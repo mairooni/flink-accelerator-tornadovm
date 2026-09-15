@@ -528,8 +528,23 @@ public final class AccelKernelGenerator {
                 || root == LogicalTypeRoot.INTEGER;
     }
 
+    /**
+     * Whether this generator will produce a value of this type.
+     *
+     * <p>{@code DOUBLE} only, and {@code FLOAT} deliberately not. This generator evaluates every
+     * expression in double and used to narrow a {@code FLOAT} result once at the end, which is not
+     * what Flink does: Flink evaluates float arithmetic in float and rounds at every step. The two
+     * agree for a single operation — double carries far more than the 2p+2 bits of mantissa that
+     * makes one rounding exact — and diverge for a chain, which is what any expression worth
+     * offloading is. Narrowing at the end was therefore a wrong answer that looked like a
+     * conversion.
+     *
+     * <p>Refusing is the honest position until the generator can emit float arithmetic throughout.
+     * Flink's estimator refuses a {@code FLOAT} result before it gets here (M2.3), so in practice
+     * this is a second line rather than the first; it is here because a provider should not claim a
+     * semantics it does not implement, whoever is asking.
+     */
     private static boolean isDoubleResult(LogicalType type) {
-        LogicalTypeRoot root = type.getTypeRoot();
-        return root == LogicalTypeRoot.DOUBLE || root == LogicalTypeRoot.FLOAT;
+        return type.getTypeRoot() == LogicalTypeRoot.DOUBLE;
     }
 }

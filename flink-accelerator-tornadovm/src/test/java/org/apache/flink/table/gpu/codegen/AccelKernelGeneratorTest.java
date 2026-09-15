@@ -325,19 +325,20 @@ class AccelKernelGeneratorTest {
     }
 
     @Test
-    @DisplayName("a FLOAT result is narrowed in the kernel, so the row gets a Float")
-    void narrowsAFloatResultOnTheDevice() {
+    @DisplayName("a FLOAT result is refused, not narrowed at the end")
+    void refusesAFloatResult() {
         AccelExpression sum =
                 call(
                         AccelFunction.PLUS,
                         new FloatType(),
                         col(0, new FloatType()),
                         col(1, new FloatType()));
-        GpuKernelSource kernel = generate(Collections.singletonList(sum), null);
 
-        assertArrayEquals(new GpuValueType[] {GpuValueType.FLOAT}, kernel.outputTypes());
-        assertTrue(kernel.source().contains("FloatArray out0"), kernel.source());
-        assertTrue(kernel.source().contains("out0.set(i, (float) ("), kernel.source());
+        // This used to generate, computing in double and writing `out0.set(i, (float) (...))`.
+        // That is not Flink's float arithmetic: Flink rounds at every step, the kernel rounded
+        // once. For one operation the two agree, which is why the old test passed and looked
+        // right; for a chain they do not. M2.3.
+        assertFalse(tryGenerate(Collections.singletonList(sum), null).isPresent());
     }
 
     @Test
