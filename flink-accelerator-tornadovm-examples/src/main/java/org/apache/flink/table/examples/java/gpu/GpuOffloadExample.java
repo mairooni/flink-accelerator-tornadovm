@@ -101,19 +101,30 @@ public final class GpuOffloadExample {
         // Matching results prove nothing on their own. If offload did not happen then both runs
         // executed the same CPU plan and would match trivially, so the assertion that carries the
         // weight is that the work actually reached the device.
-        if (!withGpu.offloaded()) {
+        if (!withGpu.eligible()) {
             System.out.println();
             System.out.println(
-                    "Results match, but THE GPU WAS NOT USED. Both runs executed on the CPU,");
-            System.out.println("so this comparison demonstrates nothing. The planner reported:");
+                    "Results match, but THE PLANNER REFUSED THE QUERY. Both runs executed the");
+            System.out.println("same CPU plan, so this comparison demonstrates nothing. Reason:");
             System.out.println();
             System.out.println("  " + withGpu.offloadReason());
             System.out.println();
             System.out.println(SETUP_HELP);
-            throw new IllegalStateException("GPU offload did not run; see the reason above");
+            throw new IllegalStateException("the query was not eligible; see the reason above");
         }
 
-        System.out.println("Results are identical, and the query ran on the GPU.");
+        System.out.println("Results are identical, and the planner found the query eligible.");
+        System.out.println();
+        System.out.println("Whether a device actually ran it is decided on the TaskManager, and");
+        System.out.println("this program cannot see that. Check the TaskManager log for one of:");
+        System.out.println();
+        System.out.println("  Accelerated on this TaskManager: provider <name> claims <n>x");
+        System.out.println("  Accelerator declined on this TaskManager, running the generated ...");
+        System.out.println();
+        System.out.println("Expect a decline for this query, and that is the right answer: it is");
+        System.out.println("three operations over 24 bytes a row, so the bus costs more than the");
+        System.out.println("arithmetic saves. What it demonstrates is transparency -- identical");
+        System.out.println("results either way -- not speed.");
     }
 
     private static final String SETUP_HELP =
@@ -145,7 +156,21 @@ public final class GpuOffloadExample {
          * merely the planner's intent. A node the cost gate selected but which then fell back is
          * reported as CPU, with the reason.
          */
-        boolean offloaded() {
+        /**
+         * Whether the <em>planner</em> found the query eligible. Not whether a device ran it.
+         *
+         * <p>Those used to be the same question and are not any more. The planner runs in this
+         * JVM and cannot know which machine the scheduler will pick or what hardware it has, so
+         * since the cost comparison moved to the TaskManager, EXPLAIN reports eligibility and the
+         * device verdict is taken -- and logged -- where the task actually runs.
+         *
+         * <p>This method was called {@code offloaded()} and read exactly the same string, which
+         * made it assert something it had no access to: run against a device that declines on
+         * cost, it reported that the query "ran on the GPU" while the TaskManager log said
+         * otherwise. Asserting the stronger thing needs the operator's own metrics, which is
+         * separate work.
+         */
+        boolean eligible() {
             return plan.contains("GPU  subtree");
         }
 
@@ -169,9 +194,14 @@ public final class GpuOffloadExample {
         // A deterministic source: datagen's random generator is not seeded, so random values would
         // differ between the two runs and make the comparison meaningless.
         env.executeSql(
+                // NOT NULL is load-bearing, and is the one thing the query author has to write.
+                // A device kernel has no representation for null, so the estimator refuses any
+                // expression with a nullable operand rather than guessing -- and datagen's columns
+                // are nullable unless the DDL says otherwise. Without these the planner reports
+                // "nullable operand of +" and the whole comparison below runs on the CPU twice.
                 "CREATE TABLE Measurements (\n"
-                        + "  id INT,\n"
-                        + "  val DOUBLE\n"
+                        + "  id INT NOT NULL,\n"
+                        + "  val DOUBLE NOT NULL\n"
                         + ") WITH (\n"
                         + "  'connector' = 'datagen',\n"
                         + "  'number-of-rows' = '"

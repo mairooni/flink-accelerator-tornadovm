@@ -22,7 +22,7 @@
 # The offload decision is made in the client, which cannot know where the task will run. This
 # reproduces that mismatch on one machine: the client and JobManager start from the full lib/,
 # so the plan is built by a JVM that can reach TornadoVM, while the TaskManager is started with
-# FLINK_LIB_DIR pointing at a copy of lib/ with flink-table-gpu-runtime removed.
+# FLINK_LIB_DIR pointing at a copy of lib/ with the provider jar removed.
 #
 # The split matters. Simply uninstalling the module does not reproduce anything, because then
 # the client cannot reach a device either and never selects the node -- the plan comes out CPU
@@ -61,8 +61,8 @@ if [[ -z "${JAR}" ]]; then
     echo "HaversineBenchmark jar not found under ${FLINK_HOME}/examples/table" >&2
     exit 1
 fi
-if ! ls "${FLINK_HOME}"/lib/flink-table-gpu-runtime-*.jar >/dev/null 2>&1; then
-    echo "no flink-table-gpu-runtime in lib/ -- run gpu-cluster-setup.sh first" >&2
+if ! ls "${FLINK_HOME}"/lib/flink-accelerator-tornadovm-*.jar >/dev/null 2>&1; then
+    echo "no provider jar in lib/ -- run gpu-cluster-setup.sh first" >&2
     echo "(with the module absent from the client too, there is nothing to reproduce)" >&2
     exit 1
 fi
@@ -72,10 +72,10 @@ NOGPU="${FLINK_HOME}/lib-nogpu"
 rm -rf "${NOGPU}"
 mkdir -p "${NOGPU}"
 cp "${FLINK_HOME}"/lib/*.jar "${NOGPU}"/
-rm -f "${NOGPU}"/flink-table-gpu-runtime-*.jar
+rm -f "${NOGPU}"/flink-accelerator-tornadovm-*.jar
 
-echo "### client lib: $(ls "${FLINK_HOME}"/lib/flink-table-gpu-runtime-*.jar | wc -l) gpu runtime jar(s)"
-echo "### TM     lib: $(ls "${NOGPU}"/flink-table-gpu-runtime-*.jar 2>/dev/null | wc -l) gpu runtime jar(s)"
+echo "### client lib: $(ls "${FLINK_HOME}"/lib/flink-accelerator-tornadovm-*.jar | wc -l) provider jar(s)"
+echo "### TM     lib: $(ls "${NOGPU}"/flink-accelerator-tornadovm-*.jar 2>/dev/null | wc -l) provider jar(s)"
 
 "${FLINK_HOME}/bin/stop-cluster.sh" >/dev/null 2>&1
 trap '"${FLINK_HOME}/bin/stop-cluster.sh" >/dev/null 2>&1 || true' EXIT

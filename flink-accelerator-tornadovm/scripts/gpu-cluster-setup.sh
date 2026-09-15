@@ -18,7 +18,7 @@
 #
 # Prepares a built Flink distribution to run GPU-offloaded jobs.
 #
-#   - moves flink-table-gpu-runtime from opt/ to lib/, so it is on the TaskManager classpath
+#   - copies the provider jar into lib/, so it is on the TaskManager classpath
 #   - writes the TornadoVM JVM flags into conf/config.yaml
 #
 # The flags come from TornadoVM's own argfile template rather than being copied by hand: it is
@@ -33,8 +33,9 @@
 #
 # Usage: gpu-cluster-setup.sh <flink-dist-dir>
 #   TORNADOVM_HOME must point at a built TornadoVM SDK.
-#   PARQUET_JAR may point at flink-sql-parquet-<version>.jar; otherwise it is looked up in this
-#   checkout's flink-formats/flink-sql-parquet/target.
+#   PROVIDER_JAR may point at the provider jar; otherwise this checkout's own target/ is used.
+#   PARQUET_JAR may point at flink-sql-parquet-<version>.jar; otherwise it is looked up under
+#   FLINK_SRC, if that is set to a Flink checkout.
 
 set -euo pipefail
 
@@ -50,54 +51,44 @@ fi
 
 CONFIG="${FLINK_HOME}/conf/config.yaml"
 
-# opt/ -> lib/. The jar is shipped in opt/ because it needs a JVM launched with the flags below.
-GPU_JAR=$(ls "${FLINK_HOME}"/opt/flink-table-gpu-runtime-*.jar 2>/dev/null | head -1 || true)
-if [[ -n "${GPU_JAR}" ]]; then
-    cp "${GPU_JAR}" "${FLINK_HOME}/lib/"
-    echo "installed $(basename "${GPU_JAR}") into lib/"
-elif ls "${FLINK_HOME}"/lib/flink-table-gpu-runtime-*.jar >/dev/null 2>&1; then
-    echo "flink-table-gpu-runtime already in lib/"
+# The provider jar into lib/.
+#
+# It does not come from the distribution any more and must not: since the provider left Flink's
+# reactor, Flink builds and ships no part of it. This is the whole deployment story for an
+# accelerator -- put the jar on the TaskManager classpath -- and it is what any second provider
+# would do too.
+PROVIDER_JAR="${PROVIDER_JAR:-}"
+if [[ -z "${PROVIDER_JAR}" ]]; then
+    MODULE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+    PROVIDER_JAR=$(ls "${MODULE_ROOT}"/target/flink-accelerator-tornadovm-*.jar 2>/dev/null \
+                   | grep -v -- '-sources\|-javadoc\|original-' | head -1 || true)
+fi
+if [[ -n "${PROVIDER_JAR}" && -f "${PROVIDER_JAR}" ]]; then
+    rm -f "${FLINK_HOME}"/lib/flink-accelerator-tornadovm-*.jar
+    cp "${PROVIDER_JAR}" "${FLINK_HOME}/lib/"
+    echo "installed $(basename "${PROVIDER_JAR}") into lib/"
+elif ls "${FLINK_HOME}"/lib/flink-accelerator-tornadovm-*.jar >/dev/null 2>&1; then
+    echo "provider already in lib/ and no newer jar built"
 else
-    echo "no flink-table-gpu-runtime jar in opt/ or lib/ -- was the dist built from this branch?" >&2
+    echo "no provider jar: run 'mvn install -DskipTests' in this repository first" >&2
     exit 1
 fi
 
-# Swap the planner loader for the planner itself.
-#
-# flink-table-planner-loader ships in lib/ and carries a shaded copy of the planner. On this branch
-# that copy has been observed to lag the built sources -- the shade resolves an older
-# flink-table-planner artifact -- so a cluster using it runs a planner without the current offload
-# code and silently reports that the expressions could not be generated. The distribution already
-# ships the unshaded planner in opt/ for exactly this swap, and it is built from the reactor.
-LOADER=$(ls "${FLINK_HOME}"/lib/flink-table-planner-loader-*.jar 2>/dev/null | head -1 || true)
-PLANNER=$(ls "${FLINK_HOME}"/opt/flink-table-planner_*.jar 2>/dev/null | head -1 || true)
-if [[ -z "${PLANNER}" ]]; then
-    if ls "${FLINK_HOME}"/lib/flink-table-planner_*.jar >/dev/null 2>&1; then
-        echo "no planner in opt/; keeping the one already in lib/" >&2
-    else
-        echo "no planner jar in opt/ or lib/" >&2
-        exit 1
-    fi
-else
-    if [[ -n "${LOADER}" ]]; then
-        mv "${LOADER}" "${FLINK_HOME}/opt/"
-        echo "moved $(basename "${LOADER}") out of lib/"
-    fi
-    # Unconditionally, every run. This used to happen only on the first, when the loader was still
-    # in lib/ to be displaced; after that the script reported "already in lib/" and left whatever
-    # was there. A rebuilt planner therefore sat in opt/ while the cluster went on running the old
-    # one -- which is the same stale-planner failure the loader swap exists to prevent, arriving by
-    # a different route, and it silently cost a placement measurement.
-    cp "${PLANNER}" "${FLINK_HOME}/lib/"
-    echo "installed $(basename "${PLANNER}") into lib/"
-fi
+# Nothing is done to the shaded planner Flink ships in lib/. It used to be displaced by the
+# unshaded planner from opt/, because the shaded copy was observed to lag the built sources and a
+# cluster running it reported that the expressions could not be generated. That diagnosis was
+# wrong. The shade resolves exactly the artifact it names; what was stale was the planner module's
+# own target/classes, which Maven fills incrementally and never prunes when a source is deleted, so
+# classes of long-removed types were packaged and carried downstream. One `clean` build of Flink
+# fixes it for good -- later incremental builds stay correct -- and a workaround here only hid it.
 
 # Parquet SQL format. flink-sql-parquet is the shaded jar meant for lib/; the unshaded
 # flink-parquet would drag its Hadoop dependencies in behind it.
 PARQUET_JAR="${PARQUET_JAR:-}"
-if [[ -z "${PARQUET_JAR}" ]]; then
-    REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
-    PARQUET_JAR=$(ls "${REPO_ROOT}"/flink-formats/flink-sql-parquet/target/flink-sql-parquet-*.jar 2>/dev/null \
+if [[ -z "${PARQUET_JAR}" && -n "${FLINK_SRC:-}" ]]; then
+    # Relative paths from here used to reach Flink's tree because this script lived inside it.
+    # They do not any more, so the Flink checkout has to be named rather than assumed.
+    PARQUET_JAR=$(ls "${FLINK_SRC}"/flink-formats/flink-sql-parquet/target/flink-sql-parquet-*.jar 2>/dev/null \
                   | grep -v original | head -1 || true)
 fi
 if ls "${FLINK_HOME}"/lib/flink-sql-parquet-*.jar >/dev/null 2>&1; then
