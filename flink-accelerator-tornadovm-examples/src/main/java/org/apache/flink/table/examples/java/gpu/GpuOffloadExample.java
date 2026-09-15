@@ -159,16 +159,15 @@ public final class GpuOffloadExample {
         /**
          * Whether the <em>planner</em> found the query eligible. Not whether a device ran it.
          *
-         * <p>Those used to be the same question and are not any more. The planner runs in this
-         * JVM and cannot know which machine the scheduler will pick or what hardware it has, so
-         * since the cost comparison moved to the TaskManager, EXPLAIN reports eligibility and the
-         * device verdict is taken -- and logged -- where the task actually runs.
+         * <p>Those used to be the same question and are not any more. The planner runs in this JVM
+         * and cannot know which machine the scheduler will pick or what hardware it has, so since
+         * the cost comparison moved to the TaskManager, EXPLAIN reports eligibility and the device
+         * verdict is taken -- and logged -- where the task actually runs.
          *
          * <p>This method was called {@code offloaded()} and read exactly the same string, which
-         * made it assert something it had no access to: run against a device that declines on
-         * cost, it reported that the query "ran on the GPU" while the TaskManager log said
-         * otherwise. Asserting the stronger thing needs the operator's own metrics, which is
-         * separate work.
+         * made it assert something it had no access to: run against a device that declines on cost,
+         * it reported that the query "ran on the GPU" while the TaskManager log said otherwise.
+         * Asserting the stronger thing needs the operator's own metrics, which is separate work.
          */
         boolean eligible() {
             return plan.contains("GPU  subtree");
