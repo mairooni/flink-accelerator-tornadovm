@@ -209,10 +209,11 @@ class AcceleratedCalcDeviceIT {
     /**
      * How far a long arithmetic chain drifts from the host, measured rather than assumed.
      *
-     * <p><b>This does not say the drift is acceptable.</b> It bounds it, because an unbounded
-     * regression would be far worse and nothing else in the project can see this at all: Flink's
-     * differential harness runs against a host-side provider that evaluates with {@code Math} and
-     * therefore agrees with the CPU by construction.
+     * <p>About 1 ulp is an accepted divergence as of 2026-09-16, recorded with signed zero rather
+     * than left open. What this bounds is a <em>regression</em>: nothing else in the project can
+     * see this drift at all, because Flink's differential harness runs against a host-side provider
+     * that evaluates with {@code Math} and therefore agrees with the CPU by construction. Widening
+     * the bound is a decision, not a fix.
      *
      * <p>What was measured, and the shape is odd enough to be worth writing down:
      *
@@ -225,8 +226,9 @@ class AcceleratedCalcDeviceIT {
      * </ul>
      *
      * <p>FMA contraction is the obvious suspect and the third and fourth lines do not fit it
-     * cleanly, so <b>the cause is not established</b> and this comment does not claim one. Chasing
-     * it further belongs in the blocker recorded in the project's TASKS.md, not here.
+     * cleanly, so <b>the cause is not established</b> and this comment does not claim one. It did
+     * not have to be for the divergence to be accepted, but anyone who does establish it should
+     * write it here.
      */
     @Test
     @DisplayName("a long arithmetic chain drifts from the host, and by how much is measured")
@@ -242,10 +244,9 @@ class AcceleratedCalcDeviceIT {
      * match the other, and they do not. First run: 2.1756620143894665 on the host against
      * 2.175662014389466 on the device.
      *
-     * <p>Unresolved, and it matters more here than it would in a library. Refusing transcendentals,
-     * shipping a correctly-rounded device implementation, or documenting the divergence the way
-     * signed zero already is — that is a design decision, recorded as a blocker, not something this
-     * test settles by widening until it passes.
+     * <p>Documented rather than refused: the project accepts about 1 ulp, the same way it accepts
+     * the signed-zero divergence. Neither refusing transcendentals nor shipping a correctly-rounded
+     * device implementation is warranted by what was measured.
      */
     @Test
     @DisplayName("transcendentals diverge from the host, and by how much is measured")
@@ -303,8 +304,72 @@ class AcceleratedCalcDeviceIT {
         }
     }
 
-    @SuppressWarnings("unchecked")
+    @Test
+    @DisplayName("a partition smaller than one batch is correct, tail of the buffer and all")
+    void partitionSmallerThanOneBatch() throws Exception {
+        // 100 rows into a 16,384-row buffer: one batch, 99% of it never staged. Before M2.5 the
+        // kernel evaluated the whole buffer, and on the very first batch that tail is whatever the
+        // allocator left -- TornadoVM's native arrays are not zeroed. Nothing read those results,
+        // so this was waste rather than a wrong answer, but it was waste proportional to the batch
+        // size on every partition in the job.
+        Result result = runOnDevice(headline(), AcceleratedCalcDeviceIT::headlineOnHost, 100);
+
+        assertThat(result.batches).isEqualTo(1);
+        assertThat(result.emitted).hasSameSizeAs(result.expected);
+        for (int i = 0; i < result.expected.size(); i++) {
+            assertThat(result.emitted.get(i).getDouble(1))
+                    .as("row " + i)
+                    .isEqualTo(result.expected.get(i).getDouble(1));
+        }
+    }
+
+    /**
+     * The kernel is running in parallel, asserted the only way that is observable.
+     *
+     * <p>This guards a failure with no other symptom. TornadoVM emits a sequential loop when it
+     * cannot establish a kernel's iteration space, every device thread runs the whole loop, and the
+     * results are <em>correct</em> — so every other test here passes. It has happened twice: once
+     * when the {@code @Parallel} annotation scan could not see a runtime-generated class, and again
+     * at M2.5 when the loop bound moved into a buffer and the inference gave up. Measured the
+     * second time on 2M rows: 3.6 ms against 6,025 ms, a factor of about 1,700.
+     *
+     * <p>The bound is calibrated, and it had to be measured rather than guessed — the first attempt
+     * at this test used a bound two orders of magnitude too loose and passed cheerfully with the
+     * grid removed. Half a million rows of {@code val * 2.0 + 1.0}, on the card this was written
+     * against:
+     *
+     * <pre>
+     *   with the iteration space stated      1.73 ms
+     *   without it, running sequentially    47.09 ms
+     * </pre>
+     *
+     * <p>10 ms is roughly the geometric mean, so there is about 5x of headroom on either side and
+     * the threshold does not care much which card it runs on. It is a trap for a catastrophe, not a
+     * performance benchmark; re-measure both numbers before moving it, and do not tighten it into a
+     * benchmark.
+     */
+    @Test
+    @DisplayName("the kernel runs in parallel, which nothing else here can tell")
+    void kernelIsNotSilentlySequential() throws Exception {
+        Result result = runOnDevice(headline(), AcceleratedCalcDeviceIT::headlineOnHost, 500_000);
+
+        assertThat(result.kernelNanos).isPositive();
+        assertThat(result.kernelNanos / 1_000_000.0)
+                .as(
+                        "%.2f ms of kernel time for 500k rows of one multiply-add, against about"
+                                + " 1.7 ms expected and 47 ms if it is running sequentially --"
+                                + " which it would be, while still returning the right answers",
+                        result.kernelNanos / 1_000_000.0)
+                .isLessThan(10.0);
+    }
+
     private Result runOnDevice(AccelExpression projection, DoubleUnaryOperator onHost)
+            throws Exception {
+        return runOnDevice(projection, onHost, ROWS);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Result runOnDevice(AccelExpression projection, DoubleUnaryOperator onHost, int rows)
             throws Exception {
         AccelNode subtree =
                 plan(projection, predicate(AccelFunction.GREATER_THAN, col(1), lit(1.0)));
@@ -328,7 +393,7 @@ class AcceleratedCalcDeviceIT {
             harness.open();
             GpuCalcOperator operator = (GpuCalcOperator) harness.getOneInputOperator();
 
-            for (int i = 0; i < ROWS; i++) {
+            for (int i = 0; i < rows; i++) {
                 harness.processElement(new StreamRecord<>(row(i, value(i))));
             }
             operator.endInput();
@@ -343,7 +408,7 @@ class AcceleratedCalcDeviceIT {
         }
 
         List<RowData> expected = new ArrayList<>();
-        for (int i = 0; i < ROWS; i++) {
+        for (int i = 0; i < rows; i++) {
             double v = value(i);
             if (v > 1.0) {
                 expected.add(row(i, onHost.applyAsDouble(v)));

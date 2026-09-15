@@ -286,6 +286,14 @@ class AccelKernelGeneratorTest {
         assertTrue(source.contains("public static void " + kernel.methodName() + "("), source);
         assertTrue(source.contains("for (@Parallel int i = 0;"), source);
         assertTrue(source.contains("IntArray mask"), source);
+        // The loop is bounded by the rows actually staged, never by a buffer's capacity. A
+        // capacity bound had the device evaluate the whole expression over the tail of every
+        // partial batch -- results nobody reads, arithmetic nobody needs, and one INF away from
+        // mattering. M2.5.
+        assertTrue(source.contains("IntArray rows"), source);
+        assertTrue(source.contains("final int n = rows.get(0);"), source);
+        assertTrue(source.contains("i < n; i++"), source);
+        assertFalse(source.contains(".getSize()"), source);
         assertEquals(
                 countOccurrences(source, "{"), countOccurrences(source, "}"), "unbalanced braces");
         assertEquals(
@@ -360,7 +368,8 @@ class AccelKernelGeneratorTest {
 
         assertTrue(
                 source.contains("import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;"));
+        // IntArray is always used, mask or no mask: since M2.5 the live row count arrives in one.
+        assertTrue(source.contains("import uk.ac.manchester.tornado.api.types.arrays.IntArray;"));
         assertFalse(source.contains("FloatArray;"), source);
-        assertFalse(source.contains("IntArray;"), source);
     }
 }

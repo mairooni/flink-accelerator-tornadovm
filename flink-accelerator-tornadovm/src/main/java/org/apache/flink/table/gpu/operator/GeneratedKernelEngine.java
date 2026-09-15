@@ -24,10 +24,12 @@ import org.apache.flink.table.gpu.codegen.GpuValueType;
 import org.apache.flink.table.gpu.gather.RowGather;
 import org.apache.flink.table.gpu.metrics.OffloadMetrics;
 
+import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.TornadoExecutionResult;
 import uk.ac.manchester.tornado.api.TornadoProfilerResult;
+import uk.ac.manchester.tornado.api.WorkerGrid1D;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 import uk.ac.manchester.tornado.api.enums.ProfilerMode;
 import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
@@ -76,6 +78,13 @@ public final class GeneratedKernelEngine implements AutoCloseable {
 
     private Object[] outputs;
     private IntArray mask;
+
+    /** The live row count for the batch about to run, in a one-element buffer. */
+    private IntArray rows;
+
+    /** The launch size, narrowed to the live row count before each execution. */
+    private WorkerGrid1D grid;
+
     private GeneratedKernel generated;
     private TornadoExecutionPlan plan;
 
@@ -102,10 +111,15 @@ public final class GeneratedKernelEngine implements AutoCloseable {
             mask = new IntArray(batchSize);
             mask.init(0);
         }
+        // How many rows the kernel should actually process, re-read by the device on every
+        // execution. A one-element array rather than a scalar argument, because a scalar is
+        // captured when the graph is built and the last batch of a partition is short.
+        rows = new IntArray(1);
+        rows.set(0, batchSize);
 
         Method entry = compile(kernel);
 
-        Object[] args = new Object[inputs.length + outputs.length + (mask == null ? 0 : 1)];
+        Object[] args = new Object[inputs.length + outputs.length + (mask == null ? 0 : 1) + 1];
         int at = 0;
         for (Object in : inputs) {
             args[at++] = in;
@@ -114,11 +128,13 @@ public final class GeneratedKernelEngine implements AutoCloseable {
             args[at++] = out;
         }
         if (mask != null) {
-            args[at] = mask;
+            args[at++] = mask;
         }
+        args[at] = rows;
 
         TaskGraph graph = new TaskGraph("calc");
         graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inputs);
+        graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, rows);
         // Naming the kernel by Method rather than by a method reference is what makes a generated
         // kernel possible at all: a method reference would have to exist in source.
         graph = graph.task("kernel", entry, args);
@@ -128,7 +144,22 @@ public final class GeneratedKernelEngine implements AutoCloseable {
                         : Stream.concat(Arrays.stream(outputs), Stream.<Object>of(mask)).toArray();
         graph = graph.transferToHost(DataTransferMode.EVERY_EXECUTION, results);
 
-        plan = new TornadoExecutionPlan(graph.snapshot());
+        // An explicit iteration space, and it is not optional.
+        //
+        // TornadoVM infers one from the @Parallel loop's bound when it can. It cannot here: since
+        // M2.5 the bound is read from a buffer, so it is not known when the kernel is compiled,
+        // and the inference quietly gives up and emits a sequential loop. Quietly is the word --
+        // results stay correct and the kernel got about 1,500x slower, 4ms to 6s over 2M rows,
+        // which no correctness test can see. This project has now been caught by a silently
+        // sequential kernel twice.
+        //
+        // Stating the grid removes the inference from the path entirely: the launch is this many
+        // threads because it was asked for, and setGlobalWork below narrows it per batch so a
+        // short batch launches short.
+        grid = new WorkerGrid1D(batchSize);
+        GridScheduler scheduler = new GridScheduler();
+        scheduler.addWorkerGrid("calc.kernel", grid);
+        plan = new TornadoExecutionPlan(graph.snapshot()).withGridScheduler(scheduler);
         if (profile) {
             plan = plan.withProfiler(ProfilerMode.SILENT);
         }
@@ -200,7 +231,15 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         }
     }
 
-    public Execution execute() {
+    /**
+     * Runs the staged batch.
+     *
+     * @param stagedRows how many rows were staged. The kernel processes exactly this many; the tail
+     *     of the buffers is left alone rather than evaluated and discarded.
+     */
+    public Execution execute(int stagedRows) {
+        rows.set(0, stagedRows);
+        grid.setGlobalWork(stagedRows, 1, 1);
         long t0 = System.nanoTime();
         TornadoExecutionResult result = withKernelLoader(plan::execute);
         long wall = System.nanoTime() - t0;

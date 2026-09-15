@@ -78,7 +78,7 @@ public final class GeneratedKernelSweep {
 
                 // One untimed batch so kernel compilation on the device is not in the numbers.
                 stage(engine, input, 0, Math.min(batchSize, rows));
-                engine.execute();
+                engine.execute(batchSize);
 
                 double gpuMs = run(engine, input, rows, batchSize);
                 OffloadMetrics m = engine.metrics();
@@ -106,7 +106,7 @@ public final class GeneratedKernelSweep {
             stage(engine, input, start, count);
             long gather = System.nanoTime() - t0;
 
-            GeneratedKernelEngine.Execution execution = engine.execute();
+            GeneratedKernelEngine.Execution execution = engine.execute(batchSize);
 
             long d0 = System.nanoTime();
             int emitted = 0;
@@ -174,8 +174,9 @@ public final class GeneratedKernelSweep {
                         + className
                         + " {\n\n"
                         + "    public static void evaluate(DoubleArray c0_in, DoubleArray out0,"
-                        + " IntArray mask) {\n"
-                        + "        for (@Parallel int i = 0; i < c0_in.getSize(); i++) {\n"
+                        + " IntArray mask, IntArray rows) {\n"
+                        + "        final int n = rows.get(0);\n"
+                        + "        for (@Parallel int i = 0; i < n; i++) {\n"
                         + "            double c0 = c0_in.get(i);\n"
                         + "            out0.set(i, "
                         + expr

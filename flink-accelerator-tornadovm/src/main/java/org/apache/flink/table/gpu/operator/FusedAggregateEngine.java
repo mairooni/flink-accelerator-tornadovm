@@ -160,20 +160,29 @@ public final class FusedAggregateEngine implements AutoCloseable {
         partials = new DoubleArray(contracted.length);
         partials.init(0.0);
 
-        Object[] kernelArgs = new Object[inputs.length + 1 + (source.hasFilter() ? 1 : 0)];
+        // The generated kernel takes a live row count as its last argument (M2.5). This engine
+        // pins it to the batch size rather than tracking it: the contraction multiplies by a
+        // weight vector that is already zeroed past the staged rows, so a short final batch
+        // contributes nothing either way, and narrowing the loop here would leave the projection
+        // buffer's tail holding the previous batch's values for a GEMV that still reads it.
+        IntArray kernelRows = new IntArray(1);
+        kernelRows.set(0, batchSize);
+        Object[] kernelArgs = new Object[inputs.length + 2 + (source.hasFilter() ? 1 : 0)];
         int at = 0;
         for (Object in : inputs) {
             kernelArgs[at++] = in;
         }
         kernelArgs[at++] = projected;
         if (source.hasFilter()) {
-            kernelArgs[at] = mask;
+            kernelArgs[at++] = mask;
         }
+        kernelArgs[at] = kernelRows;
 
         TaskGraph graph =
                 new TaskGraph("fused-aggregate")
                         .transferToDevice(DataTransferMode.EVERY_EXECUTION, inputs)
                         .transferToDevice(DataTransferMode.EVERY_EXECUTION, mask, weights)
+                        .transferToDevice(DataTransferMode.FIRST_EXECUTION, kernelRows)
                         // `projected` is deliberately in no transfer list. It is written by the
                         // projection and read by the contraction, both on the device, and nothing
                         // on the host ever looks at it. It was once declared in both directions on

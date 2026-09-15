@@ -242,9 +242,8 @@ public final class AccelKernelGenerator {
                 arrayTypes.add(type.arrayType());
             }
         }
-        if (condition != null) {
-            arrayTypes.add(GpuValueType.INT.arrayType());
-        }
+        // IntArray unconditionally: the live row count is one, whether or not there is a mask.
+        arrayTypes.add(GpuValueType.INT.arrayType());
 
         StringBuilder sb = new StringBuilder();
         sb.append("import uk.ac.manchester.tornado.api.annotations.Parallel;\n");
@@ -272,12 +271,25 @@ public final class AccelKernelGenerator {
         if (condition != null) {
             params.add("IntArray mask");
         }
+        // Last, so the engine can append it without knowing whether a mask is present.
+        params.add("IntArray rows");
         sb.append(String.join(", ", params)).append(") {\n");
 
-        String first = inputs.values().iterator().next();
-        sb.append("        for (@Parallel int i = 0; i < ")
-                .append(first)
-                .append("_in.getSize(); i++) {\n");
+        // Bounded by the rows actually staged, not by the buffer's capacity.
+        //
+        // Capacity was the obvious bound and it is wrong in both directions. A partial batch --
+        // the last of every partition, and every batch of a partition smaller than one -- had the
+        // device evaluate the whole expression over the buffer's tail, which is the previous
+        // batch's data or, on the first batch, whatever the allocator left. The results were never
+        // read, so this was not a wrong answer; it was up to a full batch of arithmetic per
+        // partition spent on values that do not exist, and one INF or NAN away from becoming a
+        // wrong answer the moment anything downstream reads past the count.
+        //
+        // The count arrives in a one-element IntArray rather than as an int: a scalar argument is
+        // captured when the task graph is built and cannot then change, and this has to change on
+        // the last batch. An array is transferred on every execution.
+        sb.append("        final int n = rows.get(0);\n");
+        sb.append("        for (@Parallel int i = 0; i < n; i++) {\n");
         for (String var : inputs.values()) {
             sb.append(INDENT)
                     .append("    double ")

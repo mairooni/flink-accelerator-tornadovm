@@ -140,7 +140,7 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
         // self-referential plan could re-enter this operator.
         buffered = 0;
 
-        GeneratedKernelEngine.Execution execution = engine.execute();
+        GeneratedKernelEngine.Execution execution = engine.execute(count);
 
         long drainStart = System.nanoTime();
         int emitted = 0;
