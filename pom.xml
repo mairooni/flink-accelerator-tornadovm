@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+
+	<groupId>io.github.beehive-lab</groupId>
+	<artifactId>flink-accelerator-tornadovm-parent</artifactId>
+	<version>0.1.0-SNAPSHOT</version>
+	<packaging>pom</packaging>
+
+	<name>Flink Accelerator : TornadoVM : Parent</name>
+	<description>
+		A TornadoVM-backed AcceleratorProvider for Apache Flink's Table API.
+
+		This repository exists because the thing it builds must not be part of Flink. Flink
+		discovers an accelerator through ServiceLoader and knows nothing about the one it finds:
+		not the framework, not the device API, not the vendor. Keeping the implementation in
+		Flink's own reactor contradicted that at the only level that matters -- the build -- by
+		making a clean checkout of Flink need an artifact that is not on Maven Central.
+	</description>
+
+	<modules>
+		<module>flink-accelerator-tornadovm</module>
+		<module>flink-accelerator-tornadovm-examples</module>
+	</modules>
+
+	<properties>
+		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+		<!--
+			Flink is a compile-time dependency and a runtime-provided one: this jar goes into a
+			distribution's lib/, beside the Flink it was built against.
+
+			It is a SNAPSHOT, and it has to be until the accelerator SPI is released. The
+			interfaces this provider implements — AcceleratorProvider, AccelNode, the IR — do
+			not exist in Flink 2.2 or anything before it. Until the FLIP lands, build Flink's
+			`gpu-offload` branch with `mvn install -DskipTests` and this resolves against it.
+		-->
+		<flink.version>2.3.0</flink.version>
+
+		<!--
+			TornadoVM. Not on Maven Central: build a TornadoVM distribution first and its own
+			build installs these into the local repository under these coordinates.
+
+			Changing this version requires a clean build, not an incremental one. TornadoVM
+			resolves a kernel from its method reference's SerializedLambda, so the writeReplace()
+			that makes that possible is emitted into the calling class at compile time against a
+			specific tornado-api. Maven will not recompile unchanged sources for a dependency
+			version bump, and the stale classes then fail at run time with
+			"Kernel entry ... has no writeReplace()".
+		-->
+		<tornado.version>6.0.1-jdk21-dev</tornado.version>
+
+		<junit5.version>5.10.2</junit5.version>
+		<assertj.version>3.25.3</assertj.version>
+		<slf4j.version>1.7.36</slf4j.version>
+		<spotless.version>2.43.0</spotless.version>
+	</properties>
+
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>org.junit</groupId>
+				<artifactId>junit-bom</artifactId>
+				<version>${junit5.version}</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
+
+	<dependencies>
+		<dependency>
+			<groupId>org.slf4j</groupId>
+			<artifactId>slf4j-api</artifactId>
+			<version>${slf4j.version}</version>
+			<scope>provided</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.assertj</groupId>
+			<artifactId>assertj-core</artifactId>
+			<version>${assertj.version}</version>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<pluginManagement>
+			<plugins>
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-compiler-plugin</artifactId>
+					<version>3.13.0</version>
+					<configuration>
+						<!--
+							TornadoVM's off-heap array types are built on java.lang.foreign, a
+							preview API on JDK 21 and final on 22. Flink 2.3 has no JDK 22+
+							profile, so 21-with-preview is what a TaskManager running this
+							actually runs on.
+						-->
+						<source>21</source>
+						<target>21</target>
+						<compilerArgs>
+							<arg>--enable-preview</arg>
+						</compilerArgs>
+					</configuration>
+				</plugin>
+				<plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-surefire-plugin</artifactId>
+					<version>3.2.2</version>
+					<configuration>
+						<!-- Classes here carry the preview bit, so the test JVM must admit it
+						     too; without this every test dies on UnsupportedClassVersionError
+						     before reaching an assertion. -->
+						<argLine>--enable-preview</argLine>
+					</configuration>
+				</plugin>
+				<plugin>
+					<groupId>com.diffplug.spotless</groupId>
+					<artifactId>spotless-maven-plugin</artifactId>
+					<version>${spotless.version}</version>
+					<configuration>
+						<java>
+							<googleJavaFormat>
+								<version>1.24.0</version>
+								<style>AOSP</style>
+							</googleJavaFormat>
+							<!-- \# refers to the static imports. Same order as Flink's, so a
+							     file moving either way needs no reformatting. -->
+							<importOrder>
+								<order>org.apache.flink,org.apache.flink.shaded,,javax,java,scala,\#</order>
+							</importOrder>
+							<removeUnusedImports />
+						</java>
+					</configuration>
+					<executions>
+						<execution>
+							<id>spotless-check</id>
+							<phase>validate</phase>
+							<goals>
+								<goal>check</goal>
+							</goals>
+						</execution>
+					</executions>
+				</plugin>
+			</plugins>
+		</pluginManagement>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<groupId>com.diffplug.spotless</groupId>
+				<artifactId>spotless-maven-plugin</artifactId>
+			</plugin>
+		</plugins>
+	</build>
+</project>

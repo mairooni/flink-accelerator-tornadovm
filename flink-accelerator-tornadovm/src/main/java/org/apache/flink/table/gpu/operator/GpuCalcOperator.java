@@ -1,0 +1,268 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.table.gpu.operator;
+
+import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
+import org.apache.flink.streaming.api.operators.BoundedOneInput;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.table.data.GenericRowData;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
+import org.apache.flink.table.gpu.codegen.GpuValueType;
+import org.apache.flink.table.gpu.gather.RowGather;
+import org.apache.flink.table.gpu.metrics.OffloadMetrics;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
+
+import java.util.List;
+
+/**
+ * Executes an offloaded Calc: buffers rows, runs one kernel over the batch, emits the survivors.
+ *
+ * <p>Batching is not a tuning choice. TornadoVM needs a sized, contiguous buffer, so there is no
+ * offload without accumulating N records first — which is why this operator exists at all rather
+ * than a per-record one.
+ *
+ * <p><b>Output is deferred by up to one batch.</b> Records are emitted when the buffer fills, and
+ * the remainder on {@link #endInput()}. That is correct for bounded batch execution; it is one of
+ * the reasons streaming is out of scope.
+ *
+ * <p><b>Input rows are never retained.</b> The Table planner force-enables object reuse in batch
+ * mode, so the {@code RowData} handed to {@link #processElement} is very often the same instance
+ * every time with different contents. Every field this operator needs is copied into a staging
+ * array on arrival.
+ */
+public class GpuCalcOperator extends AbstractStreamOperator<RowData>
+        implements OneInputStreamOperator<RowData, RowData>, BoundedOneInput {
+
+    private static final long serialVersionUID = 1L;
+
+    private final GpuCalcSpec spec;
+    private final int batchSize;
+    private final boolean profile;
+
+    private transient GeneratedKernelEngine engine;
+    private transient RowGather[] gathers;
+    private transient PassThroughBuffer[] passThrough;
+    private transient GenericRowData outRow;
+    private transient StreamRecord<RowData> outElement;
+    private transient int buffered;
+
+    public GpuCalcOperator(GpuCalcSpec spec, int batchSize, boolean profile) {
+        this.spec = spec;
+        this.batchSize = batchSize;
+        this.profile = profile;
+        // Emitting downstream from inside processElement is the normal chained path; no timers or
+        // state are used, so the default chaining strategy is fine.
+    }
+
+    @Override
+    public void open() throws Exception {
+        super.open();
+        engine = new GeneratedKernelEngine(spec, profile);
+        engine.open();
+        gathers = new RowGather[spec.kernel().inputFieldIndexes().length];
+
+        int[] layout = spec.outputLayout();
+        passThrough = new PassThroughBuffer[layout.length];
+        List<LogicalType> fields = spec.outputType().getChildren();
+        for (int i = 0; i < layout.length; i++) {
+            if (layout[i] != GpuCalcSpec.COMPUTED) {
+                passThrough[i] = PassThroughBuffer.create(fields.get(i), layout[i], batchSize);
+            }
+        }
+
+        outRow = new GenericRowData(layout.length);
+        outElement = new StreamRecord<>(null);
+        buffered = 0;
+    }
+
+    @Override
+    public void processElement(StreamRecord<RowData> element) throws Exception {
+        RowData row = element.getValue();
+        if (gathers[0] == null) {
+            // The concrete RowData implementation is not knowable at plan time -- the planner
+            // declares only InternalTypeInfo<RowData> and the connector picks the class -- so the
+            // gather strategy is chosen from the first record actually seen.
+            int[] fields = spec.kernel().inputFieldIndexes();
+            GpuValueType[] types = spec.kernel().inputTypes();
+            for (int c = 0; c < fields.length; c++) {
+                gathers[c] =
+                        RowGather.forColumn(
+                                row,
+                                fields[c],
+                                types[c],
+                                engine.inputColumn(c),
+                                engine.inputSegment(c));
+            }
+        }
+        for (RowGather g : gathers) {
+            g.accept(row, buffered);
+        }
+        for (PassThroughBuffer buffer : passThrough) {
+            if (buffer != null) {
+                buffer.accept(row, buffered);
+            }
+        }
+        if (++buffered == batchSize) {
+            flush();
+        }
+    }
+
+    @Override
+    public void endInput() throws Exception {
+        flush();
+    }
+
+    private void flush() throws Exception {
+        if (buffered == 0) {
+            return;
+        }
+        int count = buffered;
+        // Reset before emitting: output.collect runs the rest of the chain, which for a
+        // self-referential plan could re-enter this operator.
+        buffered = 0;
+
+        GeneratedKernelEngine.Execution execution = engine.execute();
+
+        long drainStart = System.nanoTime();
+        int emitted = 0;
+        int[] layout = spec.outputLayout();
+        for (int i = 0; i < count; i++) {
+            if (!engine.selected(i)) {
+                continue;
+            }
+            int computed = 0;
+            for (int field = 0; field < layout.length; field++) {
+                if (layout[field] == GpuCalcSpec.COMPUTED) {
+                    outRow.setField(field, engine.output(computed++, i));
+                } else {
+                    passThrough[field].writeInto(outRow, field, i);
+                }
+            }
+            output.collect(outElement.replace(outRow));
+            emitted++;
+        }
+        engine.recordBatch(count, 0, execution, emitted, System.nanoTime() - drainStart);
+    }
+
+    @Override
+    public void close() throws Exception {
+        if (engine != null) {
+            OffloadMetrics metrics = engine.metrics();
+            if (metrics.getBatches() > 0) {
+                LOG.info(metrics.report("GpuCalcOperator " + spec));
+            }
+            engine.close();
+            engine = null;
+        }
+        super.close();
+    }
+
+    /**
+     * Stages one pass-through column without boxing.
+     *
+     * <p>Only fixed-width numeric types are handled, which is all the matcher admits. Anything else
+     * would have to be either boxed or copied through a serializer, and both are expensive enough
+     * that a Calc needing one is better left on the CPU.
+     */
+    private abstract static class PassThroughBuffer {
+
+        final int inputField;
+
+        PassThroughBuffer(int inputField) {
+            this.inputField = inputField;
+        }
+
+        abstract void accept(RowData row, int position);
+
+        abstract void writeInto(GenericRowData out, int field, int position);
+
+        static PassThroughBuffer create(LogicalType type, int inputField, int capacity) {
+            LogicalTypeRoot root = type.getTypeRoot();
+            if (root == LogicalTypeRoot.BIGINT) {
+                long[] values = new long[capacity];
+                return new PassThroughBuffer(inputField) {
+                    @Override
+                    void accept(RowData row, int position) {
+                        values[position] = row.getLong(inputField);
+                    }
+
+                    @Override
+                    void writeInto(GenericRowData out, int field, int position) {
+                        out.setField(field, values[position]);
+                    }
+                };
+            }
+            if (root == LogicalTypeRoot.INTEGER) {
+                int[] values = new int[capacity];
+                return new PassThroughBuffer(inputField) {
+                    @Override
+                    void accept(RowData row, int position) {
+                        values[position] = row.getInt(inputField);
+                    }
+
+                    @Override
+                    void writeInto(GenericRowData out, int field, int position) {
+                        out.setField(field, values[position]);
+                    }
+                };
+            }
+            if (root == LogicalTypeRoot.FLOAT) {
+                float[] values = new float[capacity];
+                return new PassThroughBuffer(inputField) {
+                    @Override
+                    void accept(RowData row, int position) {
+                        values[position] = row.getFloat(inputField);
+                    }
+
+                    @Override
+                    void writeInto(GenericRowData out, int field, int position) {
+                        out.setField(field, values[position]);
+                    }
+                };
+            }
+            if (root == LogicalTypeRoot.DOUBLE) {
+                double[] values = new double[capacity];
+                return new PassThroughBuffer(inputField) {
+                    @Override
+                    void accept(RowData row, int position) {
+                        values[position] = row.getDouble(inputField);
+                    }
+
+                    @Override
+                    void writeInto(GenericRowData out, int field, int position) {
+                        out.setField(field, values[position]);
+                    }
+                };
+            }
+            throw new UnsupportedOperationException(
+                    "no pass-through buffer for "
+                            + type
+                            + "; the matcher should have refused this "
+                            + "Calc before the operator was built");
+        }
+    }
+
+    /** Metrics for the batches this operator has run so far; exposed for tests. */
+    public OffloadMetrics metrics() {
+        return engine.metrics();
+    }
+}
