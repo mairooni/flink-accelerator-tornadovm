@@ -183,72 +183,116 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
      * would have to be either boxed or copied through a serializer, and both are expensive enough
      * that a Calc needing one is better left on the CPU.
      */
+    /**
+     * One column carried past the kernel, staged host-side at its declared width.
+     *
+     * <h2>Validity</h2>
+     *
+     * <p>A {@code long[]} has no null; it has a zero. The first version of this class wrote {@code
+     * values[position] = row.getLong(field)} with no check, so a NULL arrived downstream as 0 —
+     * silently, in a path whose whole premise is that the user cannot tell a device was used, and
+     * for a column the device never even touches. Nothing about the query said so and no test could
+     * see it, because the only tests that existed ran against a host-side provider that evaluates
+     * with object semantics and gets nulls right for free.
+     *
+     * <p>So each buffer carries a validity bit alongside its values. Not a bitmap: a {@code
+     * boolean[]} costs a byte a row against the eight a {@code long} already costs, and the staging
+     * is not where this operator spends its time — the measured breakdown puts 90% in gather and
+     * drain, which this does not change the shape of.
+     *
+     * <p>This is a pass-through concern only, and deliberately. Nullable operands of a
+     * <em>call</em> are refused by the planner and should stay refused: a kernel has no null to
+     * compute with. A column merely carried past it needs no null semantics at all, only somewhere
+     * to record that it was one.
+     */
     private abstract static class PassThroughBuffer {
 
         final int inputField;
 
-        PassThroughBuffer(int inputField) {
+        /** Whether the row at this position had a value. Parallel to the value array. */
+        final boolean[] present;
+
+        PassThroughBuffer(int inputField, int capacity) {
             this.inputField = inputField;
+            this.present = new boolean[capacity];
         }
 
-        abstract void accept(RowData row, int position);
+        /** Stages one row, recording a null as an absence rather than as a zero. */
+        final void accept(RowData row, int position) {
+            if (row.isNullAt(inputField)) {
+                present[position] = false;
+                return;
+            }
+            present[position] = true;
+            read(row, position);
+        }
 
-        abstract void writeInto(GenericRowData out, int field, int position);
+        final void writeInto(GenericRowData out, int field, int position) {
+            if (!present[position]) {
+                out.setField(field, null);
+                return;
+            }
+            write(out, field, position);
+        }
+
+        abstract void read(RowData row, int position);
+
+        abstract void write(GenericRowData out, int field, int position);
 
         static PassThroughBuffer create(LogicalType type, int inputField, int capacity) {
             LogicalTypeRoot root = type.getTypeRoot();
             if (root == LogicalTypeRoot.BIGINT) {
                 long[] values = new long[capacity];
-                return new PassThroughBuffer(inputField) {
+                return new PassThroughBuffer(inputField, capacity) {
                     @Override
-                    void accept(RowData row, int position) {
+                    void read(RowData row, int position) {
                         values[position] = row.getLong(inputField);
                     }
 
                     @Override
-                    void writeInto(GenericRowData out, int field, int position) {
+                    void write(GenericRowData out, int field, int position) {
                         out.setField(field, values[position]);
                     }
                 };
             }
             if (root == LogicalTypeRoot.INTEGER) {
                 int[] values = new int[capacity];
-                return new PassThroughBuffer(inputField) {
+                return new PassThroughBuffer(inputField, capacity) {
                     @Override
-                    void accept(RowData row, int position) {
+                    void read(RowData row, int position) {
                         values[position] = row.getInt(inputField);
                     }
 
                     @Override
-                    void writeInto(GenericRowData out, int field, int position) {
+                    void write(GenericRowData out, int field, int position) {
                         out.setField(field, values[position]);
                     }
                 };
             }
             if (root == LogicalTypeRoot.FLOAT) {
                 float[] values = new float[capacity];
-                return new PassThroughBuffer(inputField) {
+                return new PassThroughBuffer(inputField, capacity) {
                     @Override
-                    void accept(RowData row, int position) {
+                    void read(RowData row, int position) {
                         values[position] = row.getFloat(inputField);
                     }
 
                     @Override
-                    void writeInto(GenericRowData out, int field, int position) {
+                    void write(GenericRowData out, int field, int position) {
                         out.setField(field, values[position]);
                     }
                 };
             }
             if (root == LogicalTypeRoot.DOUBLE) {
                 double[] values = new double[capacity];
-                return new PassThroughBuffer(inputField) {
+                return new PassThroughBuffer(inputField, capacity) {
                     @Override
-                    void accept(RowData row, int position) {
+                    void read(RowData row, int position) {
                         values[position] = row.getDouble(inputField);
                     }
 
                     @Override
-                    void writeInto(GenericRowData out, int field, int position) {
+                    void write(GenericRowData out, int field, int position) {
                         out.setField(field, values[position]);
                     }
                 };

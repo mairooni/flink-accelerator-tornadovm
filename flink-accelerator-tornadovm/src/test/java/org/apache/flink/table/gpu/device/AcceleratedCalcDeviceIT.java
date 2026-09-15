@@ -155,6 +155,57 @@ class AcceleratedCalcDeviceIT {
         }
     }
 
+    @Test
+    @DisplayName("a null in a pass-through column comes back a null, not a zero")
+    void nullPassThroughSurvivesTheDevice() throws Exception {
+        AccelNode subtree =
+                plan(headline(), predicate(AccelFunction.GREATER_THAN, col(1), lit(1.0)));
+
+        Optional<AcceleratorPlan> offered =
+                DeviceAssumptions.provider().accept(subtree, work(subtree));
+        assertThat(offered).isPresent();
+
+        StreamOperatorFactory<RowData> factory =
+                DeviceAssumptions.provider().createOperator(offered.get(), CONTEXT);
+
+        List<RowData> emitted = new ArrayList<>();
+        try (OneInputStreamOperatorTestHarness<RowData, RowData> harness =
+                new OneInputStreamOperatorTestHarness<>(factory, 1, 1, 0)) {
+            harness.setup();
+            harness.open();
+
+            // Every third row has no id. The column is carried past the kernel, never into it, so
+            // a null here is a staging question and not an arithmetic one.
+            for (int i = 0; i < ROWS; i++) {
+                GenericRowData row = new GenericRowData(2);
+                row.setField(0, i % 3 == 0 ? null : i);
+                row.setField(1, value(i));
+                harness.processElement(new StreamRecord<>(row));
+            }
+            ((GpuCalcOperator) harness.getOneInputOperator()).endInput();
+
+            harness.getOutput().stream()
+                    .map(o -> ((StreamRecord<RowData>) o).getValue())
+                    .forEach(emitted::add);
+        }
+
+        assertThat(emitted).isNotEmpty();
+        int nulls = 0;
+        for (int i = 0; i < emitted.size(); i++) {
+            RowData out = emitted.get(i);
+            if (out.isNullAt(0)) {
+                nulls++;
+            } else {
+                // A zero would be the bug: before the validity bit existed, a null id staged
+                // through a long[] and came back as 0, which is a perfectly plausible id.
+                assertThat(out.getInt(0) % 3).as("row " + i + " lost its null").isNotZero();
+            }
+        }
+        assertThat(nulls)
+                .as("no nulls came back at all, so the validity bit is not being carried")
+                .isPositive();
+    }
+
     /**
      * How far a long arithmetic chain drifts from the host, measured rather than assumed.
      *
