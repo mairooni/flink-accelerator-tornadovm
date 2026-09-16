@@ -55,6 +55,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.DoubleUnaryOperator;
@@ -576,6 +577,171 @@ class AcceleratedCalcDeviceIT {
             }
         }
         assertThat(nulls).isEqualTo(ROWS / 5 + (ROWS % 5 == 0 ? 0 : 1));
+    }
+
+    /**
+     * All nine combinations of {TRUE, FALSE, UNKNOWN} through {@code AND} and {@code OR}, on a
+     * device.
+     *
+     * <p>The one place "absent in, absent out" is wrong. {@code FALSE AND UNKNOWN} is {@code FALSE}
+     * and {@code TRUE OR UNKNOWN} is {@code TRUE}, because an operand that decides the answer
+     * decides it whatever the other one turns out to be. Treating these strictly would drop rows
+     * that SQL keeps, and drop them <em>quietly</em> — a wrong row count, not a failure — which is
+     * why this is its own task and its own exhaustive test rather than a line in M2.11.
+     *
+     * <p>The predicate under test is the whole {@code WHERE} clause, so what is asserted is which
+     * rows survive: a row is emitted exactly when SQL says the condition is {@code TRUE}.
+     */
+    @Test
+    @DisplayName("AND and OR follow SQL's three-valued logic for every combination")
+    void threeValuedLogicMatchesSql() throws Exception {
+        for (boolean and : new boolean[] {true, false}) {
+            List<Boolean> survived = runPredicate(and);
+            assertThat(survived).as("%s: nine combinations", and ? "AND" : "OR").hasSize(9);
+
+            int at = 0;
+            for (Boolean left : TRUTH) {
+                for (Boolean right : TRUTH) {
+                    Boolean expected = and ? sqlAnd(left, right) : sqlOr(left, right);
+                    assertThat(survived.get(at++))
+                            .as(
+                                    "%s %s %s should be %s",
+                                    name(left), and ? "AND" : "OR", name(right), name(expected))
+                            .isEqualTo(Boolean.TRUE.equals(expected));
+                }
+            }
+        }
+    }
+
+    /** {@code null} is UNKNOWN. */
+    private static final List<Boolean> TRUTH = Arrays.asList(Boolean.TRUE, Boolean.FALSE, null);
+
+    private static String name(Boolean b) {
+        return b == null ? "UNKNOWN" : b.toString().toUpperCase();
+    }
+
+    private static Boolean sqlAnd(Boolean a, Boolean b) {
+        if (Boolean.FALSE.equals(a) || Boolean.FALSE.equals(b)) {
+            return Boolean.FALSE;
+        }
+        return (a == null || b == null) ? null : Boolean.TRUE;
+    }
+
+    private static Boolean sqlOr(Boolean a, Boolean b) {
+        if (Boolean.TRUE.equals(a) || Boolean.TRUE.equals(b)) {
+            return Boolean.TRUE;
+        }
+        return (a == null || b == null) ? null : Boolean.FALSE;
+    }
+
+    /**
+     * Runs the nine combinations as one batch and reports, per row, whether it survived.
+     *
+     * <p>Truth is encoded as a nullable DOUBLE: 1.0 is TRUE, 0.0 is FALSE, absent is UNKNOWN. The
+     * condition is {@code (a > 0.5) AND (b > 0.5)}, so a null operand makes its comparison UNKNOWN
+     * and the logical operator has to decide what that means.
+     */
+    @SuppressWarnings("unchecked")
+    private List<Boolean> runPredicate(boolean and) throws Exception {
+        AccelExpression left =
+                new AccelCall(
+                        AccelFunction.GREATER_THAN,
+                        Arrays.asList(new AccelInputRef(0, new DoubleType(true)), lit(0.5)),
+                        new BooleanType(true));
+        AccelExpression right =
+                new AccelCall(
+                        AccelFunction.GREATER_THAN,
+                        Arrays.asList(new AccelInputRef(1, new DoubleType(true)), lit(0.5)),
+                        new BooleanType(true));
+        AccelExpression condition =
+                new AccelCall(
+                        and ? AccelFunction.AND : AccelFunction.OR,
+                        Arrays.asList(left, right),
+                        new BooleanType(true));
+
+        // A third column carries the row's identity, kept out of the predicate. The first attempt
+        // encoded it into column 0 and so changed the very truth value under test -- FALSE became
+        // `0.0 + row`, which is greater than 0.5 for every row but the first.
+        RowType inputType =
+                RowType.of(new DoubleType(true), new DoubleType(true), new DoubleType(false));
+        AccelNode subtree =
+                new AccelProject(
+                        Collections.singletonList(
+                                new AccelCall(
+                                        AccelFunction.PLUS,
+                                        Arrays.asList(
+                                                new AccelInputRef(2, new DoubleType(false)),
+                                                lit(100.0)),
+                                        new DoubleType(false))),
+                        new AccelFilter(condition, new AccelInput(inputType), inputType),
+                        RowType.of(new DoubleType(true)));
+
+        Optional<AcceleratorPlan> offered =
+                DeviceAssumptions.provider().accept(subtree, work(subtree));
+        assertThat(offered).as("AND/OR over nullable operands must be servable").isPresent();
+
+        AcceleratorContext oneColumnOut =
+                new AcceleratorContext() {
+                    @Override
+                    public RowType outputType() {
+                        return RowType.of(new DoubleType(true));
+                    }
+
+                    @Override
+                    public int maxBatchSize() {
+                        return 64;
+                    }
+
+                    @Override
+                    public ClassLoader userCodeClassLoader() {
+                        return CONTEXT.userCodeClassLoader();
+                    }
+
+                    @Override
+                    public boolean providesOffHeap() {
+                        return false;
+                    }
+
+                    @Override
+                    public java.nio.ByteBuffer allocateOffHeap(int bytes) {
+                        throw new IllegalStateException("no managed memory in this harness");
+                    }
+                };
+
+        StreamOperatorFactory<RowData> factory =
+                DeviceAssumptions.provider().createOperator(offered.get(), oneColumnOut);
+
+        // Row i encodes the i-th (left, right) pair; a surviving row identifies itself by the
+        // value it carries, since the filter is what is under test and rows that fail vanish.
+        List<Double> markers = new ArrayList<>();
+        List<Boolean> survived = new ArrayList<>();
+        try (OneInputStreamOperatorTestHarness<RowData, RowData> harness =
+                new OneInputStreamOperatorTestHarness<>(factory, 1, 1, 0)) {
+            harness.setup();
+            harness.open();
+            int row = 0;
+            for (Boolean l : TRUTH) {
+                for (Boolean r : TRUTH) {
+                    GenericRowData in = new GenericRowData(3);
+                    in.setField(0, l == null ? null : (l ? 1.0 : 0.0));
+                    in.setField(1, r == null ? null : (r ? 1.0 : 0.0));
+                    in.setField(2, (double) row);
+                    markers.add((double) row);
+                    harness.processElement(new StreamRecord<>(in));
+                    row++;
+                }
+            }
+            ((GpuCalcOperator) harness.getOneInputOperator()).endInput();
+
+            List<Double> out = new ArrayList<>();
+            harness.getOutput().stream()
+                    .map(o -> ((StreamRecord<RowData>) o).getValue())
+                    .forEach(r -> out.add(r.isNullAt(0) ? null : r.getDouble(0)));
+            for (Double marker : markers) {
+                survived.add(out.contains(marker + 100.0));
+            }
+        }
+        return survived;
     }
 
     private Result runOnDevice(AccelExpression projection, DoubleUnaryOperator onHost)

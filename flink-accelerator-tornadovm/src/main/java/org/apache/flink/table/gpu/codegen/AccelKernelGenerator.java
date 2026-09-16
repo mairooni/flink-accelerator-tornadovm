@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -133,12 +134,7 @@ public final class AccelKernelGenerator {
             // otherwise have its 33rd read someone else's bit.
             return Optional.empty();
         }
-        if (hasNullable(subtree) && hasThreeValuedLogic(subtree)) {
-            // AND and OR are the one place "absent in, absent out" is wrong: FALSE AND UNKNOWN is
-            // FALSE, and TRUE OR UNKNOWN is TRUE. Getting that wrong changes a row count rather
-            // than failing, so while a null can reach one this generator declines. M2.12.
-            return Optional.empty();
-        }
+
         AccelProject project = (AccelProject) subtree;
         AccelNode input = project.inputs().get(0);
         AccelExpression condition = null;
@@ -152,6 +148,7 @@ public final class AccelKernelGenerator {
             return Optional.empty();
         }
 
+        NULLABLE_INPUTS.get().clear();
         final Map<Integer, String> inputs = new LinkedHashMap<>();
         final Map<Integer, GpuValueType> inputTypes = new LinkedHashMap<>();
         final List<String> computed = new ArrayList<>();
@@ -220,7 +217,7 @@ public final class AccelKernelGenerator {
                 }
             }
         }
-        boolean carriesValidity = carriesValidity(inputs, computedValidity);
+        boolean carriesValidity = carriesValidity(NULLABLE_INPUTS.get());
         String source =
                 renderClass(
                         className,
@@ -229,6 +226,7 @@ public final class AccelKernelGenerator {
                         inputTypes,
                         computed,
                         computedValidity,
+                        NULLABLE_INPUTS.get(),
                         outputTypes,
                         renderedCondition,
                         packedStride);
@@ -253,6 +251,7 @@ public final class AccelKernelGenerator {
             Map<Integer, GpuValueType> inputTypes,
             List<String> computed,
             List<String> computedValidity,
+            Set<Integer> nullableInputs,
             List<GpuValueType> outputTypes,
             @Nullable String condition,
             int packedStride) {
@@ -301,7 +300,7 @@ public final class AccelKernelGenerator {
         // rather than one array per column: four bytes a row whatever the column count, against
         // four bytes *per column* the naive way. On a path where every measurement so far is bound
         // by moving the input, that difference is the design.
-        boolean carriesValidity = carriesValidity(inputs, computedValidity);
+        boolean carriesValidity = carriesValidity(nullableInputs);
         if (carriesValidity) {
             params.add("IntArray inNulls");
             params.add("IntArray outNulls");
@@ -329,13 +328,20 @@ public final class AccelKernelGenerator {
             sb.append(INDENT).append("    final int nulls = inNulls.get(i);\n");
             int bit = 0;
             for (Integer index : inputs.keySet()) {
-                // 1 means present, so the stored bit is inverted on the way in. Branchless: this
-                // is read once per row per column and combined with & thereafter.
+                // The bit is the column's position among the staged columns, which is the same
+                // order the operator writes them in -- so the two cannot drift apart. Only a
+                // nullable column gets a variable; a NOT NULL one has nothing to read.
+                int position = bit++;
+                if (!nullableInputs.contains(index)) {
+                    continue;
+                }
+                // 1 means present, so the stored bit is inverted on the way in. Branchless: read
+                // once per row per column and combined with & thereafter.
                 sb.append(INDENT)
                         .append("    final int v")
                         .append(index)
                         .append(" = 1 - ((nulls >>> ")
-                        .append(bit++)
+                        .append(position)
                         .append(") & 1);\n");
             }
         }
@@ -528,6 +534,77 @@ public final class AccelKernelGenerator {
         }
     }
 
+    /**
+     * {@code AND} and {@code OR} under SQL's three-valued logic.
+     *
+     * <p>Folded left over the operands, two at a time, because the rule is binary and n-ary {@code
+     * AND} is just that rule applied repeatedly.
+     *
+     * <p>For {@code AND}: the result is present when both operands are present, <em>or</em> when
+     * either is present and false — because a false decides the answer whatever the other operand
+     * turns out to be. The value is the ordinary conjunction of the two, with an absent operand
+     * read as true so that it cannot turn a decided false into a true.
+     *
+     * <p>{@code OR} is the mirror image, with true as the deciding value.
+     */
+    private static Rendered renderLogical(boolean and, List<Rendered> operands) {
+        Rendered result = operands.get(0);
+        for (int i = 1; i < operands.size(); i++) {
+            result = renderLogicalPair(and, result, operands.get(i));
+        }
+        return result;
+    }
+
+    private static Rendered renderLogicalPair(boolean and, Rendered left, Rendered right) {
+        if (left.alwaysPresent() && right.alwaysPresent()) {
+            // Nothing can be absent, so this is ordinary boolean logic and emits as such.
+            return new Rendered(
+                    "(" + left.value + (and ? " && " : " || ") + right.value + ")",
+                    Rendered.ALWAYS);
+        }
+        // "Decided" means this operand alone settles the answer: false for AND, true for OR.
+        String leftDecides = decides(and, left);
+        String rightDecides = decides(and, right);
+        String valid =
+                "((("
+                        + left.valid
+                        + " & "
+                        + right.valid
+                        + ") != 0 || "
+                        + leftDecides
+                        + " || "
+                        + rightDecides
+                        + ") ? 1 : 0)";
+        // An absent operand reads as the non-deciding value, so it cannot overturn a decided one.
+        String leftValue = neutral(and, left);
+        String rightValue = neutral(and, right);
+        String value = "(" + leftValue + (and ? " && " : " || ") + rightValue + ")";
+        return new Rendered(value, valid);
+    }
+
+    /** Whether this operand is present and holds the value that settles the answer on its own. */
+    private static String decides(boolean and, Rendered operand) {
+        String settling = and ? "!" : "";
+        if (operand.alwaysPresent()) {
+            return "(" + settling + operand.value + ")";
+        }
+        return "(" + operand.valid + " != 0 && " + settling + operand.value + ")";
+    }
+
+    /** This operand's value, with an absent one read as the value that decides nothing. */
+    private static String neutral(boolean and, Rendered operand) {
+        if (operand.alwaysPresent()) {
+            return operand.value;
+        }
+        return "("
+                + operand.valid
+                + " == 0 ? "
+                + (and ? "true" : "false")
+                + " : "
+                + operand.value
+                + ")";
+    }
+
     /** {@code a & b & ...}, or the constant 1 when nothing can be absent. */
     private static String andValidity(List<Rendered> operands) {
         List<String> terms = new ArrayList<>();
@@ -550,15 +627,21 @@ public final class AccelKernelGenerator {
      * transfer, no extra instruction. That is deliberate: declaring {@code NOT NULL} stays the
      * cheaper path rather than merely the older one.
      */
-    private static boolean carriesValidity(
-            Map<Integer, String> inputs, List<String> computedValidity) {
-        for (String valid : computedValidity) {
-            if (!Rendered.ALWAYS.equals(valid)) {
-                return true;
-            }
-        }
-        return false;
+    private static boolean carriesValidity(Set<Integer> nullableInputs) {
+        return !nullableInputs.isEmpty();
     }
+
+    /**
+     * Staged columns that may be absent, collected while rendering.
+     *
+     * <p>Not derivable from the projections alone, which is what the first version tried: a
+     * predicate over a nullable column with a projection over a {@code NOT NULL} one produces no
+     * nullable <em>output</em>, and the kernel still has to read a validity bit to evaluate the
+     * predicate. That generated {@code v0} against a signature with no {@code inNulls} in it, and
+     * failed to compile -- loudly, which is the one merciful thing about it.
+     */
+    private static final ThreadLocal<Set<Integer>> NULLABLE_INPUTS =
+            ThreadLocal.withInitial(LinkedHashSet::new);
 
     private static @Nullable Rendered render(
             AccelExpression node, Map<Integer, String> inputs, Map<Integer, GpuValueType> types) {
@@ -569,9 +652,12 @@ public final class AccelKernelGenerator {
             }
             types.putIfAbsent(ref.index(), valueTypeOf(ref.outputType()));
             String name = inputs.computeIfAbsent(ref.index(), index -> "c" + index);
-            // A column declared NOT NULL carries no validity and costs nothing to read.
-            return new Rendered(
-                    name, ref.outputType().isNullable() ? "v" + ref.index() : Rendered.ALWAYS);
+            if (!ref.outputType().isNullable()) {
+                // A column declared NOT NULL carries no validity and costs nothing to read.
+                return new Rendered(name, Rendered.ALWAYS);
+            }
+            NULLABLE_INPUTS.get().add(ref.index());
+            return new Rendered(name, "v" + ref.index());
         }
         if (node instanceof AccelLiteral) {
             Object value = ((AccelLiteral) node).value();
@@ -602,6 +688,19 @@ public final class AccelKernelGenerator {
                 return null;
             }
             operands.add(rendered);
+        }
+
+        // AND and OR are the one place "absent in, absent out" is wrong, and getting it wrong
+        // changes a row count rather than failing. SQL's three-valued truth tables:
+        //
+        //     FALSE AND UNKNOWN = FALSE        TRUE  OR UNKNOWN = TRUE
+        //     TRUE  AND UNKNOWN = UNKNOWN      FALSE OR UNKNOWN = UNKNOWN
+        //
+        // So an absent operand does not make the result absent when the other operand already
+        // decides it. Value and validity have to be computed together, which is why these two are
+        // handled here rather than falling through to the strict rule below.
+        if (call.function() == AccelFunction.AND || call.function() == AccelFunction.OR) {
+            return renderLogical(call.function() == AccelFunction.AND, operands);
         }
 
         // IS NULL and IS NOT NULL read a validity bit rather than propagating one, and their own
