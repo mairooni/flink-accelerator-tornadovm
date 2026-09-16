@@ -126,6 +126,14 @@ public final class AccelKernelGenerator {
         if (!(subtree instanceof AccelProject)) {
             return Optional.empty();
         }
+        if (hasNullable(subtree)) {
+            // Until validity travels with the values (M2.11), this generator cannot represent a
+            // value that is not there and declines rather than computing on whatever occupies the
+            // slot. Flink stopped refusing these in the planner at M2.9 precisely so the decision
+            // could be made here; declining means the code-generated operator runs and the answer
+            // is unchanged.
+            return Optional.empty();
+        }
         AccelProject project = (AccelProject) subtree;
         AccelNode input = project.inputs().get(0);
         AccelExpression condition = null;
@@ -332,6 +340,41 @@ public final class AccelKernelGenerator {
     }
 
     /** Renders one expression, registering any column it reads. Null if it cannot be written. */
+    /** Whether anything in this subtree may be null, values or conditions alike. */
+    private static boolean hasNullable(AccelNode node) {
+        if (node instanceof AccelProject) {
+            for (AccelExpression e : ((AccelProject) node).projections()) {
+                if (hasNullable(e)) {
+                    return true;
+                }
+            }
+        } else if (node instanceof AccelFilter) {
+            if (hasNullable(((AccelFilter) node).condition())) {
+                return true;
+            }
+        }
+        for (AccelNode input : node.inputs()) {
+            if (hasNullable(input)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasNullable(AccelExpression expression) {
+        if (expression.outputType().isNullable()) {
+            return true;
+        }
+        if (expression instanceof AccelCall) {
+            for (AccelExpression operand : ((AccelCall) expression).operands()) {
+                if (hasNullable(operand)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private static @Nullable String render(
             AccelExpression node, Map<Integer, String> inputs, Map<Integer, GpuValueType> types) {
         if (node instanceof AccelInputRef) {

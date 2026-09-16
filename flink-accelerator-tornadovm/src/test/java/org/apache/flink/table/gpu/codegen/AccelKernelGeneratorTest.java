@@ -60,7 +60,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class AccelKernelGeneratorTest {
 
-    private static final LogicalType DOUBLE = new DoubleType();
+    /**
+     * Not nullable, and it has to be said out loud.
+     *
+     * <p>{@code new DoubleType()} is <em>nullable</em> — Flink's logical types default that way.
+     * These tests used it throughout and so were quietly building nullable IR, which went unnoticed
+     * because the planner refused nullable operands before the generator ever saw one. Since M2.9
+     * it does see them, and declines; a test meaning "a NOT NULL column" has to say so.
+     */
+    private static final LogicalType DOUBLE = new DoubleType(false);
 
     private static AccelExpression col(int index) {
         return new AccelInputRef(index, DOUBLE);
@@ -84,7 +92,7 @@ class AccelKernelGeneratorTest {
     }
 
     private static AccelExpression predicate(AccelFunction function, AccelExpression... operands) {
-        return new AccelCall(function, Arrays.asList(operands), new BooleanType());
+        return new AccelCall(function, Arrays.asList(operands), new BooleanType(false));
     }
 
     /**
@@ -255,12 +263,54 @@ class AccelKernelGeneratorTest {
     @Test
     @DisplayName("BIGINT is refused as an expression input: it does not survive a double")
     void bigintInputRefused() {
-        AccelExpression id = col(0, new BigIntType());
+        AccelExpression id = col(0, new BigIntType(false));
         AccelExpression expr = call(AccelFunction.TIMES, id, id);
 
         assertFalse(
                 tryGenerate(Collections.singletonList(expr), null).isPresent(),
                 "values above 2^53 would differ from the CPU plan");
+    }
+
+    /**
+     * A nullable value is declined here, which is where that decision now lives.
+     *
+     * <p>Flink refused these in the planner until M2.9, and it cost nearly everything: 95.4% of
+     * numeric columns in Flink's own test DDLs are nullable and no query construct rescues one. The
+     * IR always carried the fact — {@code LogicalType.isNullable()} — so the subtree now arrives
+     * here saying so, and this generator declines because it has no way to represent a value that
+     * is not there. Computing on whatever occupies the slot would be the alternative, and that slot
+     * reads 0.0.
+     *
+     * <p>Temporary. M2.11 gives validity a path to the device and this refusal goes with it.
+     */
+    @Test
+    @DisplayName("a nullable operand is declined until validity has a path to the device")
+    void nullableOperandIsDeclined() {
+        AccelExpression nullableColumn = new AccelInputRef(1, new DoubleType(true));
+        AccelExpression expr =
+                new AccelCall(
+                        AccelFunction.TIMES,
+                        Arrays.asList(nullableColumn, lit(2.0)),
+                        new DoubleType(true));
+
+        assertFalse(tryGenerate(Collections.singletonList(expr), null).isPresent());
+    }
+
+    @Test
+    @DisplayName("and so is a nullable condition, not only a nullable projection")
+    void nullableConditionIsDeclined() {
+        AccelExpression condition =
+                new AccelCall(
+                        AccelFunction.GREATER_THAN,
+                        Arrays.asList(new AccelInputRef(1, new DoubleType(true)), lit(1.0)),
+                        new BooleanType(true));
+
+        assertFalse(
+                tryGenerate(
+                                Collections.singletonList(
+                                        call(AccelFunction.TIMES, col(0), lit(2.0))),
+                                condition)
+                        .isPresent());
     }
 
     @Test
@@ -316,7 +366,10 @@ class AccelKernelGeneratorTest {
         AccelExpression sum =
                 call(
                         AccelFunction.PLUS,
-                        call(AccelFunction.PLUS, col(0, new IntType()), col(1, new FloatType())),
+                        call(
+                                AccelFunction.PLUS,
+                                col(0, new IntType(false)),
+                                col(1, new FloatType(false))),
                         col(2, DOUBLE));
         GpuKernelSource kernel = generate(Collections.singletonList(sum), null);
 
@@ -338,9 +391,9 @@ class AccelKernelGeneratorTest {
         AccelExpression sum =
                 call(
                         AccelFunction.PLUS,
-                        new FloatType(),
-                        col(0, new FloatType()),
-                        col(1, new FloatType()));
+                        new FloatType(false),
+                        col(0, new FloatType(false)),
+                        col(1, new FloatType(false)));
 
         // This used to generate, computing in double and writing `out0.set(i, (float) (...))`.
         // That is not Flink's float arithmetic: Flink rounds at every step, the kernel rounded

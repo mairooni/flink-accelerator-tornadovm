@@ -117,16 +117,16 @@ final class DeviceAssumptions {
      * The smallest thing that exercises everything: generate, compile, transfer, run, read back.
      */
     private static void runOneRow() throws Exception {
-        RowType row = RowType.of(new DoubleType());
+        RowType row = RowType.of(new DoubleType(false));
         AccelNode subtree =
                 new AccelProject(
                         Collections.singletonList(
                                 new AccelCall(
                                         AccelFunction.TIMES,
                                         Arrays.asList(
-                                                new AccelInputRef(0, new DoubleType()),
-                                                new AccelLiteral(2.0, new DoubleType())),
-                                        new DoubleType())),
+                                                new AccelInputRef(0, new DoubleType(false)),
+                                                new AccelLiteral(2.0, new DoubleType(false))),
+                                        new DoubleType(false))),
                         new AccelInput(row),
                         row);
 

@@ -80,14 +80,23 @@ import static org.assertj.core.api.Assertions.assertThat;
 class AcceleratedCalcDeviceIT {
 
     private static final int ROWS = 50_000;
-    private static final LogicalType DOUBLE = new DoubleType();
+
+    /**
+     * Not nullable, said out loud.
+     *
+     * <p>{@code new DoubleType(false)} is nullable — Flink's logical types default that way — and
+     * since M2.9 the generator declines a nullable value, so a test meaning "a NOT NULL column" has
+     * to say so. Left implicit, every subtree here would be declined and every test would skip
+     * while reporting that no device was present.
+     */
+    private static final LogicalType DOUBLE = new DoubleType(false);
 
     /** What a TaskManager tells a provider about the task it is being built into. */
     private static final AcceleratorContext CONTEXT =
             new AcceleratorContext() {
                 @Override
                 public RowType outputType() {
-                    return RowType.of(new IntType(), new DoubleType());
+                    return RowType.of(new IntType(false), new DoubleType(false));
                 }
 
                 @Override
@@ -616,15 +625,15 @@ class AcceleratedCalcDeviceIT {
     }
 
     private static AccelNode plan(AccelExpression projection, AccelExpression condition) {
-        RowType inputType = RowType.of(new IntType(), new DoubleType());
+        RowType inputType = RowType.of(new IntType(false), new DoubleType(false));
         AccelNode input = new AccelInput(inputType);
         if (condition != null) {
             input = new AccelFilter(condition, input, inputType);
         }
         return new AccelProject(
-                Arrays.asList(col(0, new IntType()), projection),
+                Arrays.asList(col(0, new IntType(false)), projection),
                 input,
-                RowType.of(new IntType(), new DoubleType()));
+                RowType.of(new IntType(false), new DoubleType(false)));
     }
 
     /**
@@ -675,6 +684,6 @@ class AcceleratedCalcDeviceIT {
     }
 
     private static AccelExpression predicate(AccelFunction function, AccelExpression... operands) {
-        return new AccelCall(function, Arrays.asList(operands), new BooleanType());
+        return new AccelCall(function, Arrays.asList(operands), new BooleanType(false));
     }
 }
