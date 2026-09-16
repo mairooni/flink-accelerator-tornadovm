@@ -18,6 +18,7 @@
 
 package org.apache.flink.table.gpu.operator;
 
+import org.apache.flink.metrics.Gauge;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
@@ -93,6 +94,7 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
         super.open();
         engine = new GeneratedKernelEngine(spec, profile, staging);
         engine.open();
+        registerMetrics();
         gathers = new RowGather[spec.kernel().inputFieldIndexes().length];
 
         int[] layout = spec.outputLayout();
@@ -340,6 +342,30 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
                             + "; the matcher should have refused this "
                             + "Calc before the operator was built");
         }
+    }
+
+    /**
+     * Publishes where the time actually goes, per subtask.
+     *
+     * <p>Flink publishes whether a device served this subtask (M3.2); this is the breakdown behind
+     * that answer, and it is the provider's to give because only the provider knows what the parts
+     * are. The measured shape is the reason it is worth having: on the first hardware this ran on,
+     * the kernel was 0.4% of the time and host-side gather and drain were 90%, which is the
+     * opposite of what the design assumed and would not have been visible without it.
+     *
+     * <p>Gauges rather than counters: they are cumulative totals read from the engine, not events
+     * to be summed by a reporter.
+     */
+    private void registerMetrics() {
+        OffloadMetrics m = engine.metrics();
+        getMetricGroup().gauge("acceleratorBatches", (Gauge<Long>) m::getBatches);
+        getMetricGroup().gauge("acceleratorRowsIn", (Gauge<Long>) m::getRowsIn);
+        getMetricGroup().gauge("acceleratorRowsOut", (Gauge<Long>) m::getRowsOut);
+        getMetricGroup().gauge("acceleratorGatherNanos", (Gauge<Long>) m::getGatherNanos);
+        getMetricGroup().gauge("acceleratorCopyInNanos", (Gauge<Long>) m::getCopyInNanos);
+        getMetricGroup().gauge("acceleratorKernelNanos", (Gauge<Long>) m::getKernelNanos);
+        getMetricGroup().gauge("acceleratorCopyOutNanos", (Gauge<Long>) m::getCopyOutNanos);
+        getMetricGroup().gauge("acceleratorDrainNanos", (Gauge<Long>) m::getDrainNanos);
     }
 
     /** Metrics for the batches this operator has run so far; exposed for tests. */
