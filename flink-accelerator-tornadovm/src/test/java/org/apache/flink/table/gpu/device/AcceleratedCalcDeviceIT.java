@@ -43,6 +43,7 @@ import org.apache.flink.table.types.logical.DoubleType;
 import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.types.RowKind;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -361,6 +362,55 @@ class AcceleratedCalcDeviceIT {
                                 + " which it would be, while still returning the right answers",
                         result.kernelNanos / 1_000_000.0)
                 .isLessThan(10.0);
+    }
+
+    /**
+     * What the operator does to a row's kind, measured rather than reasoned about.
+     *
+     * <p>It emits an insert, always, because it builds a fresh {@code GenericRowData} per row and
+     * that is a {@code GenericRowData}'s default. That is not a defect and it is not an accident of
+     * this implementation: the operator it stands in for is a <em>batch</em> Calc, generated with
+     * {@code retainHeader = false}, which means the code generator emits no {@code
+     * setRowKind(input.getRowKind())} and its output is an insert whatever came in. The two agree,
+     * so offloading cannot change a row's kind relative to not offloading.
+     *
+     * <p>The row fed in below is an {@code UPDATE_AFTER} that could never actually arrive — batch
+     * sources are insert-only, and since M2.6 the streaming Calc cannot reach this path at all.
+     * Feeding one anyway is the point: it establishes what would happen, instead of leaving the
+     * question to an argument about why it cannot happen. M2.7.
+     */
+    @Test
+    @DisplayName("the operator emits inserts, matching the batch operator it replaces")
+    void rowKindMatchesTheBatchOperator() throws Exception {
+        AccelNode subtree = plan(headline(), null);
+        Optional<AcceleratorPlan> offered =
+                DeviceAssumptions.provider().accept(subtree, work(subtree));
+        assertThat(offered).isPresent();
+
+        StreamOperatorFactory<RowData> factory =
+                DeviceAssumptions.provider().createOperator(offered.get(), CONTEXT);
+
+        List<RowData> emitted = new ArrayList<>();
+        try (OneInputStreamOperatorTestHarness<RowData, RowData> harness =
+                new OneInputStreamOperatorTestHarness<>(factory, 1, 1, 0)) {
+            harness.setup();
+            harness.open();
+            for (int i = 0; i < 16; i++) {
+                GenericRowData row = new GenericRowData(2);
+                row.setRowKind(RowKind.UPDATE_AFTER);
+                row.setField(0, i);
+                row.setField(1, value(i));
+                harness.processElement(new StreamRecord<>(row));
+            }
+            ((GpuCalcOperator) harness.getOneInputOperator()).endInput();
+            harness.getOutput().stream()
+                    .map(o -> ((StreamRecord<RowData>) o).getValue())
+                    .forEach(emitted::add);
+        }
+
+        assertThat(emitted).isNotEmpty();
+        assertThat(emitted)
+                .allSatisfy(row -> assertThat(row.getRowKind()).isEqualTo(RowKind.INSERT));
     }
 
     private Result runOnDevice(AccelExpression projection, DoubleUnaryOperator onHost)
