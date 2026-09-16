@@ -744,6 +744,63 @@ class AcceleratedCalcDeviceIT {
         return survived;
     }
 
+    /**
+     * Two subtasks running the same kernel compile it once.
+     *
+     * <p>Compiling costs a few hundred milliseconds and every subtask of a job generates the same
+     * source from the same plan, so a TaskManager running eight subtasks was paying for the same
+     * kernel eight times, on the task-startup path.
+     *
+     * <p>The second half matters as much as the first: the entry is reference counted, so closing
+     * one engine must not delete the class loader and temporary directory the other is still
+     * running from. Both engines are therefore used <em>after</em> both exist, and the first is
+     * closed before the second runs again.
+     */
+    @Test
+    @DisplayName("two engines over one kernel compile it once, and neither closes the other's")
+    void kernelCompilationIsSharedAcrossSubtasks() throws Exception {
+        AccelNode subtree = plan(headline(), null);
+        Optional<AcceleratorPlan> offered =
+                DeviceAssumptions.provider().accept(subtree, work(subtree));
+        assertThat(offered).isPresent();
+        GpuKernelSource kernel = (GpuKernelSource) offered.get().payload();
+
+        int before = GeneratedKernelEngine.compilationCount();
+
+        GpuCalcSpec spec =
+                new GpuCalcSpec(kernel, kernel.outputLayout(), CONTEXT.outputType(), 256);
+        GeneratedKernelEngine first = new GeneratedKernelEngine(spec, false, null);
+        GeneratedKernelEngine second = new GeneratedKernelEngine(spec, false, null);
+        try {
+            first.open();
+            second.open();
+
+            assertThat(GeneratedKernelEngine.compilationCount() - before)
+                    .as("the same source must be compiled once, not once per subtask")
+                    .isEqualTo(1);
+
+            // Closing one must leave the other's class loader and work directory alone.
+            first.close();
+            first = null;
+
+            RowGather.StagingColumn column = second.inputColumn(0);
+            for (int i = 0; i < 256; i++) {
+                column.set(i, value(i));
+            }
+            second.execute(256);
+            for (int i = 0; i < 256; i++) {
+                assertThat(((Double) second.output(0, i)).doubleValue())
+                        .as("row %d after the other engine closed", i)
+                        .isEqualTo(headlineOnHost(value(i)));
+            }
+        } finally {
+            if (first != null) {
+                first.close();
+            }
+            second.close();
+        }
+    }
+
     private Result runOnDevice(AccelExpression projection, DoubleUnaryOperator onHost)
             throws Exception {
         return runOnDevice(projection, onHost, ROWS);

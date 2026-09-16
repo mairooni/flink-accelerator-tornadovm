@@ -304,6 +304,16 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         return mask == null || mask.get(position) != 0;
     }
 
+    /**
+     * How many kernels this JVM has actually compiled.
+     *
+     * <p>Exposed for tests, and only meaningful as a difference across an operation: the cache is
+     * shared by everything in the process, so an absolute value says nothing.
+     */
+    public static int compilationCount() {
+        return GeneratedKernel.COMPILATIONS.get();
+    }
+
     public OffloadMetrics metrics() {
         return metrics;
     }

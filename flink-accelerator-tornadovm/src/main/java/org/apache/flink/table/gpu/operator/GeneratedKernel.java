@@ -44,8 +44,11 @@ import java.security.ProtectionDomain;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Compiles a generated kernel and allocates the buffers it reads and writes.
@@ -60,14 +63,81 @@ import java.util.List;
 final class GeneratedKernel implements AutoCloseable {
 
     private final GpuKernelSource kernel;
-    private Path workDir;
-    private URLClassLoader loader;
+
+    /** The shared compilation this handle is using, or null before {@code compile}. */
+    private Compiled compiled;
+
+    /**
+     * Kernels compiled in this JVM, keyed on the source they were compiled from.
+     *
+     * <p>Compiling costs a few hundred milliseconds and every subtask of a job generates the same
+     * source from the same plan, so a TaskManager running eight subtasks was paying for the same
+     * kernel eight times, on the task-startup path.
+     *
+     * <p>Keyed on the source rather than on the spec because the source is what {@code javac} is
+     * given: two specs that differ in a way the generator does not emit -- a batch size, an output
+     * layout -- produce one kernel and should share it, and two that emit different text must not.
+     *
+     * <p>Reference counted rather than weakly held. A cached entry owns a class loader and a
+     * temporary directory, and an operator closing its handle must not delete a directory another
+     * subtask is still running from; when the last handle goes, so does the entry. That also makes
+     * the lifetime answer the question the task asks: nothing here outlives the last operator using
+     * it, let alone the class loader it came from.
+     */
+    private static final Map<String, Compiled> CACHE = new HashMap<>();
+
+    /** How many times {@code javac} has actually run. For tests, and for nothing else. */
+    static final AtomicInteger COMPILATIONS = new AtomicInteger();
+
+    /** One compiled kernel, shared by every handle that asked for the same source. */
+    private static final class Compiled {
+        final String source;
+        final Method entry;
+        final URLClassLoader loader;
+        final Path workDir;
+        int handles;
+
+        Compiled(String source, Method entry, URLClassLoader loader, Path workDir) {
+            this.source = source;
+            this.entry = entry;
+            this.loader = loader;
+            this.workDir = workDir;
+        }
+    }
 
     GeneratedKernel(GpuKernelSource kernel) {
         this.kernel = kernel;
     }
 
     Method compile() throws Exception {
+        synchronized (CACHE) {
+            Compiled hit = CACHE.get(kernel.source());
+            if (hit != null) {
+                hit.handles++;
+                compiled = hit;
+                return hit.entry;
+            }
+        }
+        Compiled fresh = compileFresh();
+        synchronized (CACHE) {
+            // Another subtask may have compiled the same source while this one was doing it. Its
+            // copy is as good as this one; drop this rather than leave two loaders for one kernel.
+            Compiled hit = CACHE.get(kernel.source());
+            if (hit != null) {
+                discard(fresh);
+                hit.handles++;
+                compiled = hit;
+                return hit.entry;
+            }
+            fresh.handles = 1;
+            CACHE.put(fresh.source, fresh);
+            compiled = fresh;
+            return fresh.entry;
+        }
+    }
+
+    private Compiled compileFresh() throws Exception {
+        COMPILATIONS.incrementAndGet();
         final GpuKernelSource kernel = this.kernel;
         JavaCompiler javac = ToolProvider.getSystemJavaCompiler();
         if (javac == null) {
@@ -75,7 +145,7 @@ final class GeneratedKernel implements AutoCloseable {
                     "No Java compiler available: GPU offload generates kernels at run time and so "
                             + "needs a JDK, not a JRE. TornadoVM requires one in any case.");
         }
-        workDir = Files.createTempDirectory("flink-gpu-kernel");
+        Path workDir = Files.createTempDirectory("flink-gpu-kernel");
         // The generated class name contains '$' to keep it distinct from anything hand-written;
         // the file must be named after the class for javac to accept it.
         String fileName = kernel.className() + ".java";
@@ -112,17 +182,37 @@ final class GeneratedKernel implements AutoCloseable {
                             + kernel.source());
         }
 
-        loader =
+        URLClassLoader loader =
                 new URLClassLoader(
                         new URL[] {workDir.toUri().toURL()},
                         GeneratedKernelEngine.class.getClassLoader());
         Class<?> generated = loader.loadClass(kernel.className());
         for (Method m : generated.getDeclaredMethods()) {
             if (m.getName().equals(kernel.methodName())) {
-                return m;
+                return new Compiled(kernel.source(), m, loader, workDir);
             }
         }
         throw new IllegalStateException("generated class has no method " + kernel.methodName());
+    }
+
+    private static void discard(Compiled c) {
+        try {
+            c.loader.close();
+        } catch (IOException ignored) {
+            // Nothing useful to do, and this copy is already redundant.
+        }
+        delete(c.workDir);
+    }
+
+    private static void delete(Path dir) {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> paths = Files.walk(dir)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
+        } catch (IOException ignored) {
+            // A temporary directory left behind is not worth failing a task for.
+        }
     }
 
     private static String classpathFor() {
@@ -241,20 +331,25 @@ final class GeneratedKernel implements AutoCloseable {
 
     /** The loader the generated class lives in; TornadoVM reads its bytecode as a resource. */
     ClassLoader loader() {
-        return loader;
+        return compiled == null ? null : compiled.loader;
     }
 
     @Override
     public void close() throws IOException {
-        if (loader != null) {
-            loader.close();
-            loader = null;
+        Compiled mine = compiled;
+        compiled = null;
+        if (mine == null) {
+            return;
         }
-        if (workDir != null && Files.exists(workDir)) {
-            try (java.util.stream.Stream<Path> paths = Files.walk(workDir)) {
-                paths.sorted(Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
+        synchronized (CACHE) {
+            if (--mine.handles > 0) {
+                // Another subtask is still running this kernel; its loader and its directory have
+                // to stay. Deleting them here is what a per-operator cache would have done.
+                return;
             }
-            workDir = null;
+            CACHE.remove(mine.source);
         }
+        mine.loader.close();
+        delete(mine.workDir);
     }
 }
