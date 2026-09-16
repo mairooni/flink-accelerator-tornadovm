@@ -272,45 +272,86 @@ class AccelKernelGeneratorTest {
     }
 
     /**
-     * A nullable value is declined here, which is where that decision now lives.
+     * A nullable value carries a validity bit rather than being refused.
      *
-     * <p>Flink refused these in the planner until M2.9, and it cost nearly everything: 95.4% of
-     * numeric columns in Flink's own test DDLs are nullable and no query construct rescues one. The
-     * IR always carried the fact — {@code LogicalType.isNullable()} — so the subtree now arrives
-     * here saying so, and this generator declines because it has no way to represent a value that
-     * is not there. Computing on whatever occupies the slot would be the alternative, and that slot
-     * reads 0.0.
-     *
-     * <p>Temporary. M2.11 gives validity a path to the device and this refusal goes with it.
+     * <p>Declined at M2.9 and served since M2.11. The bit travels in one packed {@code int} a row —
+     * bit <em>k</em> says staged column <em>k</em> is absent — so a kernel over any number of
+     * nullable columns moves four bytes a row of validity rather than four per column.
      */
     @Test
-    @DisplayName("a nullable operand is declined until validity has a path to the device")
-    void nullableOperandIsDeclined() {
-        AccelExpression nullableColumn = new AccelInputRef(1, new DoubleType(true));
+    @DisplayName("a nullable operand produces a kernel that carries validity")
+    void nullableOperandCarriesValidity() {
         AccelExpression expr =
                 new AccelCall(
                         AccelFunction.TIMES,
-                        Arrays.asList(nullableColumn, lit(2.0)),
+                        Arrays.asList(new AccelInputRef(1, new DoubleType(true)), lit(2.0)),
                         new DoubleType(true));
 
-        assertFalse(tryGenerate(Collections.singletonList(expr), null).isPresent());
+        GpuKernelSource kernel = generate(Collections.singletonList(expr), null);
+
+        assertTrue(kernel.carriesValidity());
+        assertTrue(kernel.source().contains("IntArray inNulls"), kernel.source());
+        assertTrue(kernel.source().contains("IntArray outNulls"), kernel.source());
+        // 1 means present, so the stored bit is inverted on the way in.
+        assertTrue(
+                kernel.source().contains("final int v1 = 1 - ((nulls >>> 0) & 1);"),
+                kernel.source());
+        // Strict: absent in, absent out. A literal is always present and folds out of the AND.
+        assertTrue(
+                kernel.source().contains("outNulls.set(i, ((1 - (v1)) << 0));"), kernel.source());
     }
 
     @Test
-    @DisplayName("and so is a nullable condition, not only a nullable projection")
-    void nullableConditionIsDeclined() {
+    @DisplayName("a NOT NULL expression emits exactly what it did before validity existed")
+    void notNullExpressionIsUnchanged() {
+        GpuKernelSource kernel =
+                generate(
+                        Collections.singletonList(call(AccelFunction.TIMES, col(1), lit(2.0))),
+                        null);
+
+        // The point of the packed encoding is that declaring NOT NULL stays the cheaper path, not
+        // merely the older one: no parameter, no transfer, no instruction.
+        assertFalse(kernel.carriesValidity());
+        assertFalse(kernel.source().contains("inNulls"), kernel.source());
+        assertFalse(kernel.source().contains("outNulls"), kernel.source());
+    }
+
+    @Test
+    @DisplayName("a null operand makes a condition UNKNOWN, which does not select the row")
+    void nullableConditionFoldsValidityIntoTheMask() {
         AccelExpression condition =
                 new AccelCall(
                         AccelFunction.GREATER_THAN,
                         Arrays.asList(new AccelInputRef(1, new DoubleType(true)), lit(1.0)),
-                        new BooleanType(true));
+                        new BooleanType(false));
 
-        assertFalse(
-                tryGenerate(
-                                Collections.singletonList(
-                                        call(AccelFunction.TIMES, col(0), lit(2.0))),
-                                condition)
-                        .isPresent());
+        GpuKernelSource kernel =
+                generate(
+                        Collections.singletonList(call(AccelFunction.TIMES, col(0), lit(2.0))),
+                        condition);
+
+        // SQL says a comparison with a null is UNKNOWN and UNKNOWN does not select. That is one
+        // extra term in the mask rather than a separate mechanism.
+        assertTrue(kernel.source().contains("if ((v1 != 0 && (c1 > 1.0)))"), kernel.source());
+    }
+
+    @Test
+    @DisplayName("IS NULL reads the validity bit, and its own answer is never absent")
+    void isNullReadsTheValidityBit() {
+        AccelExpression condition =
+                new AccelCall(
+                        AccelFunction.IS_NOT_NULL,
+                        Collections.singletonList(new AccelInputRef(1, new DoubleType(true))),
+                        new BooleanType(false));
+
+        GpuKernelSource kernel =
+                generate(
+                        Collections.singletonList(call(AccelFunction.TIMES, col(0), lit(2.0))),
+                        condition);
+
+        // Without this, writing the predicate a user would reach for made their query *less*
+        // offloadable than omitting it -- IS NOT NULL had no IR at all. See M2.9.
+        assertTrue(kernel.source().contains("if ((v1 != 0))"), kernel.source());
     }
 
     @Test

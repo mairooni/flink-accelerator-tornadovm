@@ -44,8 +44,10 @@ import java.net.URLClassLoader;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.List;
 import java.util.stream.Stream;
 
 /**
@@ -87,6 +89,12 @@ public final class GeneratedKernelEngine implements AutoCloseable {
 
     /** The launch size, narrowed to the live row count before each execution. */
     private WorkerGrid1D grid;
+
+    /** Which staged inputs are absent, a bit a column a row. Null when nothing can be. */
+    private IntArray inNulls;
+
+    /** Which computed outputs are absent, a bit a column a row. */
+    private IntArray outNulls;
 
     private GeneratedKernel generated;
     private TornadoExecutionPlan plan;
@@ -139,10 +147,25 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         // captured when the graph is built and the last batch of a partition is short.
         rows = new IntArray(1);
         rows.set(0, batchSize);
+        if (kernel.carriesValidity()) {
+            // One int a row covers every staged column: bit k says column k is absent in this row.
+            // Four bytes a row whatever the column count, against four bytes per column the naive
+            // way, on a path where every measurement so far is bound by moving the input.
+            inNulls = new IntArray(batchSize);
+            inNulls.init(0);
+            outNulls = new IntArray(batchSize);
+            outNulls.init(0);
+        }
 
         Method entry = compile(kernel);
 
-        Object[] args = new Object[inputs.length + outputs.length + (mask == null ? 0 : 1) + 1];
+        Object[] args =
+                new Object
+                        [inputs.length
+                                + outputs.length
+                                + (mask == null ? 0 : 1)
+                                + (kernel.carriesValidity() ? 2 : 0)
+                                + 1];
         int at = 0;
         for (Object in : inputs) {
             args[at++] = in;
@@ -153,18 +176,29 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         if (mask != null) {
             args[at++] = mask;
         }
+        if (inNulls != null) {
+            args[at++] = inNulls;
+            args[at++] = outNulls;
+        }
         args[at] = rows;
 
         TaskGraph graph = new TaskGraph("calc");
         graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inputs);
         graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, rows);
+        if (inNulls != null) {
+            graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inNulls);
+        }
         // Naming the kernel by Method rather than by a method reference is what makes a generated
         // kernel possible at all: a method reference would have to exist in source.
         graph = graph.task("kernel", entry, args);
-        Object[] results =
-                mask == null
-                        ? outputs
-                        : Stream.concat(Arrays.stream(outputs), Stream.<Object>of(mask)).toArray();
+        List<Object> back = new ArrayList<>(Arrays.asList(outputs));
+        if (mask != null) {
+            back.add(mask);
+        }
+        if (outNulls != null) {
+            back.add(outNulls);
+        }
+        Object[] results = back.toArray();
         graph = graph.transferToHost(DataTransferMode.EVERY_EXECUTION, results);
 
         // An explicit iteration space, and it is not optional.
@@ -244,6 +278,26 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         return buffer instanceof FloatArray floats
                 ? (Object) floats.get(position)
                 : (Object) ((DoubleArray) buffer).get(position);
+    }
+
+    /** Marks a staged input column absent for this row. */
+    public void setInputNull(int column, int position) {
+        inNulls.set(position, inNulls.get(position) | (1 << column));
+    }
+
+    /** Clears every input validity bit for this row, which is the staging default. */
+    public void clearInputNulls(int position) {
+        inNulls.set(position, 0);
+    }
+
+    /** Whether this kernel moves validity at all. */
+    public boolean carriesValidity() {
+        return inNulls != null;
+    }
+
+    /** Whether the computed column at this position came back absent. */
+    public boolean outputIsNull(int column, int position) {
+        return outNulls != null && ((outNulls.get(position) >>> column) & 1) != 0;
     }
 
     public boolean selected(int position) {

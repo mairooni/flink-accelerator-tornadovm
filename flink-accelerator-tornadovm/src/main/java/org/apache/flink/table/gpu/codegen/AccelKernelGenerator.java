@@ -21,6 +21,7 @@ package org.apache.flink.table.gpu.codegen;
 import org.apache.flink.table.accelerator.AccelCall;
 import org.apache.flink.table.accelerator.AccelExpression;
 import org.apache.flink.table.accelerator.AccelFilter;
+import org.apache.flink.table.accelerator.AccelFunction;
 import org.apache.flink.table.accelerator.AccelInputRef;
 import org.apache.flink.table.accelerator.AccelLiteral;
 import org.apache.flink.table.accelerator.AccelNode;
@@ -126,12 +127,16 @@ public final class AccelKernelGenerator {
         if (!(subtree instanceof AccelProject)) {
             return Optional.empty();
         }
-        if (hasNullable(subtree)) {
-            // Until validity travels with the values (M2.11), this generator cannot represent a
-            // value that is not there and declines rather than computing on whatever occupies the
-            // slot. Flink stopped refusing these in the planner at M2.9 precisely so the decision
-            // could be made here; declining means the code-generated operator runs and the answer
-            // is unchanged.
+        if (inputs32Exceeded(subtree)) {
+            // Validity is packed into one int a row, so 32 staged columns is the ceiling. Refusing
+            // beyond it rather than silently widening: an expression over 33 columns would
+            // otherwise have its 33rd read someone else's bit.
+            return Optional.empty();
+        }
+        if (hasNullable(subtree) && hasThreeValuedLogic(subtree)) {
+            // AND and OR are the one place "absent in, absent out" is wrong: FALSE AND UNKNOWN is
+            // FALSE, and TRUE OR UNKNOWN is TRUE. Getting that wrong changes a row count rather
+            // than failing, so while a null can reach one this generator declines. M2.12.
             return Optional.empty();
         }
         AccelProject project = (AccelProject) subtree;
@@ -150,6 +155,7 @@ public final class AccelKernelGenerator {
         final Map<Integer, String> inputs = new LinkedHashMap<>();
         final Map<Integer, GpuValueType> inputTypes = new LinkedHashMap<>();
         final List<String> computed = new ArrayList<>();
+        final List<String> computedValidity = new ArrayList<>();
         final List<GpuValueType> outputTypes = new ArrayList<>();
         final int[] layout = new int[project.projections().size()];
 
@@ -163,11 +169,12 @@ public final class AccelKernelGenerator {
             if (!isDoubleResult(expression.outputType())) {
                 return Optional.empty();
             }
-            String rendered = render(expression, inputs, inputTypes);
+            Rendered rendered = render(expression, inputs, inputTypes);
             if (rendered == null) {
                 return Optional.empty();
             }
-            computed.add(rendered);
+            computed.add(rendered.value);
+            computedValidity.add(rendered.valid);
             outputTypes.add(valueTypeOf(expression.outputType()));
         }
         if (computed.isEmpty()) {
@@ -177,10 +184,17 @@ public final class AccelKernelGenerator {
 
         String renderedCondition = null;
         if (condition != null) {
-            renderedCondition = render(condition, inputs, inputTypes);
-            if (renderedCondition == null) {
+            Rendered rendered = render(condition, inputs, inputTypes);
+            if (rendered == null) {
                 return Optional.empty();
             }
+            // A comparison with an absent operand is UNKNOWN, and UNKNOWN does not select a row --
+            // so the condition's own validity ANDs into the mask rather than being checked
+            // separately. That is the whole of three-valued logic for a WHERE clause.
+            renderedCondition =
+                    rendered.alwaysPresent()
+                            ? rendered.value
+                            : "(" + rendered.valid + " != 0 && " + rendered.value + ")";
         }
         if (inputs.isEmpty()) {
             // A kernel with no input column has nothing to size the parallel loop by.
@@ -206,6 +220,7 @@ public final class AccelKernelGenerator {
                 }
             }
         }
+        boolean carriesValidity = carriesValidity(inputs, computedValidity);
         String source =
                 renderClass(
                         className,
@@ -213,6 +228,7 @@ public final class AccelKernelGenerator {
                         inputs,
                         inputTypes,
                         computed,
+                        computedValidity,
                         outputTypes,
                         renderedCondition,
                         packedStride);
@@ -226,7 +242,8 @@ public final class AccelKernelGenerator {
                         outputTypes.toArray(new GpuValueType[0]),
                         renderedCondition != null,
                         layout,
-                        packedStride));
+                        packedStride,
+                        carriesValidity));
     }
 
     private static String renderClass(
@@ -235,6 +252,7 @@ public final class AccelKernelGenerator {
             Map<Integer, String> inputs,
             Map<Integer, GpuValueType> inputTypes,
             List<String> computed,
+            List<String> computedValidity,
             List<GpuValueType> outputTypes,
             @Nullable String condition,
             int packedStride) {
@@ -279,7 +297,16 @@ public final class AccelKernelGenerator {
         if (condition != null) {
             params.add("IntArray mask");
         }
-        // Last, so the engine can append it without knowing whether a mask is present.
+        // Validity, when anything in this kernel can be absent. One int a row, one bit a column,
+        // rather than one array per column: four bytes a row whatever the column count, against
+        // four bytes *per column* the naive way. On a path where every measurement so far is bound
+        // by moving the input, that difference is the design.
+        boolean carriesValidity = carriesValidity(inputs, computedValidity);
+        if (carriesValidity) {
+            params.add("IntArray inNulls");
+            params.add("IntArray outNulls");
+        }
+        // Last, so the engine can append it without knowing what precedes it.
         params.add("IntArray rows");
         sb.append(String.join(", ", params)).append(") {\n");
 
@@ -298,6 +325,20 @@ public final class AccelKernelGenerator {
         // the last batch. An array is transferred on every execution.
         sb.append("        final int n = rows.get(0);\n");
         sb.append("        for (@Parallel int i = 0; i < n; i++) {\n");
+        if (carriesValidity) {
+            sb.append(INDENT).append("    final int nulls = inNulls.get(i);\n");
+            int bit = 0;
+            for (Integer index : inputs.keySet()) {
+                // 1 means present, so the stored bit is inverted on the way in. Branchless: this
+                // is read once per row per column and combined with & thereafter.
+                sb.append(INDENT)
+                        .append("    final int v")
+                        .append(index)
+                        .append(" = 1 - ((nulls >>> ")
+                        .append(bit++)
+                        .append(") & 1);\n");
+            }
+        }
         for (String var : inputs.values()) {
             sb.append(INDENT)
                     .append("    double ")
@@ -326,6 +367,27 @@ public final class AccelKernelGenerator {
                     .append(narrow ? ")" : "")
                     .append(");\n");
         }
+        if (carriesValidity) {
+            // The value is written whatever its validity -- computing it costs nothing extra and
+            // branching to avoid it would cost divergence -- and the bit says whether to read it.
+            // Absent slots hold a benign value rather than whatever was there, so no INF, NAN or
+            // denormal arises from arithmetic on a row that does not exist.
+            StringBuilder packed = new StringBuilder();
+            for (int i = 0; i < computedValidity.size(); i++) {
+                if (i > 0) {
+                    packed.append(" | ");
+                }
+                packed.append("((1 - (")
+                        .append(computedValidity.get(i))
+                        .append(")) << ")
+                        .append(i)
+                        .append(")");
+            }
+            sb.append(INDENT)
+                    .append("    outNulls.set(i, ")
+                    .append(packed.length() == 0 ? "0" : packed.toString())
+                    .append(");\n");
+        }
         if (condition != null) {
             sb.append(INDENT).append("    if (").append(condition).append(") {\n");
             sb.append(INDENT).append("        mask.set(i, 1);\n");
@@ -340,6 +402,72 @@ public final class AccelKernelGenerator {
     }
 
     /** Renders one expression, registering any column it reads. Null if it cannot be written. */
+    /** More staged columns than one int of validity can describe. */
+    private static boolean inputs32Exceeded(AccelNode subtree) {
+        java.util.Set<Integer> referenced = new java.util.HashSet<>();
+        collectRefs(subtree, referenced);
+        return referenced.size() > 32;
+    }
+
+    private static void collectRefs(AccelNode node, java.util.Set<Integer> into) {
+        if (node instanceof AccelProject) {
+            for (AccelExpression e : ((AccelProject) node).projections()) {
+                collectRefs(e, into);
+            }
+        } else if (node instanceof AccelFilter) {
+            collectRefs(((AccelFilter) node).condition(), into);
+        }
+        for (AccelNode input : node.inputs()) {
+            collectRefs(input, into);
+        }
+    }
+
+    private static void collectRefs(AccelExpression expression, java.util.Set<Integer> into) {
+        if (expression instanceof AccelInputRef) {
+            into.add(((AccelInputRef) expression).index());
+        } else if (expression instanceof AccelCall) {
+            for (AccelExpression operand : ((AccelCall) expression).operands()) {
+                collectRefs(operand, into);
+            }
+        }
+    }
+
+    /** Whether this subtree contains an AND or an OR, whose null semantics are not strict. */
+    private static boolean hasThreeValuedLogic(AccelNode node) {
+        if (node instanceof AccelProject) {
+            for (AccelExpression e : ((AccelProject) node).projections()) {
+                if (hasThreeValuedLogic(e)) {
+                    return true;
+                }
+            }
+        } else if (node instanceof AccelFilter) {
+            if (hasThreeValuedLogic(((AccelFilter) node).condition())) {
+                return true;
+            }
+        }
+        for (AccelNode input : node.inputs()) {
+            if (hasThreeValuedLogic(input)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasThreeValuedLogic(AccelExpression expression) {
+        if (expression instanceof AccelCall) {
+            AccelCall call = (AccelCall) expression;
+            if (call.function() == AccelFunction.AND || call.function() == AccelFunction.OR) {
+                return true;
+            }
+            for (AccelExpression operand : call.operands()) {
+                if (hasThreeValuedLogic(operand)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /** Whether anything in this subtree may be null, values or conditions alike. */
     private static boolean hasNullable(AccelNode node) {
         if (node instanceof AccelProject) {
@@ -375,7 +503,64 @@ public final class AccelKernelGenerator {
         return false;
     }
 
-    private static @Nullable String render(
+    /**
+     * A rendered value, and the expression saying whether it is there.
+     *
+     * <p>Validity is an {@code int}: 1 present, 0 absent. An {@code int} rather than a {@code
+     * boolean} because it is combined with {@code &} far more often than it is branched on, and
+     * because the constant {@link #ALWAYS} then folds away in the emitted source — an expression
+     * over {@code NOT NULL} columns produces exactly the kernel it produced before validity
+     * existed, character for character.
+     */
+    private static final class Rendered {
+        static final String ALWAYS = "1";
+
+        final String value;
+        final String valid;
+
+        Rendered(String value, String valid) {
+            this.value = value;
+            this.valid = valid;
+        }
+
+        boolean alwaysPresent() {
+            return ALWAYS.equals(valid);
+        }
+    }
+
+    /** {@code a & b & ...}, or the constant 1 when nothing can be absent. */
+    private static String andValidity(List<Rendered> operands) {
+        List<String> terms = new ArrayList<>();
+        for (Rendered r : operands) {
+            if (!r.alwaysPresent()) {
+                terms.add(r.valid);
+            }
+        }
+        if (terms.isEmpty()) {
+            return Rendered.ALWAYS;
+        }
+        return terms.size() == 1 ? terms.get(0) : "(" + String.join(" & ", terms) + ")";
+    }
+
+    /**
+     * Whether this kernel needs to move validity at all.
+     *
+     * <p>False for an expression over {@code NOT NULL} columns, and then the emitted source is
+     * character-for-character what it was before validity existed — no extra parameter, no extra
+     * transfer, no extra instruction. That is deliberate: declaring {@code NOT NULL} stays the
+     * cheaper path rather than merely the older one.
+     */
+    private static boolean carriesValidity(
+            Map<Integer, String> inputs, List<String> computedValidity) {
+        for (String valid : computedValidity) {
+            if (!Rendered.ALWAYS.equals(valid)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static @Nullable Rendered render(
             AccelExpression node, Map<Integer, String> inputs, Map<Integer, GpuValueType> types) {
         if (node instanceof AccelInputRef) {
             AccelInputRef ref = (AccelInputRef) node;
@@ -383,12 +568,20 @@ public final class AccelKernelGenerator {
                 return null;
             }
             types.putIfAbsent(ref.index(), valueTypeOf(ref.outputType()));
-            return inputs.computeIfAbsent(ref.index(), index -> "c" + index);
+            String name = inputs.computeIfAbsent(ref.index(), index -> "c" + index);
+            // A column declared NOT NULL carries no validity and costs nothing to read.
+            return new Rendered(
+                    name, ref.outputType().isNullable() ? "v" + ref.index() : Rendered.ALWAYS);
         }
         if (node instanceof AccelLiteral) {
             Object value = ((AccelLiteral) node).value();
+            if (value == null) {
+                // A literal NULL is representable, but every use of one is a constant this kernel
+                // would be computing for no reason; the planner folds them away long before here.
+                return null;
+            }
             if (value instanceof Boolean) {
-                return value.toString();
+                return new Rendered(value.toString(), Rendered.ALWAYS);
             }
             if (!(value instanceof Number)) {
                 return null;
@@ -399,18 +592,39 @@ public final class AccelKernelGenerator {
             }
             // Double.toString round-trips exactly, so the constant the kernel sees is the constant
             // the planner folded.
-            return Double.toString(d);
+            return new Rendered(Double.toString(d), Rendered.ALWAYS);
         }
         AccelCall call = (AccelCall) node;
-        List<String> operands = new ArrayList<>(call.operands().size());
+        List<Rendered> operands = new ArrayList<>(call.operands().size());
         for (AccelExpression operand : call.operands()) {
-            String rendered = render(operand, inputs, types);
+            Rendered rendered = render(operand, inputs, types);
             if (rendered == null) {
                 return null;
             }
             operands.add(rendered);
         }
-        return renderCall(call, operands);
+
+        // IS NULL and IS NOT NULL read a validity bit rather than propagating one, and their own
+        // answer is never absent -- which is the whole of what makes them useful in a WHERE clause
+        // over a nullable column.
+        if (call.function() == AccelFunction.IS_NULL) {
+            return new Rendered("(" + operands.get(0).valid + " == 0)", Rendered.ALWAYS);
+        }
+        if (call.function() == AccelFunction.IS_NOT_NULL) {
+            return new Rendered("(" + operands.get(0).valid + " != 0)", Rendered.ALWAYS);
+        }
+
+        List<String> values = new ArrayList<>(operands.size());
+        for (Rendered r : operands) {
+            values.add(r.value);
+        }
+        String rendered = renderCall(call, values);
+        if (rendered == null) {
+            return null;
+        }
+        // Every other operator here is strict: absent in, absent out. AND and OR are not, and are
+        // refused above until M2.12 gives them the three-valued treatment they need.
+        return new Rendered(rendered, andValidity(operands));
     }
 
     private static @Nullable String renderCall(AccelCall call, List<String> operands) {

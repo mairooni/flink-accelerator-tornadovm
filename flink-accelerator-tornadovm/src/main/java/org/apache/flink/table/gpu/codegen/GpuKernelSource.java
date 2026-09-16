@@ -48,6 +48,9 @@ public final class GpuKernelSource implements Serializable {
     private final boolean hasFilter;
     private final int[] outputLayout;
 
+    /** Whether the kernel takes and returns validity buffers. See {@link #carriesValidity()}. */
+    private final boolean carriesValidity;
+
     public GpuKernelSource(
             String className,
             String methodName,
@@ -66,7 +69,8 @@ public final class GpuKernelSource implements Serializable {
                 outputTypes,
                 hasFilter,
                 outputLayout,
-                0);
+                0,
+                false);
     }
 
     public GpuKernelSource(
@@ -79,6 +83,30 @@ public final class GpuKernelSource implements Serializable {
             boolean hasFilter,
             int[] outputLayout,
             int packedStride) {
+        this(
+                className,
+                methodName,
+                source,
+                inputFieldIndexes,
+                inputTypes,
+                outputTypes,
+                hasFilter,
+                outputLayout,
+                packedStride,
+                false);
+    }
+
+    public GpuKernelSource(
+            String className,
+            String methodName,
+            String source,
+            int[] inputFieldIndexes,
+            GpuValueType[] inputTypes,
+            GpuValueType[] outputTypes,
+            boolean hasFilter,
+            int[] outputLayout,
+            int packedStride,
+            boolean carriesValidity) {
         if (inputFieldIndexes.length != inputTypes.length) {
             throw new IllegalArgumentException(
                     "every staged column needs a declared type: "
@@ -96,6 +124,7 @@ public final class GpuKernelSource implements Serializable {
         this.outputCount = outputTypes.length;
         this.packedStride = packedStride;
         this.hasFilter = hasFilter;
+        this.carriesValidity = carriesValidity;
         this.outputLayout = outputLayout;
     }
 
@@ -151,6 +180,17 @@ public final class GpuKernelSource implements Serializable {
      * TornadoVM answers {@code Tornado Graph resize not implemented yet}. One matrix, column-major
      * with this stride, is one task at any width, and is also the layout a GEMV would want.
      */
+    /**
+     * Whether this kernel moves validity, and therefore takes {@code inNulls} and {@code outNulls}.
+     *
+     * <p>False for an expression over {@code NOT NULL} columns, and then the kernel is exactly the
+     * one generated before validity existed — no extra parameter, no extra transfer. Declaring
+     * {@code NOT NULL} stays the cheaper path rather than merely the older one.
+     */
+    public boolean carriesValidity() {
+        return carriesValidity;
+    }
+
     public int packedStride() {
         return packedStride;
     }

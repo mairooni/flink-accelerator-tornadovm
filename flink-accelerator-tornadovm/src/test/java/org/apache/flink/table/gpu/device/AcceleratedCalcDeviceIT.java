@@ -504,6 +504,80 @@ class AcceleratedCalcDeviceIT {
         }
     }
 
+    /**
+     * A nullable column computed on the device: values where present, nulls where not.
+     *
+     * <p>The reason M2.11 exists. Refusing these cost nearly everything — 95.4% of numeric columns
+     * in Flink's own test DDLs are nullable, and no query construct rescues one — so the
+     * interesting assertion is not that it runs but that it is <em>right</em>: a null in, a null
+     * out, in the same row, with every present value bit-identical to the host's.
+     */
+    @Test
+    @DisplayName("a nullable column comes back with nulls in the right rows and values in the rest")
+    void nullableColumnComputesOnTheDevice() throws Exception {
+        AccelExpression nullableTimesTwo =
+                new AccelCall(
+                        AccelFunction.PLUS,
+                        Arrays.asList(
+                                new AccelCall(
+                                        AccelFunction.TIMES,
+                                        Arrays.asList(
+                                                new AccelInputRef(1, new DoubleType(true)),
+                                                lit(2.0)),
+                                        new DoubleType(true)),
+                                lit(1.0)),
+                        new DoubleType(true));
+
+        RowType inputType = RowType.of(new IntType(false), new DoubleType(true));
+        AccelNode subtree =
+                new AccelProject(
+                        Arrays.asList(col(0, new IntType(false)), nullableTimesTwo),
+                        new AccelInput(inputType),
+                        RowType.of(new IntType(false), new DoubleType(true)));
+
+        Optional<AcceleratorPlan> offered =
+                DeviceAssumptions.provider().accept(subtree, work(subtree));
+        assertThat(offered).as("a nullable column must now be servable").isPresent();
+
+        GpuKernelSource kernel = (GpuKernelSource) offered.get().payload();
+        assertThat(kernel.carriesValidity()).isTrue();
+
+        StreamOperatorFactory<RowData> factory =
+                DeviceAssumptions.provider().createOperator(offered.get(), CONTEXT);
+
+        List<RowData> emitted = new ArrayList<>();
+        try (OneInputStreamOperatorTestHarness<RowData, RowData> harness =
+                new OneInputStreamOperatorTestHarness<>(factory, 1, 1, 0)) {
+            harness.setup();
+            harness.open();
+            for (int i = 0; i < ROWS; i++) {
+                GenericRowData row = new GenericRowData(2);
+                row.setField(0, i);
+                row.setField(1, i % 5 == 0 ? null : value(i));
+                harness.processElement(new StreamRecord<>(row));
+            }
+            ((GpuCalcOperator) harness.getOneInputOperator()).endInput();
+            harness.getOutput().stream()
+                    .map(o -> ((StreamRecord<RowData>) o).getValue())
+                    .forEach(emitted::add);
+        }
+
+        assertThat(emitted).hasSize(ROWS);
+        int nulls = 0;
+        for (int i = 0; i < ROWS; i++) {
+            RowData out = emitted.get(i);
+            assertThat(out.getInt(0)).as("row %d id", i).isEqualTo(i);
+            if (i % 5 == 0) {
+                assertThat(out.isNullAt(1)).as("row %d should be null", i).isTrue();
+                nulls++;
+            } else {
+                assertThat(out.isNullAt(1)).as("row %d should not be null", i).isFalse();
+                assertThat(out.getDouble(1)).as("row %d value", i).isEqualTo(value(i) * 2.0 + 1.0);
+            }
+        }
+        assertThat(nulls).isEqualTo(ROWS / 5 + (ROWS % 5 == 0 ? 0 : 1));
+    }
+
     private Result runOnDevice(AccelExpression projection, DoubleUnaryOperator onHost)
             throws Exception {
         return runOnDevice(projection, onHost, ROWS);

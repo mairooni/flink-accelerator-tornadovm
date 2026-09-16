@@ -128,8 +128,27 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
                                 engine.inputSegment(c));
             }
         }
-        for (RowGather g : gathers) {
-            g.accept(row, buffered);
+        if (engine.carriesValidity()) {
+            // Cleared first, because the buffer is reused across batches and a bit left set from a
+            // previous row would make a present value read as absent.
+            engine.clearInputNulls(buffered);
+            int[] fields = spec.kernel().inputFieldIndexes();
+            for (int c = 0; c < fields.length; c++) {
+                if (row.isNullAt(fields[c])) {
+                    engine.setInputNull(c, buffered);
+                    // The gather still writes a value, and it has to be a benign one: the kernel
+                    // computes every row whatever its validity -- branching to skip would cost
+                    // divergence and buy nothing -- so an absent slot must not hold something that
+                    // turns into an INF, a NAN or a denormal stall on the way through.
+                    engine.inputColumn(c).set(buffered, 1.0);
+                    continue;
+                }
+                gathers[c].accept(row, buffered);
+            }
+        } else {
+            for (RowGather g : gathers) {
+                g.accept(row, buffered);
+            }
         }
         for (PassThroughBuffer buffer : passThrough) {
             if (buffer != null) {
@@ -167,7 +186,10 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
             int computed = 0;
             for (int field = 0; field < layout.length; field++) {
                 if (layout[field] == GpuCalcSpec.COMPUTED) {
-                    outRow.setField(field, engine.output(computed++, i));
+                    int column = computed++;
+                    outRow.setField(
+                            field,
+                            engine.outputIsNull(column, i) ? null : engine.output(column, i));
                 } else {
                     passThrough[field].writeInto(outRow, field, i);
                 }
