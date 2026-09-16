@@ -39,16 +39,18 @@ import org.apache.flink.annotation.Internal;
  */
 @Internal
 public enum GpuValueType {
-    INT("IntArray", "int"),
-    FLOAT("FloatArray", "float"),
-    DOUBLE("DoubleArray", "double");
+    INT("IntArray", "int", 4),
+    FLOAT("FloatArray", "float", 4),
+    DOUBLE("DoubleArray", "double", 8);
 
     private final String arrayType;
     private final String primitive;
+    private final int widthInBytes;
 
-    GpuValueType(String arrayType, String primitive) {
+    GpuValueType(String arrayType, String primitive, int widthInBytes) {
         this.arrayType = arrayType;
         this.primitive = primitive;
+        this.widthInBytes = widthInBytes;
     }
 
     /** Simple name of the TornadoVM array class holding a column of this type. */
@@ -59,5 +61,10 @@ public enum GpuValueType {
     /** The Java primitive a single element of that array reads as. */
     public String primitive() {
         return primitive;
+    }
+
+    /** Bytes one element occupies in a staging buffer. */
+    public int widthInBytes() {
+        return widthInBytes;
     }
 }

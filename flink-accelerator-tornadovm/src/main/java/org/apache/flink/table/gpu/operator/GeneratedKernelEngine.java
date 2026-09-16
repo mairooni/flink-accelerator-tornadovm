@@ -36,9 +36,12 @@ import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.URLClassLoader;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -90,9 +93,29 @@ public final class GeneratedKernelEngine implements AutoCloseable {
 
     private final OffloadMetrics metrics = new OffloadMetrics();
 
+    private final @Nullable Staging staging;
+
     public GeneratedKernelEngine(GpuCalcSpec spec, boolean profile) {
+        this(spec, profile, null);
+    }
+
+    /**
+     * @param staging where staging buffers come from, or null to allocate privately. Flink offers
+     *     one when the transformation declared managed memory; taking it is what makes the staging
+     *     visible to the slot's budget instead of being memory this process took without telling
+     *     anyone. Null is the ordinary answer for a benchmark driving the engine directly, and for
+     *     a plan compiled before Flink declared anything.
+     */
+    public GeneratedKernelEngine(GpuCalcSpec spec, boolean profile, @Nullable Staging staging) {
         this.spec = spec;
         this.profile = profile;
+        this.staging = staging;
+    }
+
+    /** Where a staging buffer comes from. Exactly {@code AcceleratorContext::allocateOffHeap}. */
+    @FunctionalInterface
+    public interface Staging {
+        ByteBuffer allocate(int bytes);
     }
 
     public void open() throws Exception {
@@ -178,8 +201,19 @@ public final class GeneratedKernelEngine implements AutoCloseable {
      * partial batch is never read, but leaving it undefined would make device results differ
      * between runs.
      */
-    private static Object allocate(GpuValueType type, int batchSize) {
-        return GeneratedKernel.allocate(type, batchSize);
+    /**
+     * One staging buffer, on the slot's managed memory where Flink offered some.
+     *
+     * <p>Falling back to a private allocation is not a failure path and must not become one: a
+     * benchmark driving this engine directly has no slot behind it, and neither does a plan
+     * compiled before Flink learned to declare the memory.
+     */
+    private Object allocate(GpuValueType type, int batchSize) {
+        if (staging == null) {
+            return GeneratedKernel.allocate(type, batchSize);
+        }
+        return GeneratedKernel.allocateOn(
+                type, batchSize, staging.allocate(GeneratedKernel.sizeOf(type, batchSize)));
     }
 
     /**

@@ -55,6 +55,8 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
     private static final long serialVersionUID = 1L;
 
     private final GpuCalcSpec spec;
+
+    private final transient GeneratedKernelEngine.Staging staging;
     private final int batchSize;
     private final boolean profile;
 
@@ -66,9 +68,22 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
     private transient int buffered;
 
     public GpuCalcOperator(GpuCalcSpec spec, int batchSize, boolean profile) {
+        this(spec, batchSize, profile, null);
+    }
+
+    /**
+     * @param staging where staging buffers come from, or null to allocate privately. See {@link
+     *     GeneratedKernelEngine.Staging}.
+     */
+    public GpuCalcOperator(
+            GpuCalcSpec spec,
+            int batchSize,
+            boolean profile,
+            GeneratedKernelEngine.Staging staging) {
         this.spec = spec;
         this.batchSize = batchSize;
         this.profile = profile;
+        this.staging = staging;
         // Emitting downstream from inside processElement is the normal chained path; no timers or
         // state are used, so the default chaining strategy is fine.
     }
@@ -76,7 +91,7 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
     @Override
     public void open() throws Exception {
         super.open();
-        engine = new GeneratedKernelEngine(spec, profile);
+        engine = new GeneratedKernelEngine(spec, profile, staging);
         engine.open();
         gathers = new RowGather[spec.kernel().inputFieldIndexes().length];
 

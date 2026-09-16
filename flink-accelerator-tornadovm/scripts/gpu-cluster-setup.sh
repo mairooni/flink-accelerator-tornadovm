@@ -102,12 +102,25 @@ else
     echo "note: no flink-sql-parquet jar found; csv will work, parquet will not" >&2
 fi
 
-# Off-heap budget for the staging buffers. Each offloaded subtask holds batch-size doubles per
-# input column plus its outputs -- about 6 MiB at the default batch of 262,144 -- and TornadoVM
-# allocates its own on top. This is per TaskManager, not per slot, so it has to cover every subtask
-# that might run there at once. 4g is enough for 32 subtasks at the default batch size, measured;
-# raise it if you raise the batch size or the slot count.
-OFF_HEAP="${OFF_HEAP:-4g}"
+# Off-heap for TornadoVM's own allocations. Not for the staging buffers any more.
+#
+# Since M3.1 the staging is Flink's managed memory: the transformation declares how much it wants,
+# the operator reserves its share of the slot, and the buffers are unsafe off-heap rather than
+# direct -- outside -XX:MaxDirectMemorySize, so not this setting's problem. What used to be set here
+# was a number a deployment had to guess, scaled with the batch size, and produced
+# "OutOfMemoryError: Direct buffer memory" from a place that said nothing about accelerators.
+#
+# What remains is TornadoVM's own: device contexts, driver buffers, the compiler's working memory.
+# That does not scale with the batch size, and it is much smaller. Measured on an RTX 4070, the
+# 2M-row query at parallelism 8, eight accelerated subtasks in one TaskManager:
+#
+#     4g      previously required, and sized by hand per deployment
+#     512m    finishes, no direct-memory pressure
+#     0       fails: netty cannot reserve 4 MiB against a 1.6 GiB limit
+#
+# So zero is not yet reachable and this is not a knob to remove; it is one that stopped being a
+# function of the query.
+OFF_HEAP="${OFF_HEAP:-512m}"
 
 # Total process memory has to cover that budget and everything else the TaskManager needs, and it
 # has to grow faster than the budget does: managed and network memory are *fractions* of the total

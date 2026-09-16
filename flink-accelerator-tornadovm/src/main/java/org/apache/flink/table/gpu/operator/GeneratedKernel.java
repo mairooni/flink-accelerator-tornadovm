@@ -25,15 +25,18 @@ import org.apache.flink.table.gpu.gather.RowGather;
 import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
+import uk.ac.manchester.tornado.api.types.arrays.TornadoNativeArray;
 
 import javax.tools.JavaCompiler;
 import javax.tools.ToolProvider;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.lang.reflect.Method;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -172,6 +175,53 @@ final class GeneratedKernel implements AutoCloseable {
                 doubles.init(0.0);
                 return doubles;
         }
+    }
+
+    /**
+     * The same buffer, but on memory Flink reserved rather than memory we took.
+     *
+     * <p>{@code fromSegmentShallow} wraps without copying, so the array's elements <em>are</em> the
+     * slot's managed memory and the device writes straight into it. What that buys is accounting
+     * rather than speed: the slot's budget knows the staging exists, two accelerated operators
+     * sharing a slot cannot each assume the whole machine, and a deployment no longer has to be
+     * told by hand how much off-heap to set aside.
+     *
+     * <p>The layout is TornadoVM's. Its native arrays reserve {@link
+     * TornadoNativeArray#ARRAY_HEADER} bytes at the front for a header and store elements after it,
+     * so the buffer has to be that much larger than the data and the element count falls out of the
+     * remaining size. Getting this wrong does not fail loudly — it silently shifts every element —
+     * so {@code sizeOf} below is the only place that arithmetic is written down.
+     *
+     * @param buffer off-heap memory from {@code AcceleratorContext.allocateOffHeap}, of exactly
+     *     {@link #sizeOf} bytes
+     */
+    static Object allocateOn(GpuValueType type, int batchSize, ByteBuffer buffer) {
+        MemorySegment segment = MemorySegment.ofBuffer(buffer);
+        long expected = sizeOf(type, batchSize);
+        if (segment.byteSize() != expected) {
+            throw new IllegalArgumentException(
+                    "staging buffer is "
+                            + segment.byteSize()
+                            + " bytes, expected "
+                            + expected
+                            + " for "
+                            + batchSize
+                            + " elements of "
+                            + type);
+        }
+        switch (type) {
+            case INT:
+                return IntArray.fromSegmentShallow(segment);
+            case FLOAT:
+                return FloatArray.fromSegmentShallow(segment);
+            default:
+                return DoubleArray.fromSegmentShallow(segment);
+        }
+    }
+
+    /** Bytes one staged column needs: TornadoVM's header, then the elements. */
+    static int sizeOf(GpuValueType type, int batchSize) {
+        return (int) TornadoNativeArray.ARRAY_HEADER + batchSize * type.widthInBytes();
     }
 
     static RowGather.StagingColumn writerFor(Object buffer) {

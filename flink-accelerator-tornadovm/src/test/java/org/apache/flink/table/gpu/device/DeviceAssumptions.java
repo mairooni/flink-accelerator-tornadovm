@@ -156,6 +156,21 @@ final class DeviceAssumptions {
                             public ClassLoader userCodeClassLoader() {
                                 return DeviceAssumptions.class.getClassLoader();
                             }
+
+                            @Override
+                            public boolean providesOffHeap() {
+                                return false;
+                            }
+
+                            @Override
+                            public java.nio.ByteBuffer allocateOffHeap(int bytes) {
+                                // No slot behind this harness, so the engine allocates privately --
+                                // which is
+                                // itself worth exercising, since that is what a benchmark and any
+                                // pre-M3.1 plan get.
+                                throw new IllegalStateException(
+                                        "no managed memory in this harness");
+                            }
                         });
 
         try (OneInputStreamOperatorTestHarness<RowData, RowData> harness =

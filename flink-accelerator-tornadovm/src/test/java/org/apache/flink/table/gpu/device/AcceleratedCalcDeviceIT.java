@@ -33,6 +33,10 @@ import org.apache.flink.table.accelerator.AccelProject;
 import org.apache.flink.table.accelerator.AccelWorkProfile;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
+import org.apache.flink.table.gpu.codegen.GpuKernelSource;
+import org.apache.flink.table.gpu.gather.RowGather;
+import org.apache.flink.table.gpu.operator.GeneratedKernelEngine;
 import org.apache.flink.table.gpu.operator.GpuCalcOperator;
 import org.apache.flink.table.runtime.accelerator.AcceleratorContext;
 import org.apache.flink.table.runtime.accelerator.AcceleratorPlan;
@@ -94,6 +98,19 @@ class AcceleratedCalcDeviceIT {
                 @Override
                 public ClassLoader userCodeClassLoader() {
                     return AcceleratedCalcDeviceIT.class.getClassLoader();
+                }
+
+                @Override
+                public boolean providesOffHeap() {
+                    return false;
+                }
+
+                @Override
+                public java.nio.ByteBuffer allocateOffHeap(int bytes) {
+                    // No slot behind this harness, so the engine allocates privately -- which is
+                    // itself worth exercising, since that is what a benchmark and any
+                    // pre-M3.1 plan get.
+                    throw new IllegalStateException("no managed memory in this harness");
                 }
             };
 
@@ -411,6 +428,71 @@ class AcceleratedCalcDeviceIT {
         assertThat(emitted).isNotEmpty();
         assertThat(emitted)
                 .allSatisfy(row -> assertThat(row.getRowKind()).isEqualTo(RowKind.INSERT));
+    }
+
+    /**
+     * The kernel reads and writes memory Flink owns, and gets the same answers.
+     *
+     * <p>This drives {@link GeneratedKernelEngine} rather than the operator, and the reason is
+     * worth recording because the first version of this test quietly proved nothing. {@code
+     * OneInputStreamOperatorTestHarness} serialises the operator it is given, and the staging hook
+     * is a lambda over a live {@code AcceleratorContext}, so it is {@code transient} and comes back
+     * null — the engine then allocated privately and the test passed while exercising the old path.
+     *
+     * <p>Nothing is serialised in the real path: {@code GpuOrCpuCalcOperatorFactory} builds the
+     * operator on the TaskManager and hands it straight to the operator chain. The harness is the
+     * odd one out, so the test moves below it rather than the code bending to suit it.
+     */
+    @Test
+    @DisplayName("the kernel stages on memory Flink owns and agrees with the host")
+    void stagesOnFlinkOwnedMemory() throws Exception {
+        List<org.apache.flink.core.memory.MemorySegment> allocated = new ArrayList<>();
+        GeneratedKernelEngine.Staging staging =
+                bytes -> {
+                    // Unsafe off-heap, which is what Flink's arena hands out: outside the JVM's
+                    // direct-memory accounting, wrapped in a ByteBuffer.
+                    org.apache.flink.core.memory.MemorySegment segment =
+                            org.apache.flink.core.memory.MemorySegmentFactory
+                                    .allocateOffHeapUnsafeMemory(bytes);
+                    for (int i = 0; i < bytes; i++) {
+                        segment.put(i, (byte) 0);
+                    }
+                    allocated.add(segment);
+                    return segment.getOffHeapBuffer();
+                };
+
+        AccelNode subtree = plan(headline(), null);
+        Optional<AcceleratorPlan> offered =
+                DeviceAssumptions.provider().accept(subtree, work(subtree));
+        assertThat(offered).isPresent();
+
+        GpuKernelSource kernel = (GpuKernelSource) offered.get().payload();
+        final int batch = 1024;
+        GpuCalcSpec spec =
+                new GpuCalcSpec(kernel, kernel.outputLayout(), CONTEXT.outputType(), batch);
+
+        try (GeneratedKernelEngine engine = new GeneratedKernelEngine(spec, false, staging)) {
+            engine.open();
+
+            assertThat(allocated)
+                    .as(
+                            "the engine must have taken its staging from the hook, not allocated its own")
+                    .isNotEmpty();
+
+            RowGather.StagingColumn column = engine.inputColumn(0);
+            for (int i = 0; i < batch; i++) {
+                column.set(i, value(i));
+            }
+            engine.execute(batch);
+
+            for (int i = 0; i < batch; i++) {
+                assertThat(((Double) engine.output(0, i)).doubleValue())
+                        .as("row %d, computed on memory Flink owns", i)
+                        .isEqualTo(headlineOnHost(value(i)));
+            }
+        } finally {
+            allocated.forEach(org.apache.flink.core.memory.MemorySegment::free);
+        }
     }
 
     private Result runOnDevice(AccelExpression projection, DoubleUnaryOperator onHost)
