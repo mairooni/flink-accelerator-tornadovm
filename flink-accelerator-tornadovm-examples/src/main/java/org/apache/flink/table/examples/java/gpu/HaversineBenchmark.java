@@ -217,16 +217,45 @@ public final class HaversineBenchmark {
         // It sums lat + lon rather than lat alone so that both columns are read: the filesystem
         // source pushes projection down, and a baseline touching one column would understate what
         // the real query pays to read its input.
-        final String query =
-                args.baseline
-                        ? "SELECT COUNT(*) AS rows_seen, SUM(lat + lon) AS total_km FROM Points"
-                        : "SELECT COUNT(*) AS rows_seen, SUM(km) AS total_km\n"
-                                + "FROM (\n"
-                                + "  SELECT "
-                                + nearest(args.depots)
-                                + " AS km\n"
-                                + "  FROM Points\n"
-                                + ")";
+        final String query;
+        if (args.baseline) {
+            query = "SELECT COUNT(*) AS rows_seen, SUM(lat + lon) AS total_km FROM Points";
+        } else if (args.groups > 0) {
+            // The grouped shape, which is what a cuDF binding would serve. The Calc still offloads
+            // -- that half works today -- and the GROUP BY above it does not, so the split between
+            // them is what says whether binding a device group-by is worth doing. Wrapped in a
+            // COUNT/SUM so the job still returns one row while the grouping really happens.
+            // The key is id - (id / g) * g rather than MOD(id, g), and the difference is not
+            // cosmetic: there is no accelerator IR for MOD, and one unsupported operator refuses
+            // the whole projection -- including the haversine beside it, which is the expensive
+            // part and perfectly expressible. Subtraction, division and multiplication all have
+            // IR, so this form leaves the projection offloadable and the measurement is then
+            // about the GROUP BY rather than about MOD.
+            final String key = "(id - (id / " + args.groups + ") * " + args.groups + ")";
+            query =
+                    "SELECT COUNT(*) AS rows_seen, SUM(group_km) AS total_km\n"
+                            + "FROM (\n"
+                            + "  SELECT k, SUM(km) AS group_km\n"
+                            + "  FROM (\n"
+                            + "    SELECT "
+                            + key
+                            + " AS k, "
+                            + nearest(args.depots)
+                            + " AS km\n"
+                            + "    FROM Points\n"
+                            + "  )\n"
+                            + "  GROUP BY k\n"
+                            + ")";
+        } else {
+            query =
+                    "SELECT COUNT(*) AS rows_seen, SUM(km) AS total_km\n"
+                            + "FROM (\n"
+                            + "  SELECT "
+                            + nearest(args.depots)
+                            + " AS km\n"
+                            + "  FROM Points\n"
+                            + ")";
+        }
 
         if (args.explain) {
             System.out.println(env.explainSql(query));
@@ -347,6 +376,9 @@ public final class HaversineBenchmark {
         private boolean baseline;
         private int depots = 1;
 
+        /** Distinct groups for the GROUP BY arm; 0 means the ungrouped query. */
+        private int groups = 0;
+
         static Args parse(String[] argv) {
             Args args = new Args();
             for (int i = 0; i < argv.length; i++) {
@@ -375,6 +407,8 @@ public final class HaversineBenchmark {
                     args.generate = true;
                 } else if ("--depots".equals(flag)) {
                     args.depots = Integer.parseInt(argv[++i]);
+                } else if ("--groups".equals(flag)) {
+                    args.groups = Integer.parseInt(argv[++i]);
                 } else if ("--baseline".equals(flag)) {
                     args.baseline = true;
                 } else if ("--explain".equals(flag)) {
