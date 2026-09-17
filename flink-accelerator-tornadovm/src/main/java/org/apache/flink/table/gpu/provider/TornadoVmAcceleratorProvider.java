@@ -110,11 +110,22 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             return Optional.empty();
         }
         if (work.totalOpsPerRow() > MAX_OPS_PER_ROW) {
-            // Register pressure, and it fails silently. A kernel this large dies on the device
-            // with CL_OUT_OF_RESOURCES, asynchronously and unchecked, so the batch reports as
-            // complete having computed nothing. A smaller batch does not help. Measured: a
-            // 98-operation expression failed where a 50-operation one did not, so the ceiling sits
-            // between them and this is the conservative end.
+            // A ceiling on expression size, and the reason for it has changed twice.
+            //
+            // It was first set at 64 from an OpenCL measurement on an RTX 4070 Laptop, where a
+            // 98-operation expression died with CL_OUT_OF_RESOURCES -- asynchronously and
+            // unchecked, so the batch reported complete having computed nothing and the run
+            // claimed 81x for work that never happened. That is the failure worth being
+            // conservative about.
+            //
+            // On CUDA it does not happen there. Re-measured 2026-09-17 on an RTX 5070 Ti with
+            // common-subexpression elimination in the generator: see the sweep recorded in
+            // VERIFY.md. What used to fail was the generated *source* rather than the device --
+            // a tree that repeated itself faster than the operation count grew -- and naming
+            // subexpressions fixed that rather than moving it.
+            //
+            // The default is therefore set from what this card sustains, and the property exists
+            // because the next card will sustain something else.
             return Optional.empty();
         }
         Optional<GpuKernelSource> kernel =
@@ -171,12 +182,20 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
     // at the particular function, and only a per-function model can see it.
     // ------------------------------------------------------------------------------------------
 
+    /** The property a deployment sets to move {@link #MAX_OPS_PER_ROW}. */
+    public static final String MAX_OPS_PER_ROW_PROPERTY =
+            "flink.accelerator.tornadovm.maxOpsPerRow";
+
     /**
      * Largest expression this provider will accept, in operations per row.
      *
      * <p>Not a performance threshold -- a correctness one. See {@link #accept}.
+     *
+     * <p>Configurable since 2026-09-17, because the number is a property of a card and a driver and
+     * this is the only place that knows either. It was a compile-time constant, so a deployment
+     * that had measured its own hardware had no way to say so.
      */
-    private static final int MAX_OPS_PER_ROW = 64;
+    private static final int MAX_OPS_PER_ROW = Integer.getInteger(MAX_OPS_PER_ROW_PROPERTY, 1024);
 
     /** Nanoseconds the host spends per byte staged, transferred and drained. */
     private static final double HOST_NANOS_PER_BYTE = 0.454;

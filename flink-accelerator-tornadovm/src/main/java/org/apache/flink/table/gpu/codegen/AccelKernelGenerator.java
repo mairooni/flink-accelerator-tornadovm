@@ -149,6 +149,7 @@ public final class AccelKernelGenerator {
         }
 
         NULLABLE_INPUTS.get().clear();
+        CSE.set(new Cse());
         final Map<Integer, String> inputs = new LinkedHashMap<>();
         final Map<Integer, GpuValueType> inputTypes = new LinkedHashMap<>();
         final List<String> computed = new ArrayList<>();
@@ -229,7 +230,8 @@ public final class AccelKernelGenerator {
                         NULLABLE_INPUTS.get(),
                         outputTypes,
                         renderedCondition,
-                        packedStride);
+                        packedStride,
+                        CSE.get().declarations());
         return Optional.of(
                 new GpuKernelSource(
                         className,
@@ -254,7 +256,8 @@ public final class AccelKernelGenerator {
             Set<Integer> nullableInputs,
             List<GpuValueType> outputTypes,
             @Nullable String condition,
-            int packedStride) {
+            int packedStride,
+            List<String> subexpressions) {
 
         Set<String> arrayTypes = new TreeSet<>();
         for (GpuValueType type : inputTypes.values()) {
@@ -352,6 +355,11 @@ public final class AccelKernelGenerator {
                     .append(" = ")
                     .append(var)
                     .append("_in.get(i);\n");
+        }
+        // One statement per distinct operation, in the order they were produced -- which is
+        // bottom-up, so each one only mentions names already declared above it.
+        for (String declaration : subexpressions) {
+            sb.append(INDENT).append("    ").append(declaration).append("\n");
         }
         for (int i = 0; i < computed.size(); i++) {
             if (packedStride > 0) {
@@ -518,6 +526,52 @@ public final class AccelKernelGenerator {
      * over {@code NOT NULL} columns produces exactly the kernel it produced before validity
      * existed, character for character.
      */
+    /**
+     * Names every distinct subexpression once, so the kernel is straight-line code.
+     *
+     * <p>Without this the generator emits a tree, and a tree repeats itself. Calcite expands {@code
+     * LEAST(a, b, c, ...)} into nested conditionals that mention each operand several times over --
+     * once for a null test, once per comparison, once per branch -- so a twenty-argument {@code
+     * LEAST} over an expression of any size produces source that grows far faster than the
+     * operation count the cost model sees. Measured 2026-09-17: the haversine benchmark at {@code
+     * --depots 20} rendered to over 20 000 characters and javac rejected it, while the planner
+     * counted 359 operations. Naming each subexpression as it is produced makes the emitted size
+     * proportional to the distinct operations, which is what the cost model already counts.
+     *
+     * <p>It also reads better, which is not the point but is worth having: every statement is one
+     * operation, which is what a reader of a generated kernel wants to see.
+     */
+    private static final class Cse {
+        private final Map<String, String> byExpression = new LinkedHashMap<>();
+        private final List<String> declarations = new ArrayList<>();
+        private int next;
+
+        /** The name standing for this expression, declaring it the first time it is seen. */
+        String name(String expression, String javaType) {
+            String existing = byExpression.get(expression);
+            if (existing != null) {
+                return existing;
+            }
+            String name = "t" + next++;
+            byExpression.put(expression, name);
+            declarations.add("final " + javaType + " " + name + " = " + expression + ";");
+            return name;
+        }
+
+        List<String> declarations() {
+            return declarations;
+        }
+    }
+
+    /**
+     * The subexpression names for the kernel being generated.
+     *
+     * <p>A thread local for the same reason {@link #NULLABLE_INPUTS} is one: rendering is a static
+     * recursion and threading a context through every arm of it would say nothing the name does
+     * not.
+     */
+    private static final ThreadLocal<Cse> CSE = ThreadLocal.withInitial(Cse::new);
+
     private static final class Rendered {
         static final String ALWAYS = "1";
 
@@ -700,17 +754,21 @@ public final class AccelKernelGenerator {
         // decides it. Value and validity have to be computed together, which is why these two are
         // handled here rather than falling through to the strict rule below.
         if (call.function() == AccelFunction.AND || call.function() == AccelFunction.OR) {
-            return renderLogical(call.function() == AccelFunction.AND, operands);
+            return named(renderLogical(call.function() == AccelFunction.AND, operands), "boolean");
         }
 
         // IS NULL and IS NOT NULL read a validity bit rather than propagating one, and their own
         // answer is never absent -- which is the whole of what makes them useful in a WHERE clause
         // over a nullable column.
         if (call.function() == AccelFunction.IS_NULL) {
-            return new Rendered("(" + operands.get(0).valid + " == 0)", Rendered.ALWAYS);
+            return named(
+                    new Rendered("(" + operands.get(0).valid + " == 0)", Rendered.ALWAYS),
+                    "boolean");
         }
         if (call.function() == AccelFunction.IS_NOT_NULL) {
-            return new Rendered("(" + operands.get(0).valid + " != 0)", Rendered.ALWAYS);
+            return named(
+                    new Rendered("(" + operands.get(0).valid + " != 0)", Rendered.ALWAYS),
+                    "boolean");
         }
 
         List<String> values = new ArrayList<>(operands.size());
@@ -722,8 +780,45 @@ public final class AccelKernelGenerator {
             return null;
         }
         // Every other operator here is strict: absent in, absent out. AND and OR are not, and are
-        // refused above until M2.12 gives them the three-valued treatment they need.
-        return new Rendered(rendered, andValidity(operands));
+        // handled above, where three-valued logic computes value and validity together.
+        return named(
+                new Rendered(rendered, andValidity(operands)),
+                isBooleanResult(call.outputType()) ? "boolean" : "double");
+    }
+
+    /**
+     * Gives this subexpression a name, so a second occurrence of it emits the name rather than the
+     * expression again. See {@link Cse}.
+     *
+     * <p>A rendering that is already a bare name -- a staged column, a folded constant, the
+     * always-present validity -- is left alone: naming it would add a line and save nothing.
+     */
+    private static Rendered named(Rendered rendered, String javaType) {
+        Cse cse = CSE.get();
+        String value = isName(rendered.value) ? rendered.value : cse.name(rendered.value, javaType);
+        String valid =
+                rendered.alwaysPresent() || isName(rendered.valid)
+                        ? rendered.valid
+                        : cse.name(rendered.valid, "int");
+        return new Rendered(value, valid);
+    }
+
+    /** Whether this rendering is already a single identifier or literal. */
+    private static boolean isName(String rendered) {
+        if (rendered.isEmpty()) {
+            return true;
+        }
+        for (int i = 0; i < rendered.length(); i++) {
+            char c = rendered.charAt(i);
+            if (!Character.isLetterOrDigit(c) && c != '_' && c != '.') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isBooleanResult(org.apache.flink.table.types.logical.LogicalType type) {
+        return type.getTypeRoot() == org.apache.flink.table.types.logical.LogicalTypeRoot.BOOLEAN;
     }
 
     private static @Nullable String renderCall(AccelCall call, List<String> operands) {
@@ -789,12 +884,18 @@ public final class AccelKernelGenerator {
         String folded = operands.get(0);
         for (int i = 1; i < operands.size(); i++) {
             String next = operands.get(i);
-            folded =
+            String step =
                     least
                             ? "((" + next + " != " + next + " || " + folded + " < " + next + ") ? "
                                     + folded + " : " + next + ")"
                             : "((" + folded + " != " + folded + " || " + folded + " > " + next
                                     + ") ? " + folded + " : " + next + ")";
+            // Named at every step, and this is the step that matters. The accumulator appears
+            // three times in the expression above (four for GREATEST), so folding it inline
+            // triples the text on each operand: a twenty-argument LEAST reached 861 MB of source
+            // before this, and 18.9 MB once the operands themselves were named but the fold was
+            // not. Naming each step makes it one statement per operand. Measured 2026-09-17.
+            folded = CSE.get().name(step, "double");
         }
         return folded;
     }

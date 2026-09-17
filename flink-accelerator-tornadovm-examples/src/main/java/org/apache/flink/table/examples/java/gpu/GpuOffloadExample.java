@@ -182,7 +182,7 @@ public final class GpuOffloadExample {
                     return trimmed;
                 }
             }
-            return "no GPU Offload section in the plan; is table.exec.gpu-offload.enabled set?";
+            return "no GPU Offload section in the plan; is table.exec.accelerator.enabled set?";
         }
     }
 
@@ -220,12 +220,12 @@ public final class GpuOffloadExample {
 
         if (gpu) {
             // The entire user-facing surface of the feature.
-            env.getConfig().getConfiguration().setString("table.exec.gpu-offload.enabled", "true");
+            env.getConfig().getConfiguration().setString("table.exec.accelerator.enabled", "true");
             // See the class comment: this query is well below the calibrated floor, and is only
             // offloaded here because it matches the kernel the runtime implements.
             env.getConfig()
                     .getConfiguration()
-                    .setString("table.exec.gpu-offload.min-row-cost", "1");
+                    .setString("table.exec.accelerator.min-row-cost", "1");
         }
 
         final String query =

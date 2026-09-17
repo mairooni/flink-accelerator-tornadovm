@@ -299,11 +299,11 @@ public final class FeatureGramBenchmark {
         }
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         if (args.offload) {
-            tEnv.getConfig().getConfiguration().setString("table.exec.gpu-offload.enabled", "true");
+            tEnv.getConfig().getConfiguration().setString("table.exec.accelerator.enabled", "true");
             if (!args.fuseAggregate) {
                 tEnv.getConfig()
                         .getConfiguration()
-                        .setString("table.exec.gpu-offload.fuse-aggregate", "false");
+                        .setString("table.exec.accelerator.fuse-aggregate", "false");
             }
         }
         return tEnv;

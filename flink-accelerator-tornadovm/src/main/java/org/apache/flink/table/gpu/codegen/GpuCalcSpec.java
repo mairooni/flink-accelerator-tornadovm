@@ -96,7 +96,7 @@ public final class GpuCalcSpec implements Serializable {
         return outputType;
     }
 
-    /** Rows staged before each kernel launch, from {@code table.exec.gpu-offload.batch-size}. */
+    /** Rows staged before each kernel launch, from {@code table.exec.accelerator.batch-size}. */
     public int batchSize() {
         return batchSize;
     }

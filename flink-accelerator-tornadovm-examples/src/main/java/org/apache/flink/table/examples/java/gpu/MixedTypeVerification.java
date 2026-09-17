@@ -120,7 +120,7 @@ public final class MixedTypeVerification {
         final TableEnvironment env = environment(args);
         env.executeSql(mixed(args.data, args.format));
         if (gpu) {
-            env.getConfig().getConfiguration().setString("table.exec.gpu-offload.enabled", "true");
+            env.getConfig().getConfiguration().setString("table.exec.accelerator.enabled", "true");
         }
         String query =
                 "SELECT COUNT(*) AS rows_seen, SUM(h) AS total\n"

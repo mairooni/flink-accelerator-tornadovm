@@ -189,14 +189,14 @@ public final class HaversineBenchmark {
         env.executeSql(points(args.data, args.format));
 
         if (args.gpu) {
-            env.getConfig().getConfiguration().setString("table.exec.gpu-offload.enabled", "true");
+            env.getConfig().getConfiguration().setString("table.exec.accelerator.enabled", "true");
             if (!args.fuseAggregate) {
                 // The unfused arm: the Calc still runs on the device, the SUM above it still runs
                 // on the CPU, and the projected rows travel between them. That is what fusing is
                 // measured against, and both arms have to be one session apart at most.
                 env.getConfig()
                         .getConfiguration()
-                        .setString("table.exec.gpu-offload.fuse-aggregate", "false");
+                        .setString("table.exec.accelerator.fuse-aggregate", "false");
             }
             if (args.requireDevice) {
                 // Asks the scheduler for a slot that declares the resource, rather than taking
@@ -204,9 +204,9 @@ public final class HaversineBenchmark {
                 // specifying the whole slot: Flink rejects a slot sharing group that names an
                 // external resource without also naming cpu cores and task heap.
                 Configuration conf = env.getConfig().getConfiguration();
-                conf.setString("table.exec.gpu-offload.require-device", "true");
-                conf.setString("table.exec.gpu-offload.device.cpu-cores", args.deviceCpuCores);
-                conf.setString("table.exec.gpu-offload.device.task-heap", args.deviceTaskHeap);
+                conf.setString("table.exec.accelerator.require-device", "true");
+                conf.setString("table.exec.accelerator.device.cpu-cores", args.deviceCpuCores);
+                conf.setString("table.exec.accelerator.device.task-heap", args.deviceTaskHeap);
             }
         }
 

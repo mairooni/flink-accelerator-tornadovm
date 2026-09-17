@@ -146,8 +146,12 @@ class AccelKernelGeneratorTest {
                 "only the referenced column is staged; field 0 is projected through");
         assertEquals(1, kernel.outputCount());
         assertTrue(kernel.hasFilter());
-        assertTrue(kernel.source().contains("out0.set(i, ((c1 * 2.0) + 1.0));"), kernel.source());
-        assertTrue(kernel.source().contains("if ((c1 > 0.5))"), kernel.source());
+        // Since common-subexpression elimination the kernel is straight-line code, so each
+        // operation is named where it is computed and used by name afterwards. Asserting the
+        // operations appear, rather than where, keeps this test about the arithmetic.
+        assertTrue(kernel.source().contains("= (c1 * 2.0);"), kernel.source());
+        assertTrue(kernel.source().contains("+ 1.0);"), kernel.source());
+        assertTrue(kernel.source().contains("= (c1 > 0.5);"), kernel.source());
     }
 
     @Test
@@ -257,7 +261,7 @@ class AccelKernelGeneratorTest {
         GpuKernelSource kernel = generate(Collections.singletonList(projection), condition);
 
         assertArrayEquals(new int[] {1, 3}, kernel.inputFieldIndexes());
-        assertTrue(kernel.source().contains("if ((c3 < 0.5))"), kernel.source());
+        assertTrue(kernel.source().contains("= (c3 < 0.5);"), kernel.source());
     }
 
     @Test
@@ -332,7 +336,8 @@ class AccelKernelGeneratorTest {
 
         // SQL says a comparison with a null is UNKNOWN and UNKNOWN does not select. That is one
         // extra term in the mask rather than a separate mechanism.
-        assertTrue(kernel.source().contains("if ((v1 != 0 && (c1 > 1.0)))"), kernel.source());
+        assertTrue(kernel.source().contains("= (c1 > 1.0);"), kernel.source());
+        assertTrue(kernel.source().contains("v1 != 0 &&"), kernel.source());
     }
 
     @Test
@@ -351,7 +356,87 @@ class AccelKernelGeneratorTest {
 
         // Without this, writing the predicate a user would reach for made their query *less*
         // offloadable than omitting it -- IS NOT NULL had no IR at all. See M2.9.
-        assertTrue(kernel.source().contains("if ((v1 != 0))"), kernel.source());
+        assertTrue(kernel.source().contains("= (v1 != 0);"), kernel.source());
+    }
+
+    @Test
+    @DisplayName("a subexpression used twice is computed once")
+    void repeatedSubexpressionIsComputedOnce() {
+        // (c0 * 2.0) + (c0 * 2.0). Calcite hands the generator two separate nodes that happen to
+        // render the same, which is exactly the shape LEAST produces at scale.
+        AccelExpression twice = call(AccelFunction.TIMES, col(0), lit(2.0));
+        AccelExpression sum =
+                new AccelCall(
+                        AccelFunction.PLUS,
+                        Arrays.asList(twice, call(AccelFunction.TIMES, col(0), lit(2.0))),
+                        new DoubleType(false));
+
+        String source = generate(Collections.singletonList(sum), null).source();
+
+        assertEquals(
+                1,
+                occurrences(source, "(c0 * 2.0)"),
+                "the multiply must be emitted once and used twice:\n" + source);
+    }
+
+    /**
+     * The shape that made the haversine benchmark stop offloading, in miniature.
+     *
+     * <p>{@code LEAST} over n arguments expands into nested conditionals that mention each operand
+     * several times over. Before subexpressions were named, the emitted source grew far faster than
+     * the operation count -- at {@code --depots 20} it passed 20 000 characters and javac rejected
+     * it, while the planner counted 359 operations. This pins the property that broke: source size
+     * tracks distinct operations.
+     */
+    @Test
+    @DisplayName("LEAST over a repeated expression does not multiply the source")
+    void leastDoesNotMultiplyTheSource() {
+        AccelExpression a = call(AccelFunction.TIMES, col(0), lit(2.0));
+        AccelExpression b = call(AccelFunction.TIMES, col(1), lit(3.0));
+        AccelExpression c = call(AccelFunction.TIMES, col(0), lit(4.0));
+        AccelExpression least =
+                new AccelCall(AccelFunction.LEAST, Arrays.asList(a, b, c), new DoubleType(false));
+
+        String source = generate(Collections.singletonList(least), null).source();
+
+        assertEquals(1, occurrences(source, "(c0 * 2.0)"), source);
+        assertEquals(1, occurrences(source, "(c1 * 3.0)"), source);
+        assertEquals(1, occurrences(source, "(c0 * 4.0)"), source);
+    }
+
+    /**
+     * Twenty operands, the size the haversine benchmark uses, with the accumulator named.
+     *
+     * <p>The fold writes its own accumulator three times per operand — {@code (next != next ||
+     * folded < next) ? folded : next} — so folding it inline triples the text at every step.
+     * Measured 2026-09-17 at {@code --depots 20}: 861 MB of generated source before subexpressions
+     * were named at all, 18.9 MB once the operands were named but the fold was not, and javac
+     * rejecting both with "code too large". Naming each step makes it one statement per operand.
+     */
+    @Test
+    @DisplayName("a twenty-way LEAST emits one statement per operand, not three to the power of it")
+    void wideLeastStaysLinear() {
+        List<AccelExpression> operands = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            operands.add(call(AccelFunction.TIMES, call(AccelFunction.SIN, col(0)), lit(1.0 + i)));
+        }
+        AccelExpression least = new AccelCall(AccelFunction.LEAST, operands, new DoubleType(false));
+
+        String source = generate(Collections.singletonList(least), null).source();
+
+        assertTrue(
+                source.length() < 8000,
+                "source grew to " + source.length() + " characters; the fold is duplicating again");
+        // SIN(c0) is the same in all twenty, so it is computed once.
+        assertEquals(1, occurrences(source, "TornadoMath.sin(c0)"), source);
+    }
+
+    private static int occurrences(String haystack, String needle) {
+        int count = 0;
+        for (int at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + 1)) {
+            count++;
+        }
+        return count;
     }
 
     @Test
