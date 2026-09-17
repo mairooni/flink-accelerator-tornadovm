@@ -98,7 +98,9 @@ class BulkColumnarGatherTest {
                         }
                     });
         }
-        return new VectorizedColumnBatch(new ColumnVector[] {vector});
+        VectorizedColumnBatch built = new VectorizedColumnBatch(new ColumnVector[] {vector});
+        built.setNumRows(ROWS);
+        return built;
     }
 
     /** Runs the whole batch through one gather, moving a single row object as a reader does. */
@@ -164,6 +166,57 @@ class BulkColumnarGatherTest {
 
             assertThat(gather.tier()).isEqualTo("tier1-columnar-bulk(100.0% bulk)");
             assertThat(segment.getAtIndex(ValueLayout.JAVA_DOUBLE, 7)).isEqualTo(107.0);
+        }
+    }
+
+    /**
+     * The regression a differential run on cyclone found and every test here missed.
+     *
+     * <p>A reader allocates its vectors once and refills them per batch, so this drives ONE
+     * HeapDoubleVector through three batches, resetting its contents each time exactly as {@code
+     * nextBatch()} does. A gather that holds a run across that boundary copies whichever batch the
+     * reader finished with -- here, three times the last batch's values, which are entirely
+     * plausible numbers in the right range.
+     */
+    @Test
+    void aRefilledVectorIsCopiedBeforeItIsRefilled() {
+        final int batches = 3;
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment segment = arena.allocate((long) ROWS * batches * Double.BYTES);
+            HeapDoubleVector vector = new HeapDoubleVector(ROWS);
+            VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+            batch.setNumRows(ROWS);
+            ColumnarRowData row = new ColumnarRowData(batch);
+            RowGather gather =
+                    RowGather.forColumn(
+                            row,
+                            0,
+                            GpuValueType.DOUBLE,
+                            (position, value) ->
+                                    segment.setAtIndex(ValueLayout.JAVA_DOUBLE, position, value),
+                            segment);
+
+            int position = 0;
+            for (int b = 0; b < batches; b++) {
+                // The refill. Nothing of the previous batch survives it, which is the point.
+                for (int i = 0; i < ROWS; i++) {
+                    vector.vector[i] = 1000.0 * b + i;
+                }
+                for (int i = 0; i < ROWS; i++) {
+                    row.setRowId(i);
+                    gather.accept(row, position++);
+                }
+            }
+            gather.flush();
+
+            for (int b = 0; b < batches; b++) {
+                for (int i = 0; i < ROWS; i++) {
+                    assertThat(segment.getAtIndex(ValueLayout.JAVA_DOUBLE, b * ROWS + i))
+                            .as("batch " + b + " row " + i)
+                            .isEqualTo(1000.0 * b + i);
+                }
+            }
+            assertThat(gather.tier()).isEqualTo("tier1-columnar-bulk(100.0% bulk)");
         }
     }
 

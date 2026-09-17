@@ -185,10 +185,17 @@ class ColumnarSourceDeviceIT {
             harness.open();
             GpuCalcOperator operator = (GpuCalcOperator) harness.getOneInputOperator();
 
+            // One vector and one row object for the whole run, refilled per source batch --
+            // which is what a reader does: ParquetColumnarRowSplitReader allocates its vectors
+            // once and nextBatch() resets and refills them. Building a batch per iteration would
+            // test a shape that never occurs, and did: a staging bug that survives only while the
+            // vectors are distinct reached a measurement run before any test saw it.
+            HeapDoubleVector vector = new HeapDoubleVector(BATCH_ROWS);
+            VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+            batch.setNumRows(BATCH_ROWS);
+            ColumnarRowData row = new ColumnarRowData(batch);
             for (int b = 0; b < SOURCE_BATCHES; b++) {
-                // One row object per source batch, moved across it -- which is what
-                // ColumnarRowIterator.next() does.
-                ColumnarRowData row = new ColumnarRowData(batch(b, dictionary));
+                refill(vector, b, dictionary);
                 for (int i = 0; i < BATCH_ROWS; i++) {
                     row.setRowId(i);
                     harness.processElement(new StreamRecord<>(row));
@@ -208,9 +215,9 @@ class ColumnarSourceDeviceIT {
         return emitted;
     }
 
-    /** One double column holding the values for source batch {@code b}. */
-    private static VectorizedColumnBatch batch(int b, boolean dictionary) {
-        HeapDoubleVector vector = new HeapDoubleVector(BATCH_ROWS);
+    /** Refills the reader's one vector with the values for source batch {@code b}. */
+    private static void refill(HeapDoubleVector vector, int b, boolean dictionary) {
+        vector.reset();
         if (dictionary) {
             vector.setDictionary(new ValueDictionary(b));
             org.apache.flink.table.data.columnar.vector.heap.HeapIntVector ids =
@@ -223,7 +230,6 @@ class ColumnarSourceDeviceIT {
                 vector.vector[i] = value(b * BATCH_ROWS + i);
             }
         }
-        return new VectorizedColumnBatch(new ColumnVector[] {vector});
     }
 
     /** Decodes an id back to the value the row would have held. */

@@ -58,6 +58,6 @@ final class ColumnarGather implements RowGather {
 
     @Override
     public String tier() {
-        return "tier1-columnar(per-row; bulk path needs accessor patch)";
+        return "tier1-columnar(per-row; not a DOUBLE column)";
     }
 }

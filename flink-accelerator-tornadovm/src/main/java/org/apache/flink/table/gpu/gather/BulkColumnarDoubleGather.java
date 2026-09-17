@@ -46,9 +46,13 @@ import java.lang.foreign.ValueLayout;
  * a copy from the wrong offset, silently, with entirely plausible values in it.
  *
  * <p>So {@link #accept} holds the run's bounds and nothing else: while each row continues the run
- * -- same batch, next row id, next staging position -- it records that and returns, and {@link
- * #flush} issues the copy. Per row that is two field reads and three comparisons, against a virtual
- * accessor call with its bounds and null checks.
+ * -- same vector, next row id, next staging position -- it records that and returns, and the copy
+ * is issued at the end of the source batch. Per row that is two field reads and three comparisons,
+ * against a virtual accessor call with its bounds and null checks.
+ *
+ * <p>A run never outlives its source batch, and that is a correctness bound rather than a tidy one:
+ * a reader allocates its vectors once and refills them per batch, so the array a pending run points
+ * into stops holding that run's values as soon as the reader moves on.
  *
  * <h2>When the bulk path is not valid</h2>
  *
@@ -98,6 +102,7 @@ public final class BulkColumnarDoubleGather implements RowGather {
                 && rowId == runStartRowId + runLength
                 && position == runStartPosition + runLength) {
             runLength++;
+            flushIfBatchEnds(batch, rowId);
             return;
         }
 
@@ -109,6 +114,7 @@ public final class BulkColumnarDoubleGather implements RowGather {
             runStartRowId = rowId;
             runStartPosition = position;
             runLength = 1;
+            flushIfBatchEnds(batch, rowId);
             return;
         }
         perRowRows++;
@@ -125,6 +131,30 @@ public final class BulkColumnarDoubleGather implements RowGather {
      */
     private boolean copyable(HeapDoubleVector vector) {
         return !vector.hasDictionary() && !vector.hasNulls();
+    }
+
+    /**
+     * Copies the pending run at the last row of its source batch, rather than waiting to be told.
+     *
+     * <p>Not an optimisation -- correctness, and the kind that produces plausible numbers when it
+     * is missing. A reader allocates its vectors once and {@code reset()}s and refills them for
+     * each batch it reads, so the array a run points into stops holding that run's values the
+     * moment the reader moves on. Deferring to the staging batch's flush, a hundred source batches
+     * later, copies whichever batch the reader happened to finish with.
+     *
+     * <p>The end of the source batch is the last moment the data is still there, and it is knowable
+     * here: {@code getNumRows} says how many rows the batch holds. Waiting for the next row to
+     * arrive and noticing it belongs to a different batch is already too late -- the refill has
+     * happened by then.
+     *
+     * <p>Found by a differential arm on cyclone, where a Parquet-sourced sum came back differing
+     * from the CPU's in the seventh significant digit. Neither the host nor the device test caught
+     * it: both built a vector per source batch and so never reused one.
+     */
+    private void flushIfBatchEnds(VectorizedColumnBatch batch, int rowId) {
+        if (rowId + 1 >= batch.getNumRows()) {
+            flush();
+        }
     }
 
     @Override
