@@ -2,7 +2,7 @@
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
+ * regarding ownership.  The ASF licenses this file
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -18,103 +18,83 @@
 
 package org.apache.flink.table.gpu.codegen;
 
-import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.types.logical.RowType;
 
 import java.io.Serializable;
-import java.util.Arrays;
 
 /**
- * Everything needed to run a {@code Calc} and the ungrouped aggregate above it as one device pass.
+ * A {@code SUM} grouped by one key, run by cuDF over the columns a generated kernel just wrote.
  *
- * <p>Travels in the JobGraph and names no TornadoVM type, for the same reason {@link GpuCalcSpec}
- * does: a TaskManager without the GPU module has to be able to deserialize it in order to decide
- * that it cannot serve it.
+ * <p>Two field indices and a row type is all this needs to be, because the projection underneath is
+ * already described by a {@link GpuCalcSpec}: {@link #keyField()} and {@link #valueField()} name
+ * columns of <em>that</em> spec's output row, and the buffers holding them are the kernel's own. No
+ * copy sits between the two stages -- the whole point of putting them in one task graph -- so the
+ * aggregate is addressed by field index rather than by a buffer it would otherwise have to own.
  *
- * <h2>Why the pair and not the aggregate alone</h2>
+ * <h2>Why one key and one sum</h2>
  *
- * <p>Offloading the aggregate by itself would be a loss. The contraction is two weighted operations
- * a row against the Calc's hundred-odd, so it earns nothing on its own, and reaching it through a
- * separate operator would mean the Calc writing rows to the host and the aggregate uploading them
- * again. The value is entirely in the intermediate never landing: the kernel writes the projected
- * columns to a device buffer and the contraction reads that buffer in place.
+ * <p>Because that is what the cuDF binding exposes ({@code Cudf.groupSum}), and widening it is a
+ * matter of more shim entry points rather than a different design here. A query with two grouping
+ * columns or a second aggregate is declined by the provider and runs on the CPU, which is the same
+ * answer it gets today.
  *
- * <h2>What the contraction is</h2>
+ * <h2>Why the operator may emit several rows per key</h2>
  *
- * <p>{@code SUM(e1), ..., SUM(ek)} over the {@code rows x k} matrix the kernel just wrote is {@code
- * ones' * M} -- one GEMV, not <em>k</em> reductions. That is the shape a library serves well and
- * the one TornadoVM's {@code @Reduce} cannot express at all, since it fuses no multiple reductions.
+ * <p>It is a <em>partial</em> aggregate. Flink splits {@code GROUP BY} into a local aggregate, a
+ * shuffle, and a merge, and only the local half is offered here; the merge stage downstream
+ * combines whatever this emits. That is what makes the operator stateless across batches -- stage a
+ * batch, group it, emit its groups, forget it -- and it is the reason a device-side hash table
+ * spanning the whole partition is not needed to be correct.
  */
-@Internal
 public final class GpuAggregateSpec implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    /** Marks an output field that is {@code COUNT(*)} rather than a sum of a staged column. */
-    public static final int COUNT_STAR = -1;
-
-    private final GpuKernelSource kernel;
-    private final int[] sumSources;
-    private final RowType calcOutputType;
+    private final int keyField;
+    private final int valueField;
+    private final RowType projectionType;
     private final RowType outputType;
-    private final int batchSize;
 
     public GpuAggregateSpec(
-            GpuKernelSource kernel,
-            int[] sumSources,
-            RowType calcOutputType,
-            RowType outputType,
-            int batchSize) {
-        if (sumSources.length != outputType.getFieldCount()) {
+            int keyField, int valueField, RowType projectionType, RowType outputType) {
+        if (outputType.getFieldCount() != 2) {
             throw new IllegalArgumentException(
-                    "every aggregate output needs a source: "
-                            + outputType.getFieldCount()
-                            + " fields against "
-                            + sumSources.length
-                            + " sources");
+                    "a grouped aggregate emits (key, sum), not " + outputType);
         }
-        this.kernel = kernel;
-        this.sumSources = sumSources;
-        this.calcOutputType = calcOutputType;
+        this.keyField = keyField;
+        this.valueField = valueField;
+        this.projectionType = projectionType;
         this.outputType = outputType;
-        this.batchSize = batchSize;
-    }
-
-    /** The Calc's kernel, whose outputs the contraction reads. */
-    public GpuKernelSource kernel() {
-        return kernel;
     }
 
     /**
-     * For each aggregate output field, the Calc output column summed into it, or {@link
-     * #COUNT_STAR}.
+     * The row the projection produces, which is this aggregate's input and not what it emits.
+     *
+     * <p>Carried because the operator builds its {@link GpuCalcSpec} on the TaskManager, where
+     * Flink offers the node's <em>output</em> type -- one row a group -- and the staging needs the
+     * other one.
      */
-    public int[] sumSources() {
-        return sumSources;
+    public RowType projectionType() {
+        return projectionType;
     }
 
-    /** Row type the Calc produces, which is the contraction's input. */
-    public RowType calcOutputType() {
-        return calcOutputType;
+    /** The grouping column, as a field of the projection's output row. */
+    public int keyField() {
+        return keyField;
     }
 
-    /** Row type of the partial aggregate this emits: one row, at end of input. */
+    /** The summed column, as a field of the projection's output row. */
+    public int valueField() {
+        return valueField;
+    }
+
+    /** What this operator emits: the key, then the partial sum. */
     public RowType outputType() {
         return outputType;
     }
 
-    public int batchSize() {
-        return batchSize;
-    }
-
     @Override
     public String toString() {
-        return "GpuAggregateSpec["
-                + kernel.className()
-                + ", sums="
-                + Arrays.toString(sumSources)
-                + ", batch="
-                + batchSize
-                + "]";
+        return "GpuAggregateSpec{SUM(f" + valueField + ") GROUP BY f" + keyField + "}";
     }
 }

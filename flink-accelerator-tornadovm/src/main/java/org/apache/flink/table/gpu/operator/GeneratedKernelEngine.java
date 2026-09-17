@@ -18,6 +18,7 @@
 
 package org.apache.flink.table.gpu.operator;
 
+import org.apache.flink.table.gpu.codegen.GpuAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
@@ -35,6 +36,7 @@ import uk.ac.manchester.tornado.api.enums.ProfilerMode;
 import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
+import uk.ac.manchester.tornado.cudf.Cudf;
 
 import javax.annotation.Nullable;
 
@@ -47,7 +49,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Stream;
 
 /**
@@ -99,9 +103,40 @@ public final class GeneratedKernelEngine implements AutoCloseable {
     private GeneratedKernel generated;
     private TornadoExecutionPlan plan;
 
+    /**
+     * The same kernel without the cuDF stage, built on the first short batch and only then.
+     *
+     * <p>{@code Cudf.groupSum} takes its row count as a value captured when the task graph is
+     * built, unlike the kernel, which re-reads {@link #rows} on every execution. A partition's last
+     * batch is short, and running the group-by over a full batch's worth of buffer would fold in
+     * whatever the previous batch left in the tail -- a wrong answer, not a slow one. So the tail
+     * runs the projection alone and is grouped on the host: one batch out of however many the
+     * partition had, at a point where the stream is ending anyway.
+     */
+    private TornadoExecutionPlan tailPlan;
+
+    private WorkerGrid1D tailGrid;
+
+    /** Kept from {@link #open()} so the tail plan can be built from the same compiled kernel. */
+    private Method entry;
+
+    private Object[] kernelArgs;
+
+    /** Where the cuDF stage writes: one row per distinct key, and the count of them. */
+    private IntArray groupKeys;
+
+    private DoubleArray groupSums;
+    private IntArray groupCount;
+
+    /** How many groups the last execution produced. */
+    private int groups;
+
     private final OffloadMetrics metrics = new OffloadMetrics();
 
     private final @Nullable Staging staging;
+
+    /** The grouped aggregate to run over the kernel's output, or null to stop at the kernel. */
+    private final @Nullable GpuAggregateSpec aggregate;
 
     public GeneratedKernelEngine(GpuCalcSpec spec, boolean profile) {
         this(spec, profile, null);
@@ -115,7 +150,22 @@ public final class GeneratedKernelEngine implements AutoCloseable {
      *     a plan compiled before Flink declared anything.
      */
     public GeneratedKernelEngine(GpuCalcSpec spec, boolean profile, @Nullable Staging staging) {
+        this(spec, null, profile, staging);
+    }
+
+    /**
+     * @param aggregate a {@code SUM} grouped by one of the kernel's own output columns, run by cuDF
+     *     in the same task graph. The intermediate the kernel writes is read by the group-by where
+     *     it lies, so the only thing that crosses the interconnect is one row per group -- which is
+     *     the entire reason for composing them rather than running two graphs.
+     */
+    public GeneratedKernelEngine(
+            GpuCalcSpec spec,
+            @Nullable GpuAggregateSpec aggregate,
+            boolean profile,
+            @Nullable Staging staging) {
         this.spec = spec;
+        this.aggregate = aggregate;
         this.profile = profile;
         this.staging = staging;
     }
@@ -157,7 +207,15 @@ public final class GeneratedKernelEngine implements AutoCloseable {
             outNulls.init(0);
         }
 
-        Method entry = compile(kernel);
+        entry = compile(kernel);
+        if (aggregate != null) {
+            // Sized to the batch rather than to the group count, which nobody knows in advance:
+            // every row its own group is the worst case and it is the only safe one.
+            groupKeys = new IntArray(batchSize);
+            groupSums = new DoubleArray(batchSize);
+            groupCount = new IntArray(1);
+            groupCount.set(0, 0);
+        }
 
         Object[] args =
                 new Object
@@ -181,6 +239,7 @@ public final class GeneratedKernelEngine implements AutoCloseable {
             args[at++] = outNulls;
         }
         args[at] = rows;
+        kernelArgs = args;
 
         TaskGraph graph = new TaskGraph("calc");
         graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inputs);
@@ -191,14 +250,34 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         // Naming the kernel by Method rather than by a method reference is what makes a generated
         // kernel possible at all: a method reference would have to exist in source.
         graph = graph.task("kernel", entry, args);
-        List<Object> back = new ArrayList<>(Arrays.asList(outputs));
-        if (mask != null) {
-            back.add(mask);
+        Object[] results;
+        if (aggregate != null) {
+            // The two columns the group-by reads are the ones the task above just wrote, still on
+            // the device. Naming them by field lets a grouping key be either a computed column or
+            // a staged one that the projection only passed through.
+            graph =
+                    graph.libraryTask(
+                            "agg",
+                            Cudf::groupSum,
+                            batchSize,
+                            (IntArray) bufferFor(aggregate.keyField()),
+                            (DoubleArray) bufferFor(aggregate.valueField()),
+                            groupKeys,
+                            groupSums,
+                            groupCount);
+            // One row a group comes back, not one a row. On the query this was first measured on
+            // that is four orders of magnitude less to copy out.
+            results = new Object[] {groupKeys, groupSums, groupCount};
+        } else {
+            List<Object> back = new ArrayList<>(Arrays.asList(outputs));
+            if (mask != null) {
+                back.add(mask);
+            }
+            if (outNulls != null) {
+                back.add(outNulls);
+            }
+            results = back.toArray();
         }
-        if (outNulls != null) {
-            back.add(outNulls);
-        }
-        Object[] results = back.toArray();
         graph = graph.transferToHost(DataTransferMode.EVERY_EXECUTION, results);
 
         // An explicit iteration space, and it is not optional.
@@ -344,11 +423,103 @@ public final class GeneratedKernelEngine implements AutoCloseable {
      */
     public Execution execute(int stagedRows) {
         rows.set(0, stagedRows);
-        grid.setGlobalWork(stagedRows, 1, 1);
+        boolean tail = aggregate != null && stagedRows != spec.batchSize();
+        WorkerGrid1D live = tail ? tailGrid() : grid;
+        live.setGlobalWork(stagedRows, 1, 1);
+        TornadoExecutionPlan livePlan = tail ? tailPlan : plan;
         long t0 = System.nanoTime();
-        TornadoExecutionResult result = withKernelLoader(plan::execute);
+        TornadoExecutionResult result = withKernelLoader(livePlan::execute);
+        if (tail) {
+            groupOnHost(stagedRows);
+        } else if (aggregate != null) {
+            groups = groupCount.get(0);
+        }
         long wall = System.nanoTime() - t0;
         return new Execution(wall, profile ? result.getProfilerResult() : null);
+    }
+
+    /**
+     * How many groups the last execution produced. Only meaningful on an engine with an aggregate.
+     */
+    public int groups() {
+        return groups;
+    }
+
+    /** The grouping key of one group of the last execution. */
+    public int groupKey(int group) {
+        return groupKeys.get(group);
+    }
+
+    /** The partial sum of one group of the last execution. */
+    public double groupSum(int group) {
+        return groupSums.get(group);
+    }
+
+    /**
+     * The buffer holding one field of the kernel's output row.
+     *
+     * <p>A field is either computed -- the kernel's own outputs fill those slots in order -- or
+     * copied straight from a staged input column, which the kernel never writes but which is on the
+     * device all the same. Both are addressable, so a {@code GROUP BY} on a raw column costs no
+     * more than one on an expression.
+     */
+    private Object bufferFor(int field) {
+        int computed = spec.computedSlot(field);
+        return computed >= 0 ? outputs[computed] : inputs[spec.stagedColumn(field)];
+    }
+
+    /**
+     * Builds the projection-only plan for a partition's last, short batch.
+     *
+     * <p>Lazily, because most operator instances never reach the branch on a full partition and the
+     * build costs a device compilation of the same kernel.
+     */
+    private WorkerGrid1D tailGrid() {
+        if (tailPlan != null) {
+            return tailGrid;
+        }
+        TaskGraph graph = new TaskGraph("tail");
+        graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inputs);
+        graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, rows);
+        if (inNulls != null) {
+            graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inNulls);
+        }
+        graph = graph.task("kernel", entry, kernelArgs);
+        graph =
+                graph.transferToHost(
+                        DataTransferMode.EVERY_EXECUTION,
+                        bufferFor(aggregate.keyField()),
+                        bufferFor(aggregate.valueField()));
+        tailGrid = new WorkerGrid1D(spec.batchSize());
+        GridScheduler scheduler = new GridScheduler();
+        scheduler.addWorkerGrid("tail.kernel", tailGrid);
+        tailPlan = new TornadoExecutionPlan(graph.snapshot()).withGridScheduler(scheduler);
+        if (profile) {
+            tailPlan = tailPlan.withProfiler(ProfilerMode.SILENT);
+        }
+        return tailGrid;
+    }
+
+    /**
+     * Groups the tail batch the ordinary way, writing into the same buffers cuDF would have.
+     *
+     * <p>The caller downstream cannot tell the difference, and does not need to: a partial
+     * aggregate is allowed to emit several rows per key, so nothing about the tail has to match
+     * what the device produced for the batches before it.
+     */
+    private void groupOnHost(int stagedRows) {
+        IntArray keys = (IntArray) bufferFor(aggregate.keyField());
+        DoubleArray values = (DoubleArray) bufferFor(aggregate.valueField());
+        Map<Integer, Double> sums = new HashMap<>();
+        for (int i = 0; i < stagedRows; i++) {
+            sums.merge(keys.get(i), values.get(i), Double::sum);
+        }
+        groups = 0;
+        for (Map.Entry<Integer, Double> group : sums.entrySet()) {
+            groupKeys.set(groups, group.getKey());
+            groupSums.set(groups, group.getValue());
+            groups++;
+        }
     }
 
     /**
@@ -387,6 +558,10 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         if (plan != null) {
             plan.close();
             plan = null;
+        }
+        if (tailPlan != null) {
+            tailPlan.close();
+            tailPlan = null;
         }
         if (generated != null) {
             generated.close();

@@ -85,6 +85,18 @@ under the License.
 			<version>${tornado.version}</version>
 			<scope>provided</scope>
 		</dependency>
+		<!--
+			cuDF, for the relational primitives a generated kernel cannot express: a grouped
+			aggregate needs cross-row cooperation that no @Parallel loop states. Provided, like
+			the rest: the module is on the TornadoVM SDK's module path, and it reports itself
+			unavailable on a host where the shim has not been built, which is most of them.
+		-->
+		<dependency>
+			<groupId>io.github.beehive-lab</groupId>
+			<artifactId>tornado-cudf</artifactId>
+			<version>${tornado.version}</version>
+			<scope>provided</scope>
+		</dependency>
 		<!-- The operator test harness, for the device-gated tests under -Pdevice. -->
 		<dependency>
 			<groupId>org.apache.flink</groupId>

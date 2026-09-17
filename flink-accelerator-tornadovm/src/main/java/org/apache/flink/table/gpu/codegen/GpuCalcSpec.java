@@ -142,6 +142,60 @@ public final class GpuCalcSpec implements Serializable {
         return true;
     }
 
+    /**
+     * The device-side width of one output field, whether the kernel computes it or copies it.
+     *
+     * <p>Both answers name a buffer that is on the device during a batch, which is what lets a
+     * later stage in the same task graph -- cuDF's group-by, say -- read an output field without
+     * caring which of the two it was. The resolution has to agree with the engine's, so it lives
+     * here rather than in either caller.
+     */
+    public GpuValueType fieldType(int field) {
+        int computed = computedSlot(field);
+        return computed >= 0
+                ? kernel.outputTypes()[computed]
+                : kernel.inputTypes()[stagedColumn(field)];
+    }
+
+    /**
+     * Which of the kernel's outputs holds this field, or -1 if the field is copied rather than
+     * computed. The kernel's outputs fill the {@code COMPUTED} slots in order.
+     */
+    public int computedSlot(int field) {
+        if (outputLayout[field] != COMPUTED) {
+            return -1;
+        }
+        int computed = 0;
+        for (int i = 0; i < field; i++) {
+            if (outputLayout[i] == COMPUTED) {
+                computed++;
+            }
+        }
+        return computed;
+    }
+
+    /** Which staged input column holds this field, or -1 if the kernel computes it. */
+    public int stagedColumn(int field) {
+        if (outputLayout[field] == COMPUTED) {
+            return -1;
+        }
+        if (kernel == null) {
+            throw new IllegalStateException("a spec with no kernel stages nothing");
+        }
+        int[] staged = kernel.inputFieldIndexes();
+        for (int i = 0; i < staged.length; i++) {
+            if (staged[i] == outputLayout[field]) {
+                return i;
+            }
+        }
+        throw new IllegalStateException(
+                "field "
+                        + field
+                        + " is copied from input field "
+                        + outputLayout[field]
+                        + ", which this kernel does not stage");
+    }
+
     @Override
     public String toString() {
         return "GpuCalcSpec["

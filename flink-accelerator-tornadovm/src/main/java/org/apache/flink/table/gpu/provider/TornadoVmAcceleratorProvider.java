@@ -20,15 +20,21 @@ package org.apache.flink.table.gpu.provider;
 
 import org.apache.flink.streaming.api.operators.SimpleOperatorFactory;
 import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
+import org.apache.flink.table.accelerator.AccelAggCall;
+import org.apache.flink.table.accelerator.AccelAggFunction;
+import org.apache.flink.table.accelerator.AccelAggregate;
 import org.apache.flink.table.accelerator.AccelFunction;
 import org.apache.flink.table.accelerator.AccelIrVersion;
 import org.apache.flink.table.accelerator.AccelNode;
 import org.apache.flink.table.accelerator.AccelWorkProfile;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gpu.codegen.AccelKernelGenerator;
+import org.apache.flink.table.gpu.codegen.GpuAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
+import org.apache.flink.table.gpu.codegen.GpuValueType;
 import org.apache.flink.table.gpu.operator.GpuCalcOperator;
+import org.apache.flink.table.gpu.operator.GpuGroupedAggregateOperator;
 import org.apache.flink.table.runtime.accelerator.AcceleratorContext;
 import org.apache.flink.table.runtime.accelerator.AcceleratorCost;
 import org.apache.flink.table.runtime.accelerator.AcceleratorPlan;
@@ -36,6 +42,8 @@ import org.apache.flink.table.runtime.accelerator.AcceleratorProvider;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.io.Serializable;
 import java.util.Optional;
@@ -82,6 +90,33 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      */
     private static final String UNAVAILABLE = probeTornado();
 
+    /**
+     * Whether the cuDF binding can actually run here.
+     *
+     * <p>Two things have to be true and neither usually is: TornadoVM must ship the {@code
+     * tornado-cudf} module, and the host must have {@code libtornado-cudf.so} built against RAPIDS.
+     * Probed reflectively so that a deployment without the module gets a declined aggregate rather
+     * than a {@code NoClassDefFoundError} while this class initialises.
+     */
+    private static final boolean CUDF_AVAILABLE = probeCudf();
+
+    private static boolean probeCudf() {
+        if (UNAVAILABLE != null) {
+            return false;
+        }
+        try {
+            Class<?> provider =
+                    Class.forName(
+                            "uk.ac.manchester.tornado.cudf.provider.CudfLibraryProvider",
+                            true,
+                            TornadoVmAcceleratorProvider.class.getClassLoader());
+            return (Boolean) provider.getMethod("isAvailable").invoke(null);
+        } catch (Throwable t) {
+            LOG.debug("the cuDF binding is unavailable: {}", String.valueOf(t));
+            return false;
+        }
+    }
+
     private static String probeTornado() {
         try {
             // Loading the class is the check; it drags in DoubleArray and IntArray.
@@ -113,6 +148,9 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
     public Optional<AcceleratorPlan> accept(AccelNode subtree, AccelWorkProfile work) {
         if (UNAVAILABLE != null) {
             return Optional.empty();
+        }
+        if (subtree instanceof AccelAggregate) {
+            return acceptAggregate((AccelAggregate) subtree, work);
         }
         if (work.totalOpsPerRow() > MAX_OPS_PER_ROW) {
             LOG.debug(
@@ -154,13 +192,109 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             // into a field that is not one.
             return Optional.empty();
         }
-        return Optional.of(new TornadoPlan(kernel.get(), estimateCost(work)));
+        return Optional.of(new TornadoPlan(kernel.get(), null, estimateCost(work)));
+    }
+
+    /**
+     * A local {@code GROUP BY}, served by the projection kernel and cuDF's group-by in one task
+     * graph.
+     *
+     * <p>Every refusal below is a shape {@code Cudf.groupSum} has no answer for, not a shape that
+     * would merely be slow. One key and one {@code SUM} is what the binding exposes; the rest is
+     * what the fused pair can be trusted with:
+     *
+     * <ul>
+     *   <li><b>No filter.</b> The group-by reads the kernel's output buffers where they lie, and a
+     *       filtered row is still in them — the kernel writes a selection mask rather than
+     *       compacting. Summing it would count rows the {@code WHERE} excluded. Compacting on the
+     *       device first is the fix, and it is a task of its own.
+     *   <li><b>No nullable operand.</b> A null key becomes a group and a null summand poisons one.
+     *       {@code NOT NULL} in the DDL is the sanctioned answer, as it is for a Calc.
+     *   <li><b>An {@code INT} key and a {@code DOUBLE} sum</b>, because that is the one shim entry
+     *       point; widening it adds entry points rather than changing anything here.
+     * </ul>
+     */
+    private Optional<AcceleratorPlan> acceptAggregate(AccelAggregate agg, AccelWorkProfile work) {
+        // Louder than the Calc path's reasons, which are DEBUG. A declined Calc is the ordinary
+        // case and there is one per subtree; a declined aggregate means the planner built a fused
+        // node for this query and then found nothing to run it, which happens once per operator and
+        // is the question an operator will actually ask. Finding out took a cluster round trip once
+        // already, because a DEBUG line is only useful on a cluster configured to print it.
+        if (!CUDF_AVAILABLE) {
+            LOG.info("declining the aggregate: the cuDF binding is not usable in this JVM");
+            return Optional.empty();
+        }
+        if (agg.grouping().length != 1) {
+            LOG.info("declining the aggregate: {} grouping columns, not 1", agg.grouping().length);
+            return Optional.empty();
+        }
+        if (agg.calls().size() != 1) {
+            LOG.info("declining the aggregate: {} aggregate calls, not 1", agg.calls().size());
+            return Optional.empty();
+        }
+        AccelAggCall call = agg.calls().get(0);
+        if (call.function() != AccelAggFunction.SUM
+                || call.inputField() == AccelAggCall.NO_INPUT_FIELD) {
+            LOG.info("declining the aggregate: {} is not a SUM over a column", call);
+            return Optional.empty();
+        }
+        AccelNode projection = agg.inputs().get(0);
+        Optional<GpuKernelSource> kernel =
+                AccelKernelGenerator.generate(
+                        projection, Integer.toHexString(projection.hashCode()));
+        if (!kernel.isPresent()) {
+            LOG.info("declining the aggregate: no kernel for the projection {}", projection);
+            return Optional.empty();
+        }
+        if (kernel.get().hasFilter() || kernel.get().carriesValidity()) {
+            LOG.info(
+                    "declining the aggregate: the projection filters ({}) or carries nulls ({})",
+                    kernel.get().hasFilter(),
+                    kernel.get().carriesValidity());
+            return Optional.empty();
+        }
+        GpuCalcSpec probe =
+                new GpuCalcSpec(
+                        kernel.get(), kernel.get().outputLayout(), projection.outputType(), 1);
+        if (!probe.canStage()) {
+            LOG.info("declining the aggregate: cannot stage {}", projection.outputType());
+            return Optional.empty();
+        }
+        int keyField = agg.grouping()[0];
+        int valueField = call.inputField();
+        if (probe.fieldType(keyField) != GpuValueType.INT
+                || probe.fieldType(valueField) != GpuValueType.DOUBLE) {
+            LOG.info(
+                    "declining the aggregate: cuDF groupSum takes an INT key and a DOUBLE value, "
+                            + "not {} and {}",
+                    probe.fieldType(keyField),
+                    probe.fieldType(valueField));
+            return Optional.empty();
+        }
+        GpuAggregateSpec aggregate =
+                new GpuAggregateSpec(
+                        keyField, valueField, projection.outputType(), agg.outputType());
+        return Optional.of(new TornadoPlan(kernel.get(), aggregate, estimateCost(work)));
     }
 
     @Override
     public StreamOperatorFactory<RowData> createOperator(
             AcceleratorPlan plan, AcceleratorContext context) {
         GpuKernelSource kernel = ((TornadoPlan) plan).kernel;
+        GpuAggregateSpec aggregate = ((TornadoPlan) plan).aggregate;
+        if (aggregate != null) {
+            // The spec's output row is the projection's, not the operator's: the kernel produces
+            // the aggregate's *input*, and what leaves the operator is one (key, sum) row a group.
+            GpuCalcSpec spec =
+                    new GpuCalcSpec(
+                            kernel,
+                            kernel.outputLayout(),
+                            aggregate.projectionType(),
+                            context.maxBatchSize());
+            return SimpleOperatorFactory.of(
+                    new GpuGroupedAggregateOperator(
+                            spec, aggregate, context.maxBatchSize(), PROFILE, null));
+        }
         GpuCalcSpec spec =
                 new GpuCalcSpec(
                         kernel,
@@ -322,10 +456,15 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         private static final long serialVersionUID = 1L;
 
         private final GpuKernelSource kernel;
+        private final @Nullable GpuAggregateSpec aggregate;
         private final AcceleratorCost cost;
 
-        private TornadoPlan(GpuKernelSource kernel, AcceleratorCost cost) {
+        private TornadoPlan(
+                GpuKernelSource kernel,
+                @Nullable GpuAggregateSpec aggregate,
+                AcceleratorCost cost) {
             this.kernel = kernel;
+            this.aggregate = aggregate;
             this.cost = cost;
         }
 

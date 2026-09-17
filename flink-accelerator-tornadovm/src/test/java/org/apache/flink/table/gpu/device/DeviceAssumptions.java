@@ -97,6 +97,32 @@ final class DeviceAssumptions {
         return PROVIDER;
     }
 
+    /**
+     * Skips the calling test unless the cuDF shim is built on this host.
+     *
+     * <p>A stricter condition than having a device, and separately reported, because it usually
+     * fails on machines where everything else works: {@code libtornado-cudf.so} has to be compiled
+     * against RAPIDS libcudf, which {@code make} does not do. A skip here means the relational
+     * primitives were not checked, not that the card is missing.
+     */
+    static void requireCudf() {
+        requireDevice();
+        assumeTrue(cudfAvailable(), "the cuDF shim (libtornado-cudf.so) is not built on this host");
+    }
+
+    private static boolean cudfAvailable() {
+        try {
+            Class<?> provider =
+                    Class.forName(
+                            "uk.ac.manchester.tornado.cudf.provider.CudfLibraryProvider",
+                            true,
+                            DeviceAssumptions.class.getClassLoader());
+            return (Boolean) provider.getMethod("isAvailable").invoke(null);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private static boolean probe() {
         String selfReport = PROVIDER.toString();
         if (!selfReport.startsWith("TornadoVM (")) {

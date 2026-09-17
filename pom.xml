@@ -68,7 +68,7 @@ under the License.
 			version bump, and the stale classes then fail at run time with
 			"Kernel entry ... has no writeReplace()".
 		-->
-		<tornado.version>6.0.1-jdk21-dev</tornado.version>
+		<tornado.version>6.1.1-jdk21-dev</tornado.version>
 
 		<junit5.version>5.10.2</junit5.version>
 		<assertj.version>3.25.3</assertj.version>
