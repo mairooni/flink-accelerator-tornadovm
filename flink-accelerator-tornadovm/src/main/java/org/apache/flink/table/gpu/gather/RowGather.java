@@ -48,6 +48,19 @@ import java.lang.foreign.MemorySegment;
  */
 public interface RowGather {
 
+    /**
+     * The property that turns the bulk columnar path off, for measuring what it is worth.
+     *
+     * <p>A/B-ing it any other way means changing the source format, and that moves the floor as
+     * well as the staging: reading Parquet is itself several times cheaper than reading CSV, so a
+     * format comparison cannot say which of the two paid. This switch holds everything else still.
+     *
+     * <p>Deployment-level, like every other property here. Nothing at query level changes.
+     */
+    String BULK_COLUMNAR_PROPERTY = "flink.accelerator.tornadovm.bulkColumnar";
+
+    boolean BULK_COLUMNAR = !"false".equals(System.getProperty(BULK_COLUMNAR_PROPERTY));
+
     /** Appends {@code row}'s value for the configured column at {@code position}. */
     void accept(RowData row, int position);
 
@@ -97,7 +110,7 @@ public interface RowGather {
             // double-typed segment, so it has nothing to offer a narrower column; those fall back
             // to the per-row columnar tier rather than getting a second bulk implementation for a
             // path that is not reachable yet anyway (it needs a vectorized source).
-            boolean bulk = targetSegment != null && type == GpuValueType.DOUBLE;
+            boolean bulk = BULK_COLUMNAR && targetSegment != null && type == GpuValueType.DOUBLE;
             return bulk
                     ? new BulkColumnarDoubleGather(field, target, targetSegment)
                     : new ColumnarGather(field, type, target);
