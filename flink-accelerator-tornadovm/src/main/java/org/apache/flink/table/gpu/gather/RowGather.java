@@ -26,7 +26,6 @@ import org.apache.flink.table.gpu.codegen.GpuValueType;
 import javax.annotation.Nullable;
 
 import java.lang.foreign.MemorySegment;
-import java.util.List;
 
 /**
  * Copies one column out of a stream of {@link RowData} into a packed, column-major staging buffer.
@@ -53,15 +52,20 @@ public interface RowGather {
     void accept(RowData row, int position);
 
     /**
-     * Optionally consumes a run of rows in one operation, returning how many were taken.
+     * Writes anything {@link #accept} deferred. Called before the batch is executed, and before the
+     * caller writes to the staging column by any other route.
      *
-     * <p>Returning 0 -- the default -- means the caller falls back to {@link #accept} per row. Only
-     * a source whose data is already column-major can do better, so this is where tier 1 stops
-     * paying the per-row staging cost that dominates every other tier.
+     * <p>Deferring is how a columnar source stops paying per-row staging: consecutive rows of one
+     * {@link org.apache.flink.table.data.columnar.vector.VectorizedColumnBatch} are already packed
+     * and column-major, so a run of them is one {@code MemorySegment.copy} rather than one accessor
+     * call per row. A gather that defers holds only the run's bounds, never the rows -- which is
+     * not a refinement but the whole constraint: Flink's vectorized readers hand out a single
+     * {@code ColumnarRowData} and move its row id, and the Table planner force-enables object reuse
+     * in batch mode, so a retained row is a reference to wherever the reader has got to since.
+     *
+     * <p>No-op for every gather that writes as it goes, which is all of them but one.
      */
-    default int acceptBulk(List<RowData> rows, int from, int to, int position) {
-        return 0;
-    }
+    default void flush() {}
 
     /** Human-readable tier name, for the metrics report. */
     String tier();

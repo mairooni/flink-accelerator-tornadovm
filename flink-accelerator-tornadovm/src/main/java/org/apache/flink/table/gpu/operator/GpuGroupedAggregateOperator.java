@@ -139,6 +139,13 @@ public class GpuGroupedAggregateOperator extends AbstractStreamOperator<RowData>
         // of the chain.
         buffered = 0;
 
+        // As in GpuCalcOperator: a columnar gather holds a run until it is told to write it.
+        for (RowGather g : gathers) {
+            if (g != null) {
+                g.flush();
+            }
+        }
+
         GeneratedKernelEngine.Execution execution = engine.execute(count);
 
         long drainStart = System.nanoTime();
@@ -151,12 +158,35 @@ public class GpuGroupedAggregateOperator extends AbstractStreamOperator<RowData>
         engine.recordBatch(count, 0, execution, groups, System.nanoTime() - drainStart);
     }
 
+    /**
+     * What each staged column's gather actually did, once the batches have run.
+     *
+     * <p>Worth reporting rather than inferring: which tier applies is decided from the first record
+     * seen, so it is a property of what the plan put upstream and not of anything in the plan, and
+     * the bulk tier can silently degrade to per-row access for a column that turns out to be
+     * dictionary-encoded or nullable. A correct result says nothing about which of those happened.
+     */
+    public String[] gatherTiers() {
+        if (gathers == null) {
+            return new String[0];
+        }
+        String[] tiers = new String[gathers.length];
+        for (int i = 0; i < gathers.length; i++) {
+            tiers[i] = gathers[i] == null ? "unbound" : gathers[i].tier();
+        }
+        return tiers;
+    }
+
     @Override
     public void close() throws Exception {
         if (engine != null) {
             OffloadMetrics metrics = engine.metrics();
             if (metrics.getBatches() > 0) {
-                LOG.info(metrics.report("GpuGroupedAggregateOperator " + aggregate));
+                LOG.info(
+                        metrics.report("GpuGroupedAggregateOperator " + aggregate)
+                                + "gather tiers: "
+                                + String.join(", ", gatherTiers())
+                                + System.lineSeparator());
             }
             engine.close();
             engine = null;

@@ -137,6 +137,10 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
             int[] fields = spec.kernel().inputFieldIndexes();
             for (int c = 0; c < fields.length; c++) {
                 if (row.isNullAt(fields[c])) {
+                    // Before writing the column by hand: a gather that is holding a run would
+                    // otherwise copy over this slot when it flushes, turning the benign value
+                    // below back into whatever the source had there.
+                    gathers[c].flush();
                     engine.setInputNull(c, buffered);
                     // The gather still writes a value, and it has to be a benign one: the kernel
                     // computes every row whatever its validity -- branching to skip would cost
@@ -176,6 +180,14 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
         // self-referential plan could re-enter this operator.
         buffered = 0;
 
+        // A columnar gather stages a run of rows as one copy and holds it until told to; nothing
+        // is in the staging buffer for those rows until this returns.
+        for (RowGather g : gathers) {
+            if (g != null) {
+                g.flush();
+            }
+        }
+
         GeneratedKernelEngine.Execution execution = engine.execute(count);
 
         long drainStart = System.nanoTime();
@@ -202,12 +214,35 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
         engine.recordBatch(count, 0, execution, emitted, System.nanoTime() - drainStart);
     }
 
+    /**
+     * What each staged column's gather actually did, once the batches have run.
+     *
+     * <p>Worth reporting rather than inferring: which tier applies is decided from the first record
+     * seen, so it is a property of what the plan put upstream and not of anything in the plan, and
+     * the bulk tier can silently degrade to per-row access for a column that turns out to be
+     * dictionary-encoded or nullable. A correct result says nothing about which of those happened.
+     */
+    public String[] gatherTiers() {
+        if (gathers == null) {
+            return new String[0];
+        }
+        String[] tiers = new String[gathers.length];
+        for (int i = 0; i < gathers.length; i++) {
+            tiers[i] = gathers[i] == null ? "unbound" : gathers[i].tier();
+        }
+        return tiers;
+    }
+
     @Override
     public void close() throws Exception {
         if (engine != null) {
             OffloadMetrics metrics = engine.metrics();
             if (metrics.getBatches() > 0) {
-                LOG.info(metrics.report("GpuCalcOperator " + spec));
+                LOG.info(
+                        metrics.report("GpuCalcOperator " + spec)
+                                + "gather tiers: "
+                                + String.join(", ", gatherTiers())
+                                + System.lineSeparator());
             }
             engine.close();
             engine = null;
