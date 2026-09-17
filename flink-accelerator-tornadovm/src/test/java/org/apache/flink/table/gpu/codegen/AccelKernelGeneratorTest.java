@@ -431,6 +431,53 @@ class AccelKernelGeneratorTest {
         assertEquals(1, occurrences(source, "TornadoMath.sin(c0)"), source);
     }
 
+    @Test
+    @DisplayName("MOD and integer division truncate, so a grouping key is the one SQL computes")
+    void integerDivisionTruncates() {
+        // (id / 1000) with an INT result. In double that is 3.5 where SQL says 3, and the
+        // difference only shows up as wrongly grouped rows.
+        AccelExpression quotient =
+                new AccelCall(
+                        AccelFunction.INT_DIVIDE,
+                        Arrays.asList(intCol(0), lit(1000.0)),
+                        new IntType(false));
+
+        String source = generate(Collections.singletonList(quotient), null).source();
+
+        assertTrue(source.contains("(double) (long)"), source);
+        assertTrue(
+                source.contains("(int) ("), "an INT column is narrowed on the way out:\n" + source);
+    }
+
+    @Test
+    @DisplayName("a divisor that could be zero is refused, because a kernel cannot raise")
+    void computedDivisorIsRefused() {
+        // SQL raises on division by zero; in a kernel a / 0.0 is infinity and (long) of that is a
+        // number, so a computed divisor would turn an error into a wrong answer.
+        AccelExpression quotient =
+                new AccelCall(
+                        AccelFunction.INT_DIVIDE,
+                        Arrays.asList(intCol(0), intCol(1)),
+                        new IntType(false));
+
+        assertFalse(tryGenerate(Collections.singletonList(quotient), null).isPresent());
+    }
+
+    @Test
+    @DisplayName("a zero literal divisor is refused too")
+    void zeroDivisorIsRefused() {
+        AccelExpression quotient =
+                new AccelCall(
+                        AccelFunction.MOD, Arrays.asList(intCol(0), lit(0.0)), new IntType(false));
+
+        assertFalse(tryGenerate(Collections.singletonList(quotient), null).isPresent());
+    }
+
+    /** An INT-typed input column, which a grouping key is built from. */
+    private static AccelExpression intCol(int index) {
+        return new AccelInputRef(index, new IntType(false));
+    }
+
     private static int occurrences(String haystack, String needle) {
         int count = 0;
         for (int at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + 1)) {

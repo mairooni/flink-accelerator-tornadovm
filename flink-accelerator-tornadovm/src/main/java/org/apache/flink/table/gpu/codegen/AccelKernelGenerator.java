@@ -371,12 +371,18 @@ public final class AccelKernelGenerator {
                         .append(");\n");
                 continue;
             }
-            boolean narrow = outputTypes.get(i) == GpuValueType.FLOAT;
+            GpuValueType outputType = outputTypes.get(i);
+            // The kernel computes in double; a narrower column is cast on the way out.
+            String open =
+                    outputType == GpuValueType.FLOAT
+                            ? "(float) ("
+                            : outputType == GpuValueType.INT ? "(int) (" : "";
+            boolean narrow = !open.isEmpty();
             sb.append(INDENT)
                     .append("    out")
                     .append(i)
                     .append(".set(i, ")
-                    .append(narrow ? "(float) (" : "")
+                    .append(open)
                     .append(computed.get(i))
                     .append(narrow ? ")" : "")
                     .append(");\n");
@@ -831,6 +837,10 @@ public final class AccelKernelGenerator {
                 return infix(operands, "*");
             case DIVIDE:
                 return infix(operands, "/");
+            case INT_DIVIDE:
+                return truncating(call, operands, false);
+            case MOD:
+                return truncating(call, operands, true);
             case NEGATE:
                 return operands.size() == 1 ? "(-" + operands.get(0) + ")" : null;
             case GREATER_THAN:
@@ -898,6 +908,39 @@ public final class AccelKernelGenerator {
             folded = CSE.get().name(step, "double");
         }
         return folded;
+    }
+
+    /**
+     * Integer division and remainder, truncated toward zero as SQL means them.
+     *
+     * <p>A kernel computing in double answers 3.5 where SQL answers 3, so the truncation is written
+     * out rather than left to the result type. Exact for every operand an integral column can hold
+     * below 2^53.
+     *
+     * <p><b>Only with a non-zero literal divisor.</b> SQL raises on division by zero and a kernel
+     * cannot: {@code a / 0.0} is infinity, and {@code (long)} of that is a number. Refusing unless
+     * the divisor is a literal that is plainly not zero keeps a wrong answer from being possible,
+     * and covers what these are actually used for -- {@code MOD(id, 1000)} and the like. A computed
+     * divisor falls back to the CPU, where SQL's error is raised properly.
+     */
+    private static @Nullable String truncating(
+            AccelCall call, List<String> operands, boolean remainder) {
+        if (operands.size() != 2 || !nonZeroLiteral(call.operands().get(1))) {
+            return null;
+        }
+        String quotient = "((double) (long) (" + operands.get(0) + " / " + operands.get(1) + "))";
+        return remainder
+                ? "(" + operands.get(0) + " - (" + quotient + " * " + operands.get(1) + "))"
+                : quotient;
+    }
+
+    /** Whether this operand is a literal number that is certainly not zero. */
+    private static boolean nonZeroLiteral(AccelExpression expression) {
+        if (!(expression instanceof AccelLiteral)) {
+            return false;
+        }
+        Object value = ((AccelLiteral) expression).value();
+        return value instanceof Number && ((Number) value).doubleValue() != 0.0;
     }
 
     /**
@@ -1013,7 +1056,20 @@ public final class AccelKernelGenerator {
      * this is a second line rather than the first; it is here because a provider should not claim a
      * semantics it does not implement, whoever is asking.
      */
+    /**
+     * Result types a computed column may have.
+     *
+     * <p>{@code INTEGER} joins {@code DOUBLE} because a grouping key is usually one, and refusing
+     * it refused the whole projection beside it -- a `GROUP BY` query offloaded nothing however
+     * expressible its arithmetic was. The kernel still computes in double and narrows on the way
+     * out, which is exact for every int: the arithmetic that produced it is integral, and integral
+     * arithmetic below 2^53 is exact in a double.
+     *
+     * <p>{@code BIGINT} is deliberately absent. It is not exact above 2^53 and a kernel has no way
+     * to say so.
+     */
     private static boolean isDoubleResult(LogicalType type) {
-        return type.getTypeRoot() == LogicalTypeRoot.DOUBLE;
+        LogicalTypeRoot root = type.getTypeRoot();
+        return root == LogicalTypeRoot.DOUBLE || root == LogicalTypeRoot.INTEGER;
     }
 }
