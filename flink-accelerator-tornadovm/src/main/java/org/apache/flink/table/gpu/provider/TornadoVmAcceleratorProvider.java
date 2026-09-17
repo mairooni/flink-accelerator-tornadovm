@@ -34,6 +34,9 @@ import org.apache.flink.table.runtime.accelerator.AcceleratorCost;
 import org.apache.flink.table.runtime.accelerator.AcceleratorPlan;
 import org.apache.flink.table.runtime.accelerator.AcceleratorProvider;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.Serializable;
 import java.util.Optional;
 
@@ -53,6 +56,8 @@ import java.util.Optional;
  * the subtree at all, and that is much the narrower question.
  */
 public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TornadoVmAcceleratorProvider.class);
 
     /**
      * Whether to collect the gather / copy-in / kernel / copy-out breakdown.
@@ -110,6 +115,10 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             return Optional.empty();
         }
         if (work.totalOpsPerRow() > MAX_OPS_PER_ROW) {
+            LOG.debug(
+                    "declining: {} operations a row exceeds the ceiling of {}",
+                    work.totalOpsPerRow(),
+                    MAX_OPS_PER_ROW);
             // A ceiling on expression size, and the reason for it has changed twice.
             //
             // It was first set at 64 from an OpenCL measurement on an RTX 4070 Laptop, where a
@@ -131,11 +140,15 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         Optional<GpuKernelSource> kernel =
                 AccelKernelGenerator.generate(subtree, Integer.toHexString(subtree.hashCode()));
         if (!kernel.isPresent()) {
+            // Worth a line: "the provider declined" is all Flink can say, and the reason lives
+            // only here. It cost an afternoon once already.
+            LOG.debug("declining: no kernel could be generated for {}", subtree);
             return Optional.empty();
         }
         GpuCalcSpec probe =
                 new GpuCalcSpec(kernel.get(), kernel.get().outputLayout(), subtree.outputType(), 1);
         if (!probe.canStage()) {
+            LOG.debug("declining: the row cannot be staged for {}", subtree.outputType());
             // The kernel is expressible but the row is not: a column of a type the staging buffers
             // have no primitive array for, or a computed column the kernel would write as a double
             // into a field that is not one.

@@ -119,11 +119,17 @@ public final class GpuCalcSpec implements Serializable {
         for (int i = 0; i < outputLayout.length; i++) {
             LogicalTypeRoot root = fields.get(i).getTypeRoot();
             if (outputLayout[i] == COMPUTED) {
-                // FLOAT joins DOUBLE now that a computed column is written to a buffer of its own
-                // declared width and narrowed inside the kernel. While every output was a
-                // DoubleArray this had to refuse it, or the row would carry a Double in a field
-                // the type says is a Float.
-                if (root != LogicalTypeRoot.DOUBLE && root != LogicalTypeRoot.FLOAT) {
+                // FLOAT and INTEGER join DOUBLE because a computed column is written to a
+                // buffer of its own declared width and narrowed inside the kernel. While every
+                // output was a DoubleArray this had to refuse them, or the row would carry a
+                // Double in a field the type says is something else.
+                //
+                // INTEGER matters more than it looks: a grouping key is usually one, and refusing
+                // it refused the whole projection beside it -- which is how a GROUP BY query came
+                // to offload nothing however expressible its arithmetic was.
+                if (root != LogicalTypeRoot.DOUBLE
+                        && root != LogicalTypeRoot.FLOAT
+                        && root != LogicalTypeRoot.INTEGER) {
                     return false;
                 }
             } else if (root != LogicalTypeRoot.BIGINT

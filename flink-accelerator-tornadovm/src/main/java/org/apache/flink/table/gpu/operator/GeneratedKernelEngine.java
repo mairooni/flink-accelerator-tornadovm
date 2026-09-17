@@ -269,15 +269,22 @@ public final class GeneratedKernelEngine implements AutoCloseable {
     /**
      * One computed value, boxed as the row type declares it.
      *
-     * <p>A {@code FLOAT} output has to arrive downstream as a {@link Float}: the field is written
-     * into a {@link org.apache.flink.table.data.GenericRowData}, whose serializer reads it back at
-     * the declared type and does not convert.
+     * <p>A {@code FLOAT} output has to arrive downstream as a {@link Float} and an {@code INTEGER}
+     * as an {@link Integer}: the field is written into a {@link
+     * org.apache.flink.table.data.GenericRowData}, whose serializer reads it back at the declared
+     * type and does not convert. Getting this wrong is a {@code ClassCastException} deep in the
+     * drain rather than anything the type system catches, which is how an integer grouping key
+     * announced itself the first time one reached here.
      */
     public Object output(int column, int position) {
         Object buffer = outputs[column];
-        return buffer instanceof FloatArray floats
-                ? (Object) floats.get(position)
-                : (Object) ((DoubleArray) buffer).get(position);
+        if (buffer instanceof FloatArray floats) {
+            return floats.get(position);
+        }
+        if (buffer instanceof IntArray ints) {
+            return ints.get(position);
+        }
+        return ((DoubleArray) buffer).get(position);
     }
 
     /** Marks a staged input column absent for this row. */
