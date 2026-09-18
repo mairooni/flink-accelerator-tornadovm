@@ -88,6 +88,8 @@ final class StagedColumns {
     /**
      * Allocates room for {@code capacity} rows, from the arena where there is one.
      *
+     * @param keyField the one column a device reads, or -1 where none is — a running total sends
+     *     its values in a buffer of their own and wants every field of the row held host-side
      * @param staging where buffers come from, or null to allocate on the heap
      */
     static StagedColumns allocate(

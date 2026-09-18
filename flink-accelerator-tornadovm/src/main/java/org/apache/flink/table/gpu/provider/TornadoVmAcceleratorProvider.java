@@ -27,6 +27,7 @@ import org.apache.flink.table.accelerator.AccelFunction;
 import org.apache.flink.table.accelerator.AccelIrVersion;
 import org.apache.flink.table.accelerator.AccelJoin;
 import org.apache.flink.table.accelerator.AccelNode;
+import org.apache.flink.table.accelerator.AccelOverAggregate;
 import org.apache.flink.table.accelerator.AccelSort;
 import org.apache.flink.table.accelerator.AccelWorkProfile;
 import org.apache.flink.table.data.RowData;
@@ -35,11 +36,13 @@ import org.apache.flink.table.gpu.codegen.GpuAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
 import org.apache.flink.table.gpu.codegen.GpuJoinSpec;
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
+import org.apache.flink.table.gpu.codegen.GpuOverAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuSortSpec;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
 import org.apache.flink.table.gpu.operator.GpuCalcOperator;
 import org.apache.flink.table.gpu.operator.GpuGroupedAggregateOperator;
 import org.apache.flink.table.gpu.operator.GpuJoinOperator;
+import org.apache.flink.table.gpu.operator.GpuOverAggregateOperator;
 import org.apache.flink.table.gpu.operator.GpuSortOperator;
 import org.apache.flink.table.runtime.accelerator.AcceleratorContext;
 import org.apache.flink.table.runtime.accelerator.AcceleratorCost;
@@ -163,6 +166,9 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         }
         if (subtree instanceof AccelJoin) {
             return acceptJoin((AccelJoin) subtree, work);
+        }
+        if (subtree instanceof AccelOverAggregate) {
+            return acceptOverAggregate((AccelOverAggregate) subtree, work);
         }
         if (work.totalOpsPerRow() > MAX_OPS_PER_ROW) {
             LOG.debug(
@@ -441,11 +447,70 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         return (int) Math.max(1, Math.min(Integer.MAX_VALUE - 8, rows));
     }
 
+    /**
+     * A running total, served by {@code Cudf.runningSum} a batch at a time.
+     *
+     * <p>The shortest of these methods and the shortest list of refusals, because the planner has
+     * already turned away every frame, partition and function this cannot express. What is left is
+     * whether the columns can be staged.
+     *
+     * <p>No size refusal, alone among the cross-row nodes here: a prefix sum composes across
+     * batches, so this holds one {@code double} rather than a partition.
+     */
+    private Optional<AcceleratorPlan> acceptOverAggregate(
+            AccelOverAggregate over, AccelWorkProfile work) {
+        if (!CUDF_AVAILABLE) {
+            LOG.info("declining the window: the cuDF binding is not usable in this JVM");
+            return Optional.empty();
+        }
+        String refusal = GpuOverAggregateSpec.refuse(over);
+        if (refusal != null) {
+            LOG.info("declining the window: {}", refusal);
+            return Optional.empty();
+        }
+        GpuOverAggregateSpec spec =
+                new GpuOverAggregateSpec(
+                        over.valueField(), over.inputs().get(0).outputType(), over.outputType());
+        return Optional.of(new TornadoPlan(null, null, null, null, spec, overCost(work, spec)));
+    }
+
+    /**
+     * What a running total costs here, against what it costs {@code NonBufferOverWindowOperator}.
+     *
+     * <p>The one place a claim here is made against Flink's <em>cheap</em> path rather than its
+     * expensive one, and the constant says so. {@link #CPU_NANOS_COMPARISON} would be wrong: there
+     * is no comparator, no normalized key and no managed memory in what is being replaced, only one
+     * add per row through a generated aggs handler. {@link #CPU_NANOS_ACCUMULATION} is that, and it
+     * is a fifteenth of a comparison.
+     *
+     * <p>The device side is priced per field like the sort's and the join's, because it is the same
+     * work: stage a row, read it back into a binary row. On any row of more than about two fields
+     * that dominates, which is the model saying out loud that this offload is unlikely to pay.
+     */
+    private static AcceleratorCost overCost(AccelWorkProfile work, GpuOverAggregateSpec spec) {
+        double cpuNanosPerRow = Math.max(1, work.totalOpsPerRow()) * CPU_NANOS_ACCUMULATION;
+        double gpuNanosPerRow =
+                SORT_NANOS_PER_FIELD * spec.inputType().getFieldCount() + HOST_NANOS_PER_BYTE * 16;
+        return new AcceleratorCost(
+                cpuNanosPerRow / gpuNanosPerRow,
+                SORT_FIXED_COST_NANOS,
+                PER_BATCH_NANOS,
+                cpuNanosPerRow);
+    }
+
     @Override
     public StreamOperatorFactory<RowData> createOperator(
             AcceleratorPlan plan, AcceleratorContext context) {
         GpuKernelSource kernel = ((TornadoPlan) plan).kernel;
         GpuAggregateSpec aggregate = ((TornadoPlan) plan).aggregate;
+        GpuOverAggregateSpec over = ((TornadoPlan) plan).over;
+        if (over != null) {
+            return SimpleOperatorFactory.of(
+                    new GpuOverAggregateOperator(
+                            over,
+                            context.maxBatchSize(),
+                            context.providesOffHeap() ? context::allocateOffHeap : null));
+        }
         GpuJoinSpec join = ((TornadoPlan) plan).join;
         if (join != null) {
             return SimpleOperatorFactory.of(
@@ -633,6 +698,20 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
     private static final double SORT_NANOS_PER_FIELD = 78.0;
 
     /**
+     * What one accumulation costs Flink's own over-aggregate, per row.
+     *
+     * <p>Not measured on this host and deliberately marked as such: §T5 measured the operator at
+     * 1226.7 ms over 4M rows on an RTX 5070 Ti's host, which is 307 ns a row for a single add
+     * through a generated aggs handler. That is the figure used, scaled to nothing — the shape of
+     * the comparison is what matters and the constant is replaced by the measurement M5.2 owes.
+     *
+     * <p>Far below {@link #CPU_NANOS_COMPARISON}, and that is the point rather than an oversight.
+     * {@code NonBufferOverWindowOperator} buffers nothing and reserves no managed memory, so there
+     * is none of the cost a sorter pays and none of the advantage a device takes from it.
+     */
+    private static final double CPU_NANOS_ACCUMULATION = 307.0;
+
+    /**
      * What a sort pays once, which is not what a Calc pays once.
      *
      * <p>{@link #FIXED_COST_NANOS} is dominated by compiling a kernel, and a sort compiles none:
@@ -731,6 +810,7 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         private final @Nullable GpuAggregateSpec aggregate;
         private final @Nullable GpuSortSpec sort;
         private final @Nullable GpuJoinSpec join;
+        private final @Nullable GpuOverAggregateSpec over;
         private final AcceleratorCost cost;
 
         private TornadoPlan(
@@ -754,10 +834,21 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                 @Nullable GpuSortSpec sort,
                 @Nullable GpuJoinSpec join,
                 AcceleratorCost cost) {
+            this(kernel, aggregate, sort, join, null, cost);
+        }
+
+        private TornadoPlan(
+                @Nullable GpuKernelSource kernel,
+                @Nullable GpuAggregateSpec aggregate,
+                @Nullable GpuSortSpec sort,
+                @Nullable GpuJoinSpec join,
+                @Nullable GpuOverAggregateSpec over,
+                AcceleratorCost cost) {
             this.kernel = kernel;
             this.aggregate = aggregate;
             this.sort = sort;
             this.join = join;
+            this.over = over;
             this.cost = cost;
         }
 
@@ -771,7 +862,10 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             if (kernel != null) {
                 return kernel;
             }
-            return sort != null ? sort : join;
+            if (sort != null) {
+                return sort;
+            }
+            return join != null ? join : over;
         }
     }
 }
