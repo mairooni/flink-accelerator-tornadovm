@@ -261,7 +261,7 @@ public final class FeatureGramBenchmark {
         StringJoiner schema = new StringJoiner(",\n  ");
         StringJoiner options = new StringJoiner(",\n  ");
         for (int c = 0; c < args.cols; c++) {
-            schema.add(String.format("c%d DOUBLE", c));
+            schema.add(String.format("c%d DOUBLE NOT NULL", c));
             // A few radians either side of zero, so SIN is exercised across its range rather than
             // over a slice where it is nearly linear.
             options.add(String.format("'fields.c%d.min' = '-3.0'", c));
@@ -283,7 +283,7 @@ public final class FeatureGramBenchmark {
     private static String sourceTable(Args args) {
         StringJoiner schema = new StringJoiner(",\n  ");
         for (int c = 0; c < args.cols; c++) {
-            schema.add(String.format("c%d DOUBLE", c));
+            schema.add(String.format("c%d DOUBLE NOT NULL", c));
         }
         return String.format(
                 "CREATE TABLE Points (%n  %s%n) WITH (%n  'connector' = 'filesystem',%n"

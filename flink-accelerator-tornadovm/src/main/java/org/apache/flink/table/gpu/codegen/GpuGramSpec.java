@@ -26,6 +26,7 @@ import org.apache.flink.table.accelerator.AccelExpression;
 import org.apache.flink.table.accelerator.AccelFunction;
 import org.apache.flink.table.accelerator.AccelNode;
 import org.apache.flink.table.accelerator.AccelProject;
+import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.RowType;
 
@@ -186,9 +187,18 @@ public final class GpuGramSpec implements Serializable {
                 at++;
             }
         }
-        return Recognition.yes(
-                new GpuGramSpec(
-                        features, projection.inputs().get(0).outputType(), aggregate.outputType()));
+        RowType inputType = projection.inputs().get(0).outputType();
+        for (LogicalType column : inputType.getChildren()) {
+            if (column.isNullable()) {
+                // NOT NULL, as everywhere else here, and with a sharper consequence than usual: a
+                // null does not spoil one cell of a Gram matrix, it spoils the row's whole outer
+                // product and therefore every cell. The kernel would also carry a validity word
+                // per row, which changes its parameter list -- and an engine built for the
+                // unvalidated shape then calls it with the wrong arity.
+                return Recognition.no("a nullable input column is not contracted");
+            }
+        }
+        return Recognition.yes(new GpuGramSpec(features, inputType, aggregate.outputType()));
     }
 
     /**

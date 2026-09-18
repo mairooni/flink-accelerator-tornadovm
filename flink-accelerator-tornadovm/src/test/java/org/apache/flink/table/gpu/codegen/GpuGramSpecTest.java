@@ -108,6 +108,34 @@ class GpuGramSpecTest {
     }
 
     @Test
+    void refusesANullableInputColumn() {
+        // The failure this prevents is not a wrong cell. A nullable column makes the generated
+        // kernel carry a validity word, which changes its parameter list, and the engine then
+        // calls it with the wrong arity -- on a cluster, at the first full batch, past the point
+        // the fallback guard can recover.
+        List<AccelExpression> products = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            for (int j = i; j < 8; j++) {
+                products.add(product(feature(i), feature(j)));
+            }
+        }
+        LogicalType[] nullable = new LogicalType[8];
+        Arrays.fill(nullable, new DoubleType(true));
+        LogicalType[] projFields = new LogicalType[products.size()];
+        Arrays.fill(projFields, DOUBLE);
+        RowType projType = RowType.of(projFields);
+        AccelProject projection =
+                new AccelProject(products, new AccelInput(RowType.of(nullable)), projType);
+        List<AccelAggCall> calls = new ArrayList<>();
+        for (int i = 0; i < products.size(); i++) {
+            calls.add(new AccelAggCall(AccelAggFunction.SUM, i, DOUBLE));
+        }
+        AccelAggregate agg = new AccelAggregate(new int[0], calls, projection, projType);
+        assertThat(GpuGramSpec.recognise(agg).reason())
+                .isEqualTo("a nullable input column is not contracted");
+    }
+
+    @Test
     void refusesAGroupedAggregate() {
         AccelAggregate grouped =
                 new AccelAggregate(

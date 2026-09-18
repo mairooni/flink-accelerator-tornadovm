@@ -535,7 +535,7 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         // Generated once here purely to find out whether the feature map is expressible at all;
         // the stride the real kernel is packed at is the batch size, which only the TaskManager's
         // context knows, so the source that actually runs is generated again in createOperator.
-        if (!AccelKernelGenerator.generate(featureProjection(spec), "probe", 1).isPresent()) {
+        if (!AccelKernelGenerator.generate(featureProjection(spec), "probe", 1, 1).isPresent()) {
             LOG.info("declining the Gram matrix: no kernel for its feature map");
             return Optional.empty();
         }
@@ -613,6 +613,7 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                     AccelKernelGenerator.generate(
                                     featureProjection(gram),
                                     Integer.toHexString(gram.hashCode()),
+                                    context.maxBatchSize(),
                                     context.maxBatchSize())
                             .orElseThrow(
                                     () ->

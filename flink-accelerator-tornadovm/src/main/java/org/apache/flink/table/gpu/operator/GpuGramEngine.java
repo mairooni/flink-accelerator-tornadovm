@@ -19,7 +19,6 @@
 package org.apache.flink.table.gpu.operator;
 
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
-import org.apache.flink.table.gpu.codegen.GpuValueType;
 
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.TaskGraph;
@@ -75,8 +74,15 @@ public final class GpuGramEngine implements AutoCloseable {
     private final int features;
     private final int batchSize;
 
-    /** One staging buffer per input column the feature expressions read. */
-    private Object[] inputs;
+    /**
+     * The staged columns, all of them, {@code batchSize} rows apart and column-major.
+     *
+     * <p>One buffer rather than one per column, which is what stops the kernel's parameter list
+     * growing with the query's width. A Gram matrix over 32 features took 34 arrays before this and
+     * TornadoVM deoptimised the whole graph to sequential Java at execute time — silently, and with
+     * a library task in it that has no sequential implementation, so nothing came back.
+     */
+    private DoubleArray staged;
 
     /** {@code A}: the features, {@code batchSize x features}, column-major. */
     private DoubleArray packed;
@@ -112,10 +118,8 @@ public final class GpuGramEngine implements AutoCloseable {
     }
 
     public void open() throws Exception {
-        inputs = new Object[kernel.inputFieldIndexes().length];
-        for (int i = 0; i < inputs.length; i++) {
-            inputs[i] = GeneratedKernel.allocate(kernel.inputTypes()[i], batchSize);
-        }
+        staged = new DoubleArray(batchSize * kernel.inputFieldIndexes().length);
+        staged.init(0.0);
         packed = new DoubleArray(batchSize * features);
         packed.init(0.0);
         gram = new DoubleArray(features * features);
@@ -126,12 +130,10 @@ public final class GpuGramEngine implements AutoCloseable {
         generated = new GeneratedKernel(kernel);
         entry = generated.compile();
 
-        // Inputs, the packed output, the live row count. No mask and no validity words: a Gram
-        // matrix is refused over a filter or a nullable column, so neither can be present.
-        kernelArgs = new Object[inputs.length + 2];
-        System.arraycopy(inputs, 0, kernelArgs, 0, inputs.length);
-        kernelArgs[inputs.length] = packed;
-        kernelArgs[inputs.length + 1] = rows;
+        // The staged columns, the packed output, the live row count -- three arrays whatever the
+        // width. No mask and no validity words: a Gram matrix is refused over a filter or a
+        // nullable column, so neither can be present.
+        kernelArgs = new Object[] {staged, packed, rows};
 
         plan = buildPlan(batchSize, "gram");
         grid = gridOf(plan, "gram");
@@ -140,8 +142,7 @@ public final class GpuGramEngine implements AutoCloseable {
     private TornadoExecutionPlan buildPlan(int contraction, String name) {
         TaskGraph graph =
                 new TaskGraph(name)
-                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, inputs)
-                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, rows)
+                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, staged, rows)
                         .task("features", entry, kernelArgs)
                         // C = A' * A. A is batchSize x features held column-major, so its leading
                         // dimension is the batch size and the transpose costs nothing: cuBLAS
@@ -177,9 +178,9 @@ public final class GpuGramEngine implements AutoCloseable {
         return worker;
     }
 
-    /** One staged input column, for the gather to write into. */
-    public Object inputColumn(int column) {
-        return inputs[column];
+    /** Stages one value: column {@code c} of row {@code r}, column-major. */
+    public void stage(int column, int row, double value) {
+        staged.set(column * batchSize + row, value);
     }
 
     /** Runs one batch of {@code count} rows and folds its Gram matrix into the total. */
@@ -187,7 +188,7 @@ public final class GpuGramEngine implements AutoCloseable {
         rows.set(0, count);
         if (count == batchSize) {
             grid.setGlobalWork(count, 1, 1);
-            plan.execute();
+            withKernelLoader(plan);
         } else {
             if (tailPlan == null || tailLength != count) {
                 closeTail();
@@ -196,13 +197,43 @@ public final class GpuGramEngine implements AutoCloseable {
                 tailLength = count;
             }
             tailGrid.setGlobalWork(count, 1, 1);
-            tailPlan.execute();
+            withKernelLoader(tailPlan);
         }
         for (int i = 0; i < total.length; i++) {
             total[i] += gram.get(i);
         }
         batches++;
         rowCount += count;
+    }
+
+    /**
+     * Executes with the generated kernel's own loader as the thread's context loader.
+     *
+     * <p>Not optional, and the way it fails is the reason. TornadoVM resolves the kernel class
+     * through the context classloader to scan it for {@code @Parallel}; on a TaskManager the
+     * provider is loaded by Flink's own loader and the freshly compiled kernel lives in a {@link
+     * java.net.URLClassLoader} of its own, so the scan comes up empty. It does not throw. The graph
+     * deoptimises to sequential Java at {@code scheduleInner}, and a graph with a library task in
+     * it has no sequential implementation — so the job dies inside TornadoVM's fallback with an
+     * arity error that says nothing about classloaders.
+     *
+     * <p>{@code GeneratedKernelEngine} has done this since M2.5 for the same reason and records
+     * that the project had been caught by a silently sequential kernel twice by then. This is the
+     * third, and the first to fail loudly rather than merely run a thousand times slower — which is
+     * only because the graph has a {@code libraryTask} in it.
+     *
+     * <p>It is invisible in the device tests, because there the kernel's loader is a child of the
+     * test's and the scan finds the class anyway. Only a cluster run can see it.
+     */
+    private void withKernelLoader(TornadoExecutionPlan target) throws Exception {
+        Thread current = Thread.currentThread();
+        ClassLoader previous = current.getContextClassLoader();
+        current.setContextClassLoader(generated.loader());
+        try {
+            target.execute();
+        } finally {
+            current.setContextClassLoader(previous);
+        }
     }
 
     /** Entry {@code (i, j)} of the accumulated matrix. Symmetric, so the order does not matter. */
@@ -236,10 +267,5 @@ public final class GpuGramEngine implements AutoCloseable {
             generated.close();
             generated = null;
         }
-    }
-
-    /** Which staging width each input column is held at, for the gather to match. */
-    public GpuValueType[] inputTypes() {
-        return kernel.inputTypes();
     }
 }

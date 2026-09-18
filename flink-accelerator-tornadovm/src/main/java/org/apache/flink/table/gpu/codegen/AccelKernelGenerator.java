@@ -124,14 +124,34 @@ public final class AccelKernelGenerator {
      */
     public static Optional<GpuKernelSource> generate(
             AccelNode subtree, String classNameSuffix, int packedStride) {
+        return generate(subtree, classNameSuffix, packedStride, 0);
+    }
+
+    /**
+     * As above, and optionally reading every staged column from one buffer too.
+     *
+     * <p>Packing the inputs is the mirror of packing the outputs and exists for a sharper reason
+     * than saving tasks: a kernel's parameter list grows with the column count, and past a few tens
+     * of arrays TornadoVM stops compiling the graph and deoptimises to sequential Java — silently,
+     * at execute time, with a library task in the graph that has no sequential implementation and
+     * therefore returns nothing. A Gram matrix over 32 features met that at 34 parameters. Packed,
+     * the kernel takes two arrays whatever the width.
+     *
+     * <p>Requires every staged column to be a {@code DOUBLE}, as packed output does: one buffer is
+     * one element type.
+     */
+    public static Optional<GpuKernelSource> generate(
+            AccelNode subtree, String classNameSuffix, int packedStride, int packedInputStride) {
 
         if (!(subtree instanceof AccelProject)) {
             return Optional.empty();
         }
-        if (inputs32Exceeded(subtree)) {
-            // Validity is packed into one int a row, so 32 staged columns is the ceiling. Refusing
-            // beyond it rather than silently widening: an expression over 33 columns would
-            // otherwise have its 33rd read someone else's bit.
+        if (hasNullable(subtree) && inputs32Exceeded(subtree)) {
+            // Validity is packed into one int a row, so 32 staged columns is the ceiling -- but
+            // only where there is a validity word at all. Refusing beyond it rather than silently
+            // widening: an expression over 33 columns would otherwise have its 33rd read someone
+            // else's bit. Over NOT NULL columns there are no bits to collide, and the cap was
+            // costing a Gram matrix over 64 features, which is exactly where it pays.
             return Optional.empty();
         }
 
@@ -218,6 +238,13 @@ public final class AccelKernelGenerator {
                 }
             }
         }
+        if (packedInputStride > 0) {
+            for (GpuValueType type : stagedTypes) {
+                if (type != GpuValueType.DOUBLE) {
+                    return Optional.empty();
+                }
+            }
+        }
         boolean carriesValidity = carriesValidity(NULLABLE_INPUTS.get());
         String source =
                 renderClass(
@@ -231,6 +258,7 @@ public final class AccelKernelGenerator {
                         outputTypes,
                         renderedCondition,
                         packedStride,
+                        packedInputStride,
                         CSE.get().declarations());
         return Optional.of(
                 new GpuKernelSource(
@@ -243,6 +271,7 @@ public final class AccelKernelGenerator {
                         renderedCondition != null,
                         layout,
                         packedStride,
+                        packedInputStride,
                         carriesValidity));
     }
 
@@ -257,11 +286,15 @@ public final class AccelKernelGenerator {
             List<GpuValueType> outputTypes,
             @Nullable String condition,
             int packedStride,
+            int packedInputStride,
             List<String> subexpressions) {
 
         Set<String> arrayTypes = new TreeSet<>();
         for (GpuValueType type : inputTypes.values()) {
             arrayTypes.add(type.arrayType());
+        }
+        if (packedInputStride > 0) {
+            arrayTypes.add(GpuValueType.DOUBLE.arrayType());
         }
         if (packedStride > 0) {
             arrayTypes.add(GpuValueType.DOUBLE.arrayType());
@@ -286,8 +319,16 @@ public final class AccelKernelGenerator {
         sb.append("    public static void ").append(methodName).append("(");
 
         List<String> params = new ArrayList<>();
-        for (Map.Entry<Integer, String> input : inputs.entrySet()) {
-            params.add(inputTypes.get(input.getKey()).arrayType() + " " + input.getValue() + "_in");
+        if (packedInputStride > 0) {
+            params.add("DoubleArray in");
+        } else {
+            for (Map.Entry<Integer, String> input : inputs.entrySet()) {
+                params.add(
+                        inputTypes.get(input.getKey()).arrayType()
+                                + " "
+                                + input.getValue()
+                                + "_in");
+            }
         }
         if (packedStride > 0) {
             params.add("DoubleArray out");
@@ -348,13 +389,15 @@ public final class AccelKernelGenerator {
                         .append(") & 1);\n");
             }
         }
+        int column = 0;
         for (String var : inputs.values()) {
-            sb.append(INDENT)
-                    .append("    double ")
-                    .append(var)
-                    .append(" = ")
-                    .append(var)
-                    .append("_in.get(i);\n");
+            sb.append(INDENT).append("    double ").append(var).append(" = ");
+            if (packedInputStride > 0) {
+                sb.append("in.get(").append(column * packedInputStride).append(" + i);\n");
+            } else {
+                sb.append(var).append("_in.get(i);\n");
+            }
+            column++;
         }
         // One statement per distinct operation, in the order they were produced -- which is
         // bottom-up, so each one only mentions names already declared above it.

@@ -45,6 +45,7 @@ public final class GpuKernelSource implements Serializable {
     private final GpuValueType[] outputTypes;
     private final int outputCount;
     private final int packedStride;
+    private final int packedInputStride;
     private final boolean hasFilter;
     private final int[] outputLayout;
 
@@ -107,6 +108,32 @@ public final class GpuKernelSource implements Serializable {
             int[] outputLayout,
             int packedStride,
             boolean carriesValidity) {
+        this(
+                className,
+                methodName,
+                source,
+                inputFieldIndexes,
+                inputTypes,
+                outputTypes,
+                hasFilter,
+                outputLayout,
+                packedStride,
+                0,
+                carriesValidity);
+    }
+
+    public GpuKernelSource(
+            String className,
+            String methodName,
+            String source,
+            int[] inputFieldIndexes,
+            GpuValueType[] inputTypes,
+            GpuValueType[] outputTypes,
+            boolean hasFilter,
+            int[] outputLayout,
+            int packedStride,
+            int packedInputStride,
+            boolean carriesValidity) {
         if (inputFieldIndexes.length != inputTypes.length) {
             throw new IllegalArgumentException(
                     "every staged column needs a declared type: "
@@ -123,6 +150,7 @@ public final class GpuKernelSource implements Serializable {
         this.outputTypes = outputTypes;
         this.outputCount = outputTypes.length;
         this.packedStride = packedStride;
+        this.packedInputStride = packedInputStride;
         this.hasFilter = hasFilter;
         this.carriesValidity = carriesValidity;
         this.outputLayout = outputLayout;
@@ -193,6 +221,16 @@ public final class GpuKernelSource implements Serializable {
 
     public int packedStride() {
         return packedStride;
+    }
+
+    /**
+     * Rows apart each staged column sits in the single input buffer, or 0 when each has its own.
+     *
+     * <p>Non-zero means the kernel takes one {@code DoubleArray in} rather than one array per
+     * column, which is what keeps its parameter list from growing with the query's width.
+     */
+    public int packedInputStride() {
+        return packedInputStride;
     }
 
     /** Number of computed output columns the kernel writes. */

@@ -28,7 +28,6 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gpu.codegen.GpuGramSpec;
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
-import org.apache.flink.table.gpu.gather.RowGather;
 
 /**
  * Computes a Gram matrix on the device and emits it as one row of upper-triangle sums.
@@ -58,7 +57,6 @@ public class GpuGramOperator extends AbstractStreamOperator<RowData>
     private final int batchSize;
 
     private transient GpuGramEngine engine;
-    private transient RowGather.StagingColumn[] writers;
     private transient int[] inputFields;
     private transient GpuValueType[] inputTypes;
     private transient int buffered;
@@ -77,10 +75,6 @@ public class GpuGramOperator extends AbstractStreamOperator<RowData>
         engine.open();
         inputFields = kernel.inputFieldIndexes();
         inputTypes = kernel.inputTypes();
-        writers = new RowGather.StagingColumn[inputFields.length];
-        for (int c = 0; c < inputFields.length; c++) {
-            writers[c] = GeneratedKernel.writerFor(engine.inputColumn(c));
-        }
         registerMetrics();
         buffered = 0;
         executeNanos = 0L;
@@ -90,7 +84,7 @@ public class GpuGramOperator extends AbstractStreamOperator<RowData>
     public void processElement(StreamRecord<RowData> element) throws Exception {
         RowData row = element.getValue();
         for (int c = 0; c < inputFields.length; c++) {
-            writers[c].set(buffered, read(row, inputFields[c], inputTypes[c]));
+            engine.stage(c, buffered, read(row, inputFields[c], inputTypes[c]));
         }
         if (++buffered == batchSize) {
             flush();
