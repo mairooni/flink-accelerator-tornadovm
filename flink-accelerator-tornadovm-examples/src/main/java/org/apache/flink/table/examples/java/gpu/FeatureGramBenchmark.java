@@ -300,11 +300,15 @@ public final class FeatureGramBenchmark {
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         if (args.offload) {
             tEnv.getConfig().getConfiguration().setString("table.exec.accelerator.enabled", "true");
-            if (!args.fuseAggregate) {
-                tEnv.getConfig()
-                        .getConfiguration()
-                        .setString("table.exec.accelerator.fuse-aggregate", "false");
-            }
+            // Set either way, which it was not until M5.6. The flag only ever wrote "false" and
+            // relied on the default for "true" -- and M4.5 flipped that default to false, so
+            // --fuse-aggregate true had silently meant nothing since. The arm it was supposed to
+            // select is the only one that can reach a Gram matrix.
+            tEnv.getConfig()
+                    .getConfiguration()
+                    .setString(
+                            "table.exec.accelerator.fuse-aggregate",
+                            Boolean.toString(args.fuseAggregate));
         }
         return tEnv;
     }

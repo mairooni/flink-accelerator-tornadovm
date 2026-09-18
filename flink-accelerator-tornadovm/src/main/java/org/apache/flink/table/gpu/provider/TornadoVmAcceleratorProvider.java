@@ -24,22 +24,26 @@ import org.apache.flink.table.accelerator.AccelAggCall;
 import org.apache.flink.table.accelerator.AccelAggFunction;
 import org.apache.flink.table.accelerator.AccelAggregate;
 import org.apache.flink.table.accelerator.AccelFunction;
+import org.apache.flink.table.accelerator.AccelInput;
 import org.apache.flink.table.accelerator.AccelIrVersion;
 import org.apache.flink.table.accelerator.AccelJoin;
 import org.apache.flink.table.accelerator.AccelNode;
 import org.apache.flink.table.accelerator.AccelOverAggregate;
+import org.apache.flink.table.accelerator.AccelProject;
 import org.apache.flink.table.accelerator.AccelSort;
 import org.apache.flink.table.accelerator.AccelWorkProfile;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gpu.codegen.AccelKernelGenerator;
 import org.apache.flink.table.gpu.codegen.GpuAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
+import org.apache.flink.table.gpu.codegen.GpuGramSpec;
 import org.apache.flink.table.gpu.codegen.GpuJoinSpec;
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
 import org.apache.flink.table.gpu.codegen.GpuOverAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuSortSpec;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
 import org.apache.flink.table.gpu.operator.GpuCalcOperator;
+import org.apache.flink.table.gpu.operator.GpuGramOperator;
 import org.apache.flink.table.gpu.operator.GpuGroupedAggregateOperator;
 import org.apache.flink.table.gpu.operator.GpuJoinOperator;
 import org.apache.flink.table.gpu.operator.GpuOverAggregateOperator;
@@ -48,6 +52,8 @@ import org.apache.flink.table.runtime.accelerator.AcceleratorContext;
 import org.apache.flink.table.runtime.accelerator.AcceleratorCost;
 import org.apache.flink.table.runtime.accelerator.AcceleratorPlan;
 import org.apache.flink.table.runtime.accelerator.AcceleratorProvider;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.RowType;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -233,6 +239,9 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      * </ul>
      */
     private Optional<AcceleratorPlan> acceptAggregate(AccelAggregate agg, AccelWorkProfile work) {
+        if (agg.grouping().length == 0) {
+            return acceptGram(agg, work);
+        }
         // Louder than the Calc path's reasons, which are DEBUG. A declined Calc is the ordinary
         // case and there is one per subtree; a declined aggregate means the planner built a fused
         // node for this query and then found nothing to run it, which happens once per operator and
@@ -502,11 +511,117 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                 cpuNanosPerRow);
     }
 
+    /**
+     * A Gram matrix, served by a generated feature kernel and {@code cublasDgemm} in one task
+     * graph.
+     *
+     * <p>The one shape in this project whose advantage grows with the query rather than being
+     * fixed. Every other operator does the same work per row, which is why §T9, §T10, §T12, §T13
+     * and §T14 all found the device is not the constraint; a Gram matrix over {@code d} features is
+     * {@code O(n·d²)} of arithmetic on {@code O(n·d)} of data. §T15 measured 1.05x at eight
+     * features and 12.09x at sixty-four.
+     */
+    private Optional<AcceleratorPlan> acceptGram(AccelAggregate agg, AccelWorkProfile work) {
+        if (!CUBLAS_AVAILABLE) {
+            LOG.info("declining the Gram matrix: the cuBLAS binding is not usable in this JVM");
+            return Optional.empty();
+        }
+        GpuGramSpec.Recognition recognised = GpuGramSpec.recognise(agg);
+        if (!recognised.recognised()) {
+            LOG.info("declining the ungrouped aggregate: {}", recognised.reason());
+            return Optional.empty();
+        }
+        GpuGramSpec spec = recognised.spec();
+        // Generated once here purely to find out whether the feature map is expressible at all;
+        // the stride the real kernel is packed at is the batch size, which only the TaskManager's
+        // context knows, so the source that actually runs is generated again in createOperator.
+        if (!AccelKernelGenerator.generate(featureProjection(spec), "probe", 1).isPresent()) {
+            LOG.info("declining the Gram matrix: no kernel for its feature map");
+            return Optional.empty();
+        }
+        return Optional.of(
+                new TornadoPlan(null, null, null, null, null, spec, gramCost(work, spec)));
+    }
+
+    /** The {@code d} features as a projection, which is what the kernel generator takes. */
+    private static AccelProject featureProjection(GpuGramSpec spec) {
+        LogicalType[] fields = new LogicalType[spec.featureCount()];
+        for (int i = 0; i < fields.length; i++) {
+            fields[i] = spec.features().get(i).outputType();
+        }
+        return new AccelProject(
+                spec.features(), new AccelInput(spec.inputType()), RowType.of(fields));
+    }
+
+    /**
+     * What a Gram matrix costs here, against materialising its products a row at a time.
+     *
+     * <p>The only cost model in this provider whose ratio depends on the query's shape rather than
+     * only on its row width, and that is the point. The CPU plan computes and sums {@code d(d+1)/2}
+     * products per row; this computes {@code d} features per row and contracts them on the device.
+     * So the work saved grows as {@code d²} while what moves grows as {@code d} — which is the
+     * claim §T15 tested and the reason this node is worth having when nothing else here is.
+     */
+    private static AcceleratorCost gramCost(AccelWorkProfile work, GpuGramSpec spec) {
+        int d = spec.featureCount();
+        int products = d * (d + 1) / 2;
+        double cpuNanosPerRow = products * CPU_NANOS_PRODUCT_SUM;
+        double gpuNanosPerRow = d * GRAM_NANOS_PER_FEATURE;
+        return new AcceleratorCost(
+                cpuNanosPerRow / gpuNanosPerRow,
+                SORT_FIXED_COST_NANOS,
+                PER_BATCH_NANOS,
+                cpuNanosPerRow);
+    }
+
+    /**
+     * Whether the cuBLAS binding can run here.
+     *
+     * <p>Probed like {@link #CUDF_AVAILABLE} and for the same reason: cuBLAS ships with TornadoVM
+     * but its native library does not always, and a deployment without it should get a declined
+     * aggregate rather than a {@code NoClassDefFoundError} while this class initialises.
+     */
+    private static final boolean CUBLAS_AVAILABLE = probeCublas();
+
+    private static boolean probeCublas() {
+        if (UNAVAILABLE != null) {
+            return false;
+        }
+        try {
+            Class<?> provider =
+                    Class.forName(
+                            "uk.ac.manchester.tornado.cublas.provider.CuBlasLibraryProvider",
+                            true,
+                            TornadoVmAcceleratorProvider.class.getClassLoader());
+            return (Boolean) provider.getMethod("isAvailable").invoke(null);
+        } catch (Throwable t) {
+            LOG.debug("the cuBLAS binding is unavailable: {}", String.valueOf(t));
+            return false;
+        }
+    }
+
     @Override
     public StreamOperatorFactory<RowData> createOperator(
             AcceleratorPlan plan, AcceleratorContext context) {
         GpuKernelSource kernel = ((TornadoPlan) plan).kernel;
         GpuAggregateSpec aggregate = ((TornadoPlan) plan).aggregate;
+        GpuGramSpec gram = ((TornadoPlan) plan).gram;
+        if (gram != null) {
+            // Generated here rather than in accept: the stride the features are packed at is the
+            // batch size, and only this machine knows it.
+            GpuKernelSource features =
+                    AccelKernelGenerator.generate(
+                                    featureProjection(gram),
+                                    Integer.toHexString(gram.hashCode()),
+                                    context.maxBatchSize())
+                            .orElseThrow(
+                                    () ->
+                                            new IllegalStateException(
+                                                    "accept admitted a feature map the generator"
+                                                            + " cannot express"));
+            return SimpleOperatorFactory.of(
+                    new GpuGramOperator(gram, features, context.maxBatchSize()));
+        }
         GpuOverAggregateSpec over = ((TornadoPlan) plan).over;
         if (over != null) {
             return SimpleOperatorFactory.of(
@@ -702,6 +817,37 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
     private static final double SORT_NANOS_PER_FIELD = 78.0;
 
     /**
+     * What one product-and-accumulate costs Flink's own plan, per row.
+     *
+     * <p>Derived from §T15's sweep rather than assumed, and it is the fourth constant in this file
+     * to come out an order of magnitude above what the scalar model would have guessed. A product
+     * in the CPU plan is not a multiply: it is a generated expression evaluated over a binary row
+     * and folded into an accumulator through an {@code AggsHandleFunction}.
+     *
+     * <p>Calibrated conservatively. The measured ratios imply a rate that <em>grows</em> with the
+     * feature count — the CPU arm degrades faster than its own product count, 528 to 2080 products
+     * costing 15.6 s to 135.8 s — and a model of this shape cannot express that. Taking the
+     * smallest rate the sweep supports makes the claim an under-statement at every width, which is
+     * the direction that errs toward the CPU.
+     */
+    private static final double CPU_NANOS_PRODUCT_SUM = 27.0;
+
+    /**
+     * What one feature costs this operator per row, staged and moved.
+     *
+     * <p>The contraction is not in here and does not need to be: a GEMM over a resident matrix
+     * never touches the host, and §T15's operator spends its time on the {@code d} columns going in
+     * rather than the {@code d x d} coming back.
+     *
+     * <p>Together with the constant above this claims 1.15x at sixteen features, 2.23x at
+     * thirty-two and 4.39x at sixty-four, against 1.15x, 2.80x and 12.09x measured. So the offload
+     * is taken exactly where §T15 says it decisively wins and declined where the two arms are
+     * inside each other's noise — sixteen features claims 1.15x, which is below the 1.3x floor, and
+     * that is the right answer to a measured 1.15x.
+     */
+    private static final double GRAM_NANOS_PER_FEATURE = 200.0;
+
+    /**
      * What one accumulation costs Flink's own over-aggregate, per row.
      *
      * <p>Measured 2026-09-18 on this host, like {@link #CPU_NANOS_COMPARISON}: the {@code
@@ -817,6 +963,7 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         private final @Nullable GpuSortSpec sort;
         private final @Nullable GpuJoinSpec join;
         private final @Nullable GpuOverAggregateSpec over;
+        private final @Nullable GpuGramSpec gram;
         private final AcceleratorCost cost;
 
         private TornadoPlan(
@@ -850,11 +997,23 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                 @Nullable GpuJoinSpec join,
                 @Nullable GpuOverAggregateSpec over,
                 AcceleratorCost cost) {
+            this(kernel, aggregate, sort, join, over, null, cost);
+        }
+
+        private TornadoPlan(
+                @Nullable GpuKernelSource kernel,
+                @Nullable GpuAggregateSpec aggregate,
+                @Nullable GpuSortSpec sort,
+                @Nullable GpuJoinSpec join,
+                @Nullable GpuOverAggregateSpec over,
+                @Nullable GpuGramSpec gram,
+                AcceleratorCost cost) {
             this.kernel = kernel;
             this.aggregate = aggregate;
             this.sort = sort;
             this.join = join;
             this.over = over;
+            this.gram = gram;
             this.cost = cost;
         }
 
@@ -871,7 +1030,10 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             if (sort != null) {
                 return sort;
             }
-            return join != null ? join : over;
+            if (join != null) {
+                return join;
+            }
+            return over != null ? over : gram;
         }
     }
 }
