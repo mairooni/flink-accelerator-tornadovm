@@ -26,15 +26,18 @@ import org.apache.flink.table.accelerator.AccelAggregate;
 import org.apache.flink.table.accelerator.AccelFunction;
 import org.apache.flink.table.accelerator.AccelIrVersion;
 import org.apache.flink.table.accelerator.AccelNode;
+import org.apache.flink.table.accelerator.AccelSort;
 import org.apache.flink.table.accelerator.AccelWorkProfile;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gpu.codegen.AccelKernelGenerator;
 import org.apache.flink.table.gpu.codegen.GpuAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
+import org.apache.flink.table.gpu.codegen.GpuSortSpec;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
 import org.apache.flink.table.gpu.operator.GpuCalcOperator;
 import org.apache.flink.table.gpu.operator.GpuGroupedAggregateOperator;
+import org.apache.flink.table.gpu.operator.GpuSortOperator;
 import org.apache.flink.table.runtime.accelerator.AcceleratorContext;
 import org.apache.flink.table.runtime.accelerator.AcceleratorCost;
 import org.apache.flink.table.runtime.accelerator.AcceleratorPlan;
@@ -151,6 +154,9 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         }
         if (subtree instanceof AccelAggregate) {
             return acceptAggregate((AccelAggregate) subtree, work);
+        }
+        if (subtree instanceof AccelSort) {
+            return acceptSort((AccelSort) subtree, work);
         }
         if (work.totalOpsPerRow() > MAX_OPS_PER_ROW) {
             LOG.debug(
@@ -277,11 +283,80 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         return Optional.of(new TornadoPlan(kernel.get(), aggregate, estimateCost(work)));
     }
 
+    /**
+     * An {@code ORDER BY}, served by cuDF's {@code stable_sorted_order} and a host-side gather.
+     *
+     * <p>Every refusal here is the binding's shape rather than a device's. cuDF orders far more
+     * than this; {@code Cudf.sortedOrder} is one entry point over an {@code INT32} column with no
+     * null mask, and widening it is more shim rather than a different design. What is <em>not</em>
+     * a refusal is the payload: no column but the key reaches the device, so a row carrying a
+     * {@code BIGINT} — which the kernel generator refuses outright — is sorted here perfectly well.
+     *
+     * <ul>
+     *   <li><b>Ascending only.</b> The shim asks for {@code cudf::order::ASCENDING} and takes no
+     *       direction. Reversing the permutation on the host is not the fix it looks like: it
+     *       reverses runs of equal keys too, and a stable sort that loses stability is a wrong
+     *       answer for a query that sorts twice.
+     *   <li><b>A {@code NOT NULL INT} key.</b> The shim builds a column view with no null mask, so
+     *       a null key would order as whatever its bits happen to be — silently. {@code NOT NULL}
+     *       in the DDL is the sanctioned answer here as it is for a Calc, and {@link
+     *       AccelSort#nullsLast()} is consequently not consulted.
+     *   <li><b>A row this can hold for the whole partition</b>, at fixed width, in at most {@link
+     *       GpuSortSpec#MAX_FIELDS} columns.
+     *   <li><b>A cardinality estimate, within a stated ceiling.</b> A sort undertakes to hold its
+     *       whole input, so an unknown input is one this cannot undertake at all.
+     * </ul>
+     */
+    private Optional<AcceleratorPlan> acceptSort(AccelSort sort, AccelWorkProfile work) {
+        // INFO for the same reason the aggregate's reasons are: one per operator rather than one
+        // per subtree, and it is the question an operator will actually ask.
+        if (!CUDF_AVAILABLE) {
+            LOG.info("declining the sort: the cuDF binding is not usable in this JVM");
+            return Optional.empty();
+        }
+        String refusal = GpuSortSpec.refuse(sort, work.estimatedRows(), MAX_SORT_BYTES);
+        if (refusal != null) {
+            LOG.info("declining the sort: {}", refusal);
+            return Optional.empty();
+        }
+        GpuSortSpec spec =
+                new GpuSortSpec(sort.sortField(), sort.outputType(), work.estimatedRows());
+        return Optional.of(new TornadoPlan(null, null, spec, sortCost(work)));
+    }
+
+    /**
+     * What ordering a row costs here, against what it costs Flink's sorter.
+     *
+     * <p>Deliberately not the model above. That one prices arithmetic, and a sort has none — the
+     * planner charges its comparisons as {@code LESS_THAN} so that the subtree is not read as
+     * having no work at all, but pricing {@code log2(n)} imaginary multiplies against a device
+     * would be a number about nothing. What a sort is actually bounded by is moving the key out and
+     * the permutation back, so it is priced as that: four bytes each way against {@code n log n}
+     * host comparisons.
+     */
+    private static AcceleratorCost sortCost(AccelWorkProfile work) {
+        double comparisons = Math.max(1, work.totalOpsPerRow());
+        double cpuNanos = comparisons * CPU_NANOS_CHEAP;
+        // Eight bytes a row cross the interconnect whatever the row is worth: the key out, the
+        // permutation back. The gather and the emit are host work either way and are not what
+        // distinguishes the two plans.
+        double gpuNanos = comparisons * GPU_NANOS_CHEAP + HOST_NANOS_PER_BYTE * 8;
+        return new AcceleratorCost(cpuNanos / gpuNanos, SORT_FIXED_COST_NANOS, PER_BATCH_NANOS);
+    }
+
     @Override
     public StreamOperatorFactory<RowData> createOperator(
             AcceleratorPlan plan, AcceleratorContext context) {
         GpuKernelSource kernel = ((TornadoPlan) plan).kernel;
         GpuAggregateSpec aggregate = ((TornadoPlan) plan).aggregate;
+        GpuSortSpec sort = ((TornadoPlan) plan).sort;
+        if (sort != null) {
+            return SimpleOperatorFactory.of(
+                    new GpuSortOperator(
+                            sort,
+                            sortCapacity(sort, context),
+                            context.providesOffHeap() ? context::allocateOffHeap : null));
+        }
         if (aggregate != null) {
             // The spec's output row is the projection's, not the operator's: the kernel produces
             // the aggregate's *input*, and what leaves the operator is one (key, sum) row a group.
@@ -344,6 +419,47 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      */
     private static final int MAX_OPS_PER_ROW = Integer.getInteger(MAX_OPS_PER_ROW_PROPERTY, 1024);
 
+    /** The property a deployment sets to move {@link #MAX_SORT_BYTES}. */
+    public static final String MAX_SORT_BYTES_PROPERTY = "flink.accelerator.tornadovm.maxSortBytes";
+
+    /**
+     * The largest partition this provider will undertake to hold for a sort, in bytes of staging.
+     *
+     * <p>A ceiling stated here rather than derived from the slot, because {@link #accept} runs
+     * before the slot's staging has been reserved and the answer is needed then: a sort that finds
+     * out it does not fit has already consumed rows it cannot give back. {@link
+     * AcceleratorContext#stagingBytes()} narrows it afterwards, where the reservation is known.
+     *
+     * <p>One gibibyte by default, which on the rows measured so far is a few tens of millions. The
+     * figure is a property of a host rather than of a query, so a deployment that has measured its
+     * own can say so.
+     */
+    private static final long MAX_SORT_BYTES = Long.getLong(MAX_SORT_BYTES_PROPERTY, 1L << 30);
+
+    /**
+     * Rows the sort operator may hold, from what this machine actually reserved.
+     *
+     * <p>{@link AcceleratorContext#maxBatchSize()} is the wrong number here and it is worth saying
+     * why: it is capped by the configured batch size, which bounds how much may be in flight and
+     * has nothing to say about how large an input may be held. A sort that sized itself from it
+     * would decline every partition larger than one batch, which is every partition worth
+     * offloading.
+     *
+     * <p>Where nothing was reserved -- a benchmark with no slot behind it, a plan compiled before
+     * Flink declared the memory -- the estimate itself is the size, with an eighth over for an
+     * estimate that is a little low. Past that the operator degrades to the host rather than
+     * failing.
+     */
+    private static int sortCapacity(GpuSortSpec sort, AcceleratorContext context) {
+        int bytesPerRow = GpuSortSpec.bytesPerRow(sort.rowType());
+        long budget = context.stagingBytes();
+        long rows =
+                budget > 0
+                        ? budget / bytesPerRow
+                        : sort.estimatedRows() + sort.estimatedRows() / 8 + 1;
+        return (int) Math.max(1, Math.min(Integer.MAX_VALUE - 8, rows));
+    }
+
     /** Nanoseconds the host spends per byte staged, transferred and drained. */
     private static final double HOST_NANOS_PER_BYTE = 0.454;
 
@@ -374,6 +490,21 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      * costs a job that offloads work it never earns back.
      */
     private static final long FIXED_COST_NANOS = 700_000_000L;
+
+    /**
+     * What a sort pays once, which is not what a Calc pays once.
+     *
+     * <p>{@link #FIXED_COST_NANOS} is dominated by compiling a kernel, and a sort compiles none:
+     * the whole device half is one cuDF library task. What is left is opening a device context and
+     * loading the library, and the 300 ms to 700 ms bracket that figure came from had compilation
+     * inside it at both ends — so the low end is an upper bound on a sort rather than an estimate
+     * of one.
+     *
+     * <p>It is stated as the upper bound deliberately, because being wrong this way costs a sort
+     * that stayed on the CPU and the other way costs a job that set a device up and never earned it
+     * back. Replacing it with a measurement is part of what M5.4 still owes.
+     */
+    private static final long SORT_FIXED_COST_NANOS = 300_000_000L;
 
     /**
      * Dispatch and synchronisation per batch, independent of what the batch contains.
@@ -455,16 +586,26 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
 
         private static final long serialVersionUID = 1L;
 
-        private final GpuKernelSource kernel;
+        private final @Nullable GpuKernelSource kernel;
         private final @Nullable GpuAggregateSpec aggregate;
+        private final @Nullable GpuSortSpec sort;
         private final AcceleratorCost cost;
 
         private TornadoPlan(
-                GpuKernelSource kernel,
+                @Nullable GpuKernelSource kernel,
                 @Nullable GpuAggregateSpec aggregate,
+                AcceleratorCost cost) {
+            this(kernel, aggregate, null, cost);
+        }
+
+        private TornadoPlan(
+                @Nullable GpuKernelSource kernel,
+                @Nullable GpuAggregateSpec aggregate,
+                @Nullable GpuSortSpec sort,
                 AcceleratorCost cost) {
             this.kernel = kernel;
             this.aggregate = aggregate;
+            this.sort = sort;
             this.cost = cost;
         }
 
@@ -475,7 +616,7 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
 
         @Override
         public Serializable payload() {
-            return kernel;
+            return kernel != null ? kernel : sort;
         }
     }
 }
