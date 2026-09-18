@@ -27,9 +27,7 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.binary.BinaryRowData;
 import org.apache.flink.table.data.writer.BinaryRowWriter;
 import org.apache.flink.table.gpu.codegen.GpuSortSpec;
-import org.apache.flink.table.gpu.codegen.GpuValueType;
 import org.apache.flink.table.gpu.metrics.OffloadMetrics;
-import org.apache.flink.table.types.logical.LogicalType;
 
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
@@ -39,7 +37,6 @@ import uk.ac.manchester.tornado.cudf.Cudf;
 
 import javax.annotation.Nullable;
 
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -95,19 +92,13 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
     private final int capacity;
     private final transient GeneratedKernelEngine.Staging staging;
 
-    /** The key column cuDF reads, and the permutation it writes back. */
-    private transient IntArray keys;
+    /** The rows held, key column included; {@link StagedColumns} is shared with the join. */
+    private transient StagedColumns rows;
 
+    /** The permutation cuDF writes back. */
     private transient IntArray order;
 
-    /** One buffer per field, at the field's declared width; null at the key's own field. */
-    private transient ByteBuffer[] columns;
-
-    /** A bit a column a row, or null when no field of this row is nullable. */
-    private transient @Nullable ByteBuffer validity;
-
-    private transient int[] widths;
-    private transient LogicalType[] types;
+    private transient int fields;
     private transient int count;
 
     /** Non-null once this has stopped using the device. Holds every row, staged ones included. */
@@ -145,22 +136,9 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
             throw new IllegalStateException(
                     "a staging capacity of " + capacity + " rows overflows an int-indexed buffer");
         }
-        int fields = spec.rowType().getFieldCount();
-        widths = new int[fields];
-        types = new LogicalType[fields];
-        columns = new ByteBuffer[fields];
-        boolean anyNullable = false;
-        for (int i = 0; i < fields; i++) {
-            types[i] = spec.rowType().getTypeAt(i);
-            widths[i] = GpuSortSpec.widthOf(types[i]);
-            anyNullable |= types[i].isNullable();
-            if (i != spec.sortField()) {
-                columns[i] = buffer(widths[i] * capacity);
-            }
-        }
-        keys = allocateInts();
-        order = allocateInts();
-        validity = anyNullable ? buffer(4 * capacity) : null;
+        fields = spec.rowType().getFieldCount();
+        rows = StagedColumns.allocate(spec.rowType(), spec.sortField(), capacity, staging);
+        order = StagedColumns.ints(capacity, staging);
 
         outRow = new BinaryRowData(fields);
         outWriter = new BinaryRowWriter(outRow);
@@ -176,7 +154,7 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
         RowData row = element.getValue();
         if (onHost != null) {
             // Copied rather than retained, as everywhere else here: batch mode reuses the instance.
-            onHost.add(materialise(row));
+            onHost.add(copyOf(row));
             return;
         }
         if (count == capacity) {
@@ -185,10 +163,10 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
                             + spec.estimatedRows()
                             + "), and the staging holds "
                             + capacity);
-            onHost.add(materialise(row));
+            onHost.add(copyOf(row));
             return;
         }
-        stage(row, count++);
+        rows.stage(row, count++);
     }
 
     @Override
@@ -214,7 +192,9 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
             long executeNanos = System.nanoTime() - start;
             long drainStart = System.nanoTime();
             for (int i = 0; i < n; i++) {
-                writeStaged(outWriter, permutation[i]);
+                outWriter.reset();
+                rows.writeInto(outWriter, 0, permutation[i]);
+                outWriter.complete();
                 output.collect(outElement.replace(outRow));
             }
             count = 0;
@@ -239,11 +219,11 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
     private int[] orderOnDevice(int n) throws Exception {
         TaskGraph graph =
                 new TaskGraph("sort")
-                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, keys)
+                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, rows.keys())
                         // Nulls first is stated as 0 and could be either: the provider accepts only
                         // a NOT NULL key, because the shim builds a column with no null mask and a
                         // null key would silently order as whatever its bits happen to be.
-                        .libraryTask("order", Cudf::sortedOrder, n, keys, 0, order)
+                        .libraryTask("order", Cudf::sortedOrder, n, rows.keys(), 0, order)
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, order);
         try (TornadoExecutionPlan plan = new TornadoExecutionPlan(graph.snapshot())) {
             plan.execute();
@@ -258,14 +238,17 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
     /** Stops using the device, keeping every row that has arrived so far. */
     private void degrade(String why) {
         LOG.warn("{}; this sort finishes on the host, which does not spill", why);
-        List<RowData> rows = new ArrayList<>(count + 1024);
+        List<RowData> copies = new ArrayList<>(count + 1024);
         for (int i = 0; i < count; i++) {
-            BinaryRowData copy = new BinaryRowData(widths.length);
-            writeStaged(new BinaryRowWriter(copy), i);
-            rows.add(copy);
+            BinaryRowData copy = new BinaryRowData(fields);
+            BinaryRowWriter writer = new BinaryRowWriter(copy);
+            writer.reset();
+            rows.writeInto(writer, 0, i);
+            writer.complete();
+            copies.add(copy);
         }
         count = 0;
-        onHost = rows;
+        onHost = copies;
     }
 
     private void sortOnHost() {
@@ -277,129 +260,14 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
         onHost.clear();
     }
 
-    // ------------------------------------------------------------------------------------------
-    // Staging
-    // ------------------------------------------------------------------------------------------
-
-    private void stage(RowData row, int position) {
-        if (validity != null) {
-            int bits = 0;
-            for (int f = 0; f < widths.length; f++) {
-                if (row.isNullAt(f)) {
-                    bits |= 1 << f;
-                }
-            }
-            validity.putInt(position * 4, bits);
-        }
-        for (int f = 0; f < widths.length; f++) {
-            if (row.isNullAt(f)) {
-                continue;
-            }
-            if (f == spec.sortField()) {
-                keys.set(position, row.getInt(f));
-                continue;
-            }
-            int at = position * widths[f];
-            switch (types[f].getTypeRoot()) {
-                case INTEGER:
-                    columns[f].putInt(at, row.getInt(f));
-                    break;
-                case BIGINT:
-                    columns[f].putLong(at, row.getLong(f));
-                    break;
-                case FLOAT:
-                    columns[f].putFloat(at, row.getFloat(f));
-                    break;
-                default:
-                    columns[f].putDouble(at, row.getDouble(f));
-                    break;
-            }
-        }
-    }
-
-    /**
-     * Writes the staged row at {@code position} into a binary row.
-     *
-     * <p>{@link BinaryRowData} rather than {@code GenericRowData} because every field here is a
-     * primitive and a {@code GenericRowData} would box all of them. Sorting is the one operator
-     * where that is not a rounding error: it is the whole partition, once, and the only work this
-     * operator does on the host.
-     */
-    private void writeStaged(BinaryRowWriter writer, int position) {
-        writer.reset();
-        int bits = validity == null ? 0 : validity.getInt(position * 4);
-        for (int f = 0; f < widths.length; f++) {
-            if ((bits & (1 << f)) != 0) {
-                writer.setNullAt(f);
-                continue;
-            }
-            if (f == spec.sortField()) {
-                writer.writeInt(f, keys.get(position));
-                continue;
-            }
-            int at = position * widths[f];
-            switch (types[f].getTypeRoot()) {
-                case INTEGER:
-                    writer.writeInt(f, columns[f].getInt(at));
-                    break;
-                case BIGINT:
-                    writer.writeLong(f, columns[f].getLong(at));
-                    break;
-                case FLOAT:
-                    writer.writeFloat(f, columns[f].getFloat(at));
-                    break;
-                default:
-                    writer.writeDouble(f, columns[f].getDouble(at));
-                    break;
-            }
-        }
-        writer.complete();
-    }
-
     /** A live row copied out of whatever the upstream operator reuses. */
-    private BinaryRowData materialise(RowData row) {
-        BinaryRowData target = new BinaryRowData(widths.length);
+    private BinaryRowData copyOf(RowData row) {
+        BinaryRowData target = new BinaryRowData(fields);
         BinaryRowWriter writer = new BinaryRowWriter(target);
         writer.reset();
-        for (int f = 0; f < widths.length; f++) {
-            if (row.isNullAt(f)) {
-                writer.setNullAt(f);
-                continue;
-            }
-            switch (types[f].getTypeRoot()) {
-                case INTEGER:
-                    writer.writeInt(f, row.getInt(f));
-                    break;
-                case BIGINT:
-                    writer.writeLong(f, row.getLong(f));
-                    break;
-                case FLOAT:
-                    writer.writeFloat(f, row.getFloat(f));
-                    break;
-                default:
-                    writer.writeDouble(f, row.getDouble(f));
-                    break;
-            }
-        }
+        StagedColumns.materialise(row, spec.rowType(), writer, 0);
         writer.complete();
         return target;
-    }
-
-    private ByteBuffer buffer(int bytes) {
-        // A heap buffer where there is no arena, rather than a direct one: a direct buffer counts
-        // against MaxDirectMemorySize, which is the accounting M3.1 exists to stop depending on.
-        return staging == null ? ByteBuffer.allocate(bytes) : staging.allocate(bytes);
-    }
-
-    private IntArray allocateInts() {
-        if (staging == null) {
-            return (IntArray) GeneratedKernel.allocate(GpuValueType.INT, capacity);
-        }
-        return (IntArray)
-                GeneratedKernel.allocateOn(
-                        GpuValueType.INT,
-                        capacity,
-                        staging.allocate(GeneratedKernel.sizeOf(GpuValueType.INT, capacity)));
     }
 
     @Override

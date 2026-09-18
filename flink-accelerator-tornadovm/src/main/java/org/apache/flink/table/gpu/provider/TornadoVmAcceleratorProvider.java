@@ -25,6 +25,7 @@ import org.apache.flink.table.accelerator.AccelAggFunction;
 import org.apache.flink.table.accelerator.AccelAggregate;
 import org.apache.flink.table.accelerator.AccelFunction;
 import org.apache.flink.table.accelerator.AccelIrVersion;
+import org.apache.flink.table.accelerator.AccelJoin;
 import org.apache.flink.table.accelerator.AccelNode;
 import org.apache.flink.table.accelerator.AccelSort;
 import org.apache.flink.table.accelerator.AccelWorkProfile;
@@ -32,11 +33,13 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gpu.codegen.AccelKernelGenerator;
 import org.apache.flink.table.gpu.codegen.GpuAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
+import org.apache.flink.table.gpu.codegen.GpuJoinSpec;
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
 import org.apache.flink.table.gpu.codegen.GpuSortSpec;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
 import org.apache.flink.table.gpu.operator.GpuCalcOperator;
 import org.apache.flink.table.gpu.operator.GpuGroupedAggregateOperator;
+import org.apache.flink.table.gpu.operator.GpuJoinOperator;
 import org.apache.flink.table.gpu.operator.GpuSortOperator;
 import org.apache.flink.table.runtime.accelerator.AcceleratorContext;
 import org.apache.flink.table.runtime.accelerator.AcceleratorCost;
@@ -157,6 +160,9 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         }
         if (subtree instanceof AccelSort) {
             return acceptSort((AccelSort) subtree, work);
+        }
+        if (subtree instanceof AccelJoin) {
+            return acceptJoin((AccelJoin) subtree, work);
         }
         if (work.totalOpsPerRow() > MAX_OPS_PER_ROW) {
             LOG.debug(
@@ -357,11 +363,98 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                 cpuNanosPerRow);
     }
 
+    /**
+     * An inner equi-join, served by cuDF's ordering of the build side and a generated probe.
+     *
+     * <p>The split is §T5's and it measured both halves: a sort is not expressible as a per-row map
+     * so the ordering is bound, and a probe is one, so the probe is generated. Binding both would
+     * be slower and larger.
+     */
+    private Optional<AcceleratorPlan> acceptJoin(AccelJoin join, AccelWorkProfile work) {
+        if (!CUDF_AVAILABLE) {
+            LOG.info("declining the join: the cuDF binding is not usable in this JVM");
+            return Optional.empty();
+        }
+        String refusal = GpuJoinSpec.refuse(join, MAX_JOIN_BYTES);
+        if (refusal != null) {
+            LOG.info("declining the join: {}", refusal);
+            return Optional.empty();
+        }
+        GpuJoinSpec spec =
+                new GpuJoinSpec(
+                        join.buildKeyField(),
+                        join.probeKeyField(),
+                        join.buildIsLeft(),
+                        join.estimatedBuildRows(),
+                        join.inputs().get(0).outputType(),
+                        join.inputs().get(1).outputType(),
+                        join.outputType());
+        return Optional.of(new TornadoPlan(null, null, null, spec, joinCost(work, spec)));
+    }
+
+    /**
+     * What probing a row costs here, against what it costs Flink's hash join.
+     *
+     * <p>{@link #CPU_NANOS_COMPARISON} is reused deliberately: what it measured is what a
+     * comparison costs inside one of Flink's binary-row operators, and a hash join's per-row work
+     * is the same kind of thing as a sort's. The device side is priced per field like the sort's,
+     * for the same reason — this operator's cost is staging a row and gathering it back, not the
+     * search between them.
+     */
+    private static AcceleratorCost joinCost(AccelWorkProfile work, GpuJoinSpec spec) {
+        double comparisons = Math.max(1, work.totalOpsPerRow());
+        double cpuNanosPerRow = comparisons * CPU_NANOS_COMPARISON;
+        double gpuNanosPerRow =
+                SORT_NANOS_PER_FIELD
+                                * (spec.probeType().getFieldCount()
+                                        + spec.buildType().getFieldCount())
+                        + HOST_NANOS_PER_BYTE * 12;
+        return new AcceleratorCost(
+                cpuNanosPerRow / gpuNanosPerRow,
+                SORT_FIXED_COST_NANOS,
+                PER_BATCH_NANOS,
+                cpuNanosPerRow);
+    }
+
+    /** The property a deployment sets to move {@link #MAX_JOIN_BYTES}. */
+    public static final String MAX_JOIN_BYTES_PROPERTY = "flink.accelerator.tornadovm.maxJoinBytes";
+
+    /**
+     * The largest build side this provider will undertake to hold, in bytes of staging.
+     *
+     * <p>Stated here for the reason {@link #MAX_SORT_BYTES} is: {@code accept} runs before the
+     * slot's staging is reserved, and a join that finds out it does not fit has already consumed
+     * rows it cannot give back. {@code AcceleratorContext.stagingBytes()} narrows it afterwards.
+     */
+    private static final long MAX_JOIN_BYTES = Long.getLong(MAX_JOIN_BYTES_PROPERTY, 1L << 30);
+
+    /** Rows the build side may hold, from what this machine actually reserved. */
+    private static int joinBuildCapacity(GpuJoinSpec spec, AcceleratorContext context) {
+        int bytesPerRow = GpuJoinSpec.bytesPerRow(spec.buildType());
+        long wanted = spec.estimatedBuildRows() + spec.estimatedBuildRows() / 8 + 1;
+        long budget = context.stagingBytes();
+        // Half the budget, because the probe batch is staged out of the same arena and a build
+        // side that claimed all of it would leave the probe nowhere to go. A page off the top for
+        // the array headers, which are per buffer rather than per row.
+        long fits = budget > 0 ? (budget / 2 - 4096) / bytesPerRow : wanted;
+        long rows = Math.min(wanted, Math.max(1, fits));
+        return (int) Math.max(1, Math.min(Integer.MAX_VALUE - 8, rows));
+    }
+
     @Override
     public StreamOperatorFactory<RowData> createOperator(
             AcceleratorPlan plan, AcceleratorContext context) {
         GpuKernelSource kernel = ((TornadoPlan) plan).kernel;
         GpuAggregateSpec aggregate = ((TornadoPlan) plan).aggregate;
+        GpuJoinSpec join = ((TornadoPlan) plan).join;
+        if (join != null) {
+            return SimpleOperatorFactory.of(
+                    new GpuJoinOperator(
+                            join,
+                            joinBuildCapacity(join, context),
+                            context.maxBatchSize(),
+                            context.providesOffHeap() ? context::allocateOffHeap : null));
+        }
         GpuSortSpec sort = ((TornadoPlan) plan).sort;
         if (sort != null) {
             return SimpleOperatorFactory.of(
@@ -637,13 +730,14 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         private final @Nullable GpuKernelSource kernel;
         private final @Nullable GpuAggregateSpec aggregate;
         private final @Nullable GpuSortSpec sort;
+        private final @Nullable GpuJoinSpec join;
         private final AcceleratorCost cost;
 
         private TornadoPlan(
                 @Nullable GpuKernelSource kernel,
                 @Nullable GpuAggregateSpec aggregate,
                 AcceleratorCost cost) {
-            this(kernel, aggregate, null, cost);
+            this(kernel, aggregate, null, null, cost);
         }
 
         private TornadoPlan(
@@ -651,9 +745,19 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                 @Nullable GpuAggregateSpec aggregate,
                 @Nullable GpuSortSpec sort,
                 AcceleratorCost cost) {
+            this(kernel, aggregate, sort, null, cost);
+        }
+
+        private TornadoPlan(
+                @Nullable GpuKernelSource kernel,
+                @Nullable GpuAggregateSpec aggregate,
+                @Nullable GpuSortSpec sort,
+                @Nullable GpuJoinSpec join,
+                AcceleratorCost cost) {
             this.kernel = kernel;
             this.aggregate = aggregate;
             this.sort = sort;
+            this.join = join;
             this.cost = cost;
         }
 
@@ -664,7 +768,10 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
 
         @Override
         public Serializable payload() {
-            return kernel != null ? kernel : sort;
+            if (kernel != null) {
+                return kernel;
+            }
+            return sort != null ? sort : join;
         }
     }
 }
