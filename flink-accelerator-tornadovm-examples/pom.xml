@@ -153,6 +153,24 @@ under the License.
 						</configuration>
 					</execution>
 					<execution>
+						<id>SortBenchmark</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>SortBenchmark</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.SortBenchmark</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/SortBenchmark*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
 						<id>LogisticRegressionBenchmark</id>
 						<phase>package</phase>
 						<goals>
@@ -242,6 +260,7 @@ under the License.
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-GpuOffloadExample.jar" tofile="${project.build.directory}/GpuOffloadExample.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-HaversineBenchmark.jar" tofile="${project.build.directory}/HaversineBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-GroupedAggregateBenchmark.jar" tofile="${project.build.directory}/GroupedAggregateBenchmark.jar"/>
+								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-SortBenchmark.jar" tofile="${project.build.directory}/SortBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-LogisticRegressionBenchmark.jar" tofile="${project.build.directory}/LogisticRegressionBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-MixedTypeVerification.jar" tofile="${project.build.directory}/MixedTypeVerification.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-ReferenceJoinBenchmark.jar" tofile="${project.build.directory}/ReferenceJoinBenchmark.jar"/>

@@ -321,27 +321,40 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         }
         GpuSortSpec spec =
                 new GpuSortSpec(sort.sortField(), sort.outputType(), work.estimatedRows());
-        return Optional.of(new TornadoPlan(null, null, spec, sortCost(work)));
+        return Optional.of(
+                new TornadoPlan(
+                        null, null, spec, sortCost(work, sort.outputType().getFieldCount())));
     }
 
     /**
      * What ordering a row costs here, against what it costs Flink's sorter.
      *
      * <p>Deliberately not the model above. That one prices arithmetic, and a sort has none — the
-     * planner charges its comparisons as {@code LESS_THAN} so that the subtree is not read as
-     * having no work at all, but pricing {@code log2(n)} imaginary multiplies against a device
-     * would be a number about nothing. What a sort is actually bounded by is moving the key out and
-     * the permutation back, so it is priced as that: four bytes each way against {@code n log n}
-     * host comparisons.
+     * planner charges its comparisons as {@code LESS_THAN} so the subtree is not read as having no
+     * work at all, but pricing {@code log2(n)} imaginary multiplies against a device would be a
+     * number about nothing.
+     *
+     * <p>{@link #CPU_NANOS_COMPARISON} is measured rather than modelled, and stating it is the
+     * point: without it Flink prices a comparison at a nanosecond and refuses a sort whose CPU
+     * operator it has just been told takes two seconds.
      */
-    private static AcceleratorCost sortCost(AccelWorkProfile work) {
+    private static AcceleratorCost sortCost(AccelWorkProfile work, int fields) {
         double comparisons = Math.max(1, work.totalOpsPerRow());
-        double cpuNanos = comparisons * CPU_NANOS_CHEAP;
-        // Eight bytes a row cross the interconnect whatever the row is worth: the key out, the
-        // permutation back. The gather and the emit are host work either way and are not what
-        // distinguishes the two plans.
-        double gpuNanos = comparisons * GPU_NANOS_CHEAP + HOST_NANOS_PER_BYTE * 8;
-        return new AcceleratorCost(cpuNanos / gpuNanos, SORT_FIXED_COST_NANOS, PER_BATCH_NANOS);
+        double cpuNanosPerRow = comparisons * CPU_NANOS_COMPARISON;
+        // Per field rather than per byte, which is the thing this measurement changed. Everything
+        // above prices host work as bytes moved, because for a Calc it is: a columnar gather is a
+        // bulk copy. A sort's host work is not -- it writes each field into staging on arrival and
+        // reads it back out into a binary row on the way out, and both are per field whatever the
+        // field is worth. Priced per byte this claimed 23x and measured 2.2x.
+        //
+        // The key out and the permutation back are the only part that really is bytes, and they
+        // are eight of them.
+        double gpuNanosPerRow = SORT_NANOS_PER_FIELD * fields + HOST_NANOS_PER_BYTE * 8;
+        return new AcceleratorCost(
+                cpuNanosPerRow / gpuNanosPerRow,
+                SORT_FIXED_COST_NANOS,
+                PER_BATCH_NANOS,
+                cpuNanosPerRow);
     }
 
     @Override
@@ -445,18 +458,22 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      * would decline every partition larger than one batch, which is every partition worth
      * offloading.
      *
-     * <p>Where nothing was reserved -- a benchmark with no slot behind it, a plan compiled before
-     * Flink declared the memory -- the estimate itself is the size, with an eighth over for an
-     * estimate that is a little low. Past that the operator degrades to the host rather than
-     * failing.
+     * <p>The budget is a ceiling and the estimate is the need, so this is the smaller of the two --
+     * the same shape {@code batchSizeFor} has for a Calc. Sizing from the budget alone is not
+     * merely wasteful: the arena is the slot's whole operator share, so a 4M-row partition claimed
+     * six gigabytes, spent two and a half seconds having it zeroed, and then failed to fit because
+     * the native arrays carry a header the row width does not count. It fell back and the offload
+     * measured as a slowdown. An eighth over the estimate is the allowance for an estimate that is
+     * a little low; past that the operator degrades to the host rather than failing.
      */
     private static int sortCapacity(GpuSortSpec sort, AcceleratorContext context) {
         int bytesPerRow = GpuSortSpec.bytesPerRow(sort.rowType());
+        long wanted = sort.estimatedRows() + sort.estimatedRows() / 8 + 1;
         long budget = context.stagingBytes();
-        long rows =
-                budget > 0
-                        ? budget / bytesPerRow
-                        : sort.estimatedRows() + sort.estimatedRows() / 8 + 1;
+        // A page off the budget for the array headers, which are per buffer rather than per row
+        // and which the width above therefore cannot express.
+        long fits = budget > 0 ? (budget - 4096) / bytesPerRow : wanted;
+        long rows = Math.min(wanted, fits);
         return (int) Math.max(1, Math.min(Integer.MAX_VALUE - 8, rows));
     }
 
@@ -490,6 +507,37 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      * costs a job that offloads work it never earns back.
      */
     private static final long FIXED_COST_NANOS = 700_000_000L;
+
+    /**
+     * What one comparison costs Flink's own sorter, per row sorted.
+     *
+     * <p>Measured 2026-09-18 on this host, not modelled: an RTX 4070 Laptop machine sorting 4M CSV
+     * rows by one {@code INT}, chaining disabled so the {@code Sort} vertex stands alone. 1948 ms
+     * over 4,000,000 rows at {@code log2(4M) = 22} comparisons a row is 22.1 ns per comparison-row
+     * — against the one nanosecond {@code AcceleratorChoice} assumes where nobody tells it
+     * otherwise.
+     *
+     * <p>Not {@link #CPU_NANOS_CHEAP}, and the gap is the whole reason this constant exists. A
+     * comparison in a sorter is not a scalar compare: it is a normalized-key fetch, a binary-row
+     * dereference on a tie, and a cache miss, inside an operator that is also serialising every row
+     * into managed memory. Pricing it as arithmetic prices the wrong thing.
+     */
+    private static final double CPU_NANOS_COMPARISON = 22.1;
+
+    /**
+     * What one field of one row costs this operator on the host, staged in and written back out.
+     *
+     * <p>Measured 2026-09-18 alongside {@link #CPU_NANOS_COMPARISON}, on the same 4M-row sort of a
+     * three-field row: the {@code Sort} vertex took 938 ms, which is 234 ns a row over three
+     * fields. The operator's own breakdown puts 616 ms of that in the drain -- building four
+     * million {@code BinaryRowData} -- and the cuDF ordering itself at 15.7 ms, so this constant is
+     * almost entirely the cost of touching a row twice and almost not at all the device.
+     *
+     * <p>Which is the finding, and it is the same one §T9 and §T10 reached from the other side: the
+     * device is not the constraint. A sort that wins 2.2x wins it on 15 ms of ordering against 2081
+     * ms of Flink's sorter, and gives most of it back moving rows around.
+     */
+    private static final double SORT_NANOS_PER_FIELD = 78.0;
 
     /**
      * What a sort pays once, which is not what a Calc pays once.
