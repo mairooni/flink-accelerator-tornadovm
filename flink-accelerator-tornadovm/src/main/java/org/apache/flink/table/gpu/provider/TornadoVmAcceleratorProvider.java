@@ -488,7 +488,11 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      * that dominates, which is the model saying out loud that this offload is unlikely to pay.
      */
     private static AcceleratorCost overCost(AccelWorkProfile work, GpuOverAggregateSpec spec) {
-        double cpuNanosPerRow = Math.max(1, work.totalOpsPerRow()) * CPU_NANOS_ACCUMULATION;
+        // One accumulation a row, and deliberately not work.totalOpsPerRow(). The profile is a
+        // property of the whole subtree, and this node sits above the Sort its own ORDER BY
+        // created -- so the total includes that sort's log2(n) comparisons. Charging those at an
+        // accumulation's rate is how this claimed 45x against a measured 1.01x.
+        double cpuNanosPerRow = CPU_NANOS_ACCUMULATION;
         double gpuNanosPerRow =
                 SORT_NANOS_PER_FIELD * spec.inputType().getFieldCount() + HOST_NANOS_PER_BYTE * 16;
         return new AcceleratorCost(
@@ -700,16 +704,18 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
     /**
      * What one accumulation costs Flink's own over-aggregate, per row.
      *
-     * <p>Not measured on this host and deliberately marked as such: §T5 measured the operator at
-     * 1226.7 ms over 4M rows on an RTX 5070 Ti's host, which is 307 ns a row for a single add
-     * through a generated aggs handler. That is the figure used, scaled to nothing — the shape of
-     * the comparison is what matters and the constant is replaced by the measurement M5.2 owes.
+     * <p>Measured 2026-09-18 on this host, like {@link #CPU_NANOS_COMPARISON}: the {@code
+     * OverAggregate} vertex takes 527 ms over 4,000,000 rows with chaining off, which is 132 ns a
+     * row for one add through a generated aggs handler.
      *
-     * <p>Far below {@link #CPU_NANOS_COMPARISON}, and that is the point rather than an oversight.
+     * <p>A sixth of {@link #CPU_NANOS_COMPARISON}, and that is the point rather than an oversight.
      * {@code NonBufferOverWindowOperator} buffers nothing and reserves no managed memory, so there
-     * is none of the cost a sorter pays and none of the advantage a device takes from it.
+     * is none of the cost a sorter pays and none of the advantage a device takes from it. Against
+     * the per-field staging below, this model now claims well under 1x on any row worth offloading
+     * — which is what the measurement found, and the reason the node is left eligible but
+     * unattractive rather than removed.
      */
-    private static final double CPU_NANOS_ACCUMULATION = 307.0;
+    private static final double CPU_NANOS_ACCUMULATION = 132.0;
 
     /**
      * What a sort pays once, which is not what a Calc pays once.
