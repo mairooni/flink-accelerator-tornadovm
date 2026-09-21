@@ -278,6 +278,24 @@ under the License.
 							</includes>
 						</configuration>
 					</execution>
+					<execution>
+						<id>KMeansBenchmark</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>KMeansBenchmark</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.KMeansBenchmark</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/KMeansBenchmark*</include>
+							</includes>
+						</configuration>
+					</execution>
 				</executions>
 			</plugin>
 			<plugin>
@@ -303,6 +321,7 @@ under the License.
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-MixedTypeVerification.jar" tofile="${project.build.directory}/MixedTypeVerification.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-ReferenceJoinBenchmark.jar" tofile="${project.build.directory}/ReferenceJoinBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-FeatureGramBenchmark.jar" tofile="${project.build.directory}/FeatureGramBenchmark.jar"/>
+								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-KMeansBenchmark.jar" tofile="${project.build.directory}/KMeansBenchmark.jar"/>
 							</target>
 						</configuration>
 					</execution>
