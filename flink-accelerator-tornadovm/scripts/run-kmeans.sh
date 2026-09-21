@@ -46,6 +46,10 @@ DIMS="${DIMS:-16}"
 CLUSTERS="${CLUSTERS:-32}"
 STAGE="${STAGE:-assign}"
 ARGMIN="${ARGMIN:-sign}"
+# Fusing a Calc with an aggregate the provider cannot serve declines the whole subtree, Calc
+# included -- so for `assign`, whose aggregate is neither grouped nor a Gram matrix, fusion has
+# to be off or nothing is offloaded at all. See the note in KMeansBenchmark.
+FUSE="${FUSE:-false}"
 FORMAT="${FORMAT:-csv}"
 DATA="${DATA:-/tmp/flink-gpu-kmeans-${ROWS}-${DIMS}d-${FORMAT}}"
 
@@ -75,7 +79,7 @@ fi
 for offload in false true; do
     echo
     echo "############ offload=${offload}  rows=${ROWS}  dims=${DIMS}  clusters=${CLUSTERS}" \
-         " stage=${STAGE}  argmin=${ARGMIN}  parallelism=${PARALLELISM} ############"
+         " stage=${STAGE}  argmin=${ARGMIN}  fuse=${FUSE}  parallelism=${PARALLELISM} ############"
     "${FLINK_HOME}/bin/flink" run "${JAR}" \
         --data "${DATA}" \
         --rows "${ROWS}" \
@@ -86,5 +90,6 @@ for offload in false true; do
         --parallelism "${PARALLELISM}" \
         --runs "${RUNS}" \
         --format "${FORMAT}" \
+        --fuse-aggregate "${FUSE}" \
         --offload "${offload}"
 done

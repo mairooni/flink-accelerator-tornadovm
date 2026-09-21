@@ -19,10 +19,20 @@
 package org.apache.flink.table.examples.java.gpu;
 
 import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
+import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
+import org.apache.flink.streaming.api.operators.BoundedOneInput;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
+import org.apache.flink.table.gpu.operator.KMeansEngine;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -84,6 +94,8 @@ import java.util.StringJoiner;
  */
 public final class KMeansBenchmark {
 
+    private static final Logger LOG = LoggerFactory.getLogger(KMeansBenchmark.class);
+
     /** The range datagen fills, and therefore the range the centroids are drawn from. */
     private static final double SPREAD = 3.0;
 
@@ -117,6 +129,26 @@ public final class KMeansBenchmark {
                 parsed.runs);
         System.out.printf(
                 "expressions in the projection: about %d%n", 3 * parsed.clusters * parsed.dims);
+
+        if ("train".equals(parsed.stage)) {
+            double[][] firstCentroids = null;
+            for (int run = 1; run <= parsed.runs; run++) {
+                long start = System.nanoTime();
+                double[][] result =
+                        parsed.device
+                                ? deviceTrain(parsed, centroids)
+                                : sqlTrain(parsed, centroids);
+                double millis = (System.nanoTime() - start) / 1e6;
+                System.out.printf(
+                        "run %2d  %10.0f ms  centroidNorm=%.6e%n", run, millis, norm(result));
+                if (firstCentroids == null) {
+                    firstCentroids = result;
+                } else {
+                    agreeCentroids(firstCentroids, result);
+                }
+            }
+            return;
+        }
 
         List<Row> first = null;
         for (int run = 1; run <= parsed.runs; run++) {
@@ -159,6 +191,184 @@ public final class KMeansBenchmark {
             }
         }
         return rows;
+    }
+
+    /**
+     * Lloyd's algorithm as a user would write it without a device: one query per iteration.
+     *
+     * <p>The centroids go in as literals because there is nowhere else to put them -- a Flink SQL
+     * plan is fixed, so new centroids mean a new query. That also means the points are read again
+     * on every pass, which is the honest cost of doing this in SQL and is exactly what the device
+     * arm does not pay.
+     */
+    private static double[][] sqlTrain(Args args, double[][] initial) throws Exception {
+        final StreamTableEnvironment env = environment(args);
+        env.executeSql(sourceTable(args));
+
+        double[][] centroids = new double[args.clusters][args.dims];
+        for (int j = 0; j < args.clusters; j++) {
+            System.arraycopy(initial[j], 0, centroids[j], 0, args.dims);
+        }
+
+        for (int iteration = 0; iteration < args.iterations; iteration++) {
+            try (CloseableIterator<Row> it =
+                    env.executeSql(iterateSql(args, centroids)).collect()) {
+                while (it.hasNext()) {
+                    Row row = it.next();
+                    int cid = ((Number) row.getField(0)).intValue();
+                    double members = ((Number) row.getField(1)).doubleValue();
+                    if (members > 0.0 && cid >= 0 && cid < args.clusters) {
+                        for (int c = 0; c < args.dims; c++) {
+                            centroids[cid][c] =
+                                    ((Number) row.getField(2 + c)).doubleValue() / members;
+                        }
+                    }
+                }
+            }
+        }
+        return centroids;
+    }
+
+    /** The same algorithm with the points resident on the device for every pass. */
+    private static double[][] deviceTrain(Args args, double[][] initial) throws Exception {
+        final StreamTableEnvironment env = environment(args);
+        env.executeSql(sourceTable(args));
+
+        DataStream<double[]> trained =
+                env.toDataStream(env.from("Points"))
+                        .transform(
+                                "kmeans",
+                                PrimitiveArrayTypeInfo.DOUBLE_PRIMITIVE_ARRAY_TYPE_INFO,
+                                new KMeansOperator(
+                                        args.rows,
+                                        args.dims,
+                                        args.clusters,
+                                        args.iterations,
+                                        flatten(initial)));
+
+        try (CloseableIterator<double[]> it = trained.executeAndCollect()) {
+            return unflatten(it.next(), args.clusters, args.dims);
+        }
+    }
+
+    private static double[] flatten(double[][] centroids) {
+        int dims = centroids[0].length;
+        double[] flat = new double[centroids.length * dims];
+        for (int j = 0; j < centroids.length; j++) {
+            System.arraycopy(centroids[j], 0, flat, j * dims, dims);
+        }
+        return flat;
+    }
+
+    private static double[][] unflatten(double[] flat, int clusters, int dims) {
+        double[][] centroids = new double[clusters][dims];
+        for (int j = 0; j < clusters; j++) {
+            System.arraycopy(flat, j * dims, centroids[j], 0, dims);
+        }
+        return centroids;
+    }
+
+    /** One number over every centroid, which moves if any of them does. */
+    private static double norm(double[][] centroids) {
+        double total = 0.0;
+        for (double[] centroid : centroids) {
+            for (double value : centroid) {
+                total += value * value;
+            }
+        }
+        return Math.sqrt(total);
+    }
+
+    /**
+     * Checks two runs converged to the same centroids.
+     *
+     * <p>Looser than the row comparison below, because the device sums in a different order and a
+     * centroid is a quotient of two sums. An assignment that differed would move a centroid far
+     * more than reassociation can.
+     */
+    private static void agreeCentroids(double[][] first, double[][] second) {
+        double worst = 0.0;
+        for (int j = 0; j < first.length; j++) {
+            for (int c = 0; c < first[j].length; c++) {
+                double scale = Math.max(1.0, Math.abs(first[j][c]));
+                worst = Math.max(worst, Math.abs(first[j][c] - second[j][c]) / scale);
+            }
+        }
+        if (worst > 1e-6) {
+            throw new IllegalStateException(
+                    "runs disagree on the centroids by " + worst + ", beyond reassociation");
+        }
+    }
+
+    /** Holds the engine, stages every row into it, and trains once the input ends. */
+    private static final class KMeansOperator extends AbstractStreamOperator<double[]>
+            implements OneInputStreamOperator<Row, double[]>, BoundedOneInput {
+
+        private static final long serialVersionUID = 1L;
+
+        private final int rows;
+        private final int dims;
+        private final int clusters;
+        private final int iterations;
+        private final double[] initial;
+        private transient KMeansEngine engine;
+        private transient int staged;
+
+        private KMeansOperator(int rows, int dims, int clusters, int iterations, double[] initial) {
+            this.rows = rows;
+            this.dims = dims;
+            this.clusters = clusters;
+            this.iterations = iterations;
+            this.initial = initial;
+        }
+
+        @Override
+        public void open() throws Exception {
+            super.open();
+            engine = new KMeansEngine(rows, dims, clusters);
+            for (int j = 0; j < clusters; j++) {
+                for (int c = 0; c < dims; c++) {
+                    engine.setCentroid(j, c, initial[j * dims + c]);
+                }
+            }
+        }
+
+        @Override
+        public void processElement(StreamRecord<Row> element) {
+            Row row = element.getValue();
+            for (int c = 0; c < dims; c++) {
+                engine.setPoint(staged, c, ((Number) row.getField(c)).doubleValue());
+            }
+            staged++;
+        }
+
+        @Override
+        public void endInput() {
+            engine.open();
+            engine.train(iterations);
+            LOG.info(
+                    "kmeans: {} rows, {} dims, {} clusters, {} iterations, loop {} ms",
+                    staged,
+                    dims,
+                    clusters,
+                    iterations,
+                    String.format("%.1f", engine.trainMillis()));
+            double[] flat = new double[clusters * dims];
+            for (int j = 0; j < clusters; j++) {
+                for (int c = 0; c < dims; c++) {
+                    flat[j * dims + c] = engine.centroid(j, c);
+                }
+            }
+            output.collect(new StreamRecord<>(flat));
+        }
+
+        @Override
+        public void close() throws Exception {
+            if (engine != null) {
+                engine.close();
+            }
+            super.close();
+        }
     }
 
     /** The arithmetic alone, aggregated to one row so that nothing is measured but the compute. */
@@ -378,6 +588,8 @@ public final class KMeansBenchmark {
         private int clusters = 32;
         private int parallelism = 1;
         private int runs = 6;
+        private int iterations = 20;
+        private boolean device;
         private boolean offload;
         private boolean fuseAggregate = true;
         private boolean generate;
@@ -405,6 +617,10 @@ public final class KMeansBenchmark {
                     args.parallelism = Integer.parseInt(argv[++i]);
                 } else if ("--runs".equals(flag)) {
                     args.runs = Integer.parseInt(argv[++i]);
+                } else if ("--iterations".equals(flag)) {
+                    args.iterations = Integer.parseInt(argv[++i]);
+                } else if ("--device".equals(flag)) {
+                    args.device = Boolean.parseBoolean(argv[++i]);
                 } else if ("--offload".equals(flag)) {
                     args.offload = Boolean.parseBoolean(argv[++i]);
                 } else if ("--fuse-aggregate".equals(flag)) {
@@ -417,8 +633,10 @@ public final class KMeansBenchmark {
                     throw new IllegalArgumentException("unknown flag " + flag);
                 }
             }
-            if (!"assign".equals(args.stage) && !"iterate".equals(args.stage)) {
-                throw new IllegalArgumentException("--stage must be assign or iterate");
+            if (!"assign".equals(args.stage)
+                    && !"iterate".equals(args.stage)
+                    && !"train".equals(args.stage)) {
+                throw new IllegalArgumentException("--stage must be assign, iterate or train");
             }
             if (!"sign".equals(args.argmin) && !"case".equals(args.argmin)) {
                 throw new IllegalArgumentException("--argmin must be sign or case");
