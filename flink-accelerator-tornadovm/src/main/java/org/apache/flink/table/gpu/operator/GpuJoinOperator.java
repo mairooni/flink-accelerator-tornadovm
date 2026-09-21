@@ -251,7 +251,7 @@ public class GpuJoinOperator extends AbstractStreamOperator<RowData>
                         .transferToDevice(DataTransferMode.EVERY_EXECUTION, build.keys())
                         // The key is refused unless it is NOT NULL, so where absent keys go cannot
                         // arise; stated as 0 for the same reason the sort states it.
-                        .libraryTask("order", Cudf::sortedOrder, buildRows, build.keys(), 0, order)
+                        .libraryTask("order", Cudf::sortedOrder, buildRows, build.keys(), order)
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, order);
         try (TornadoExecutionPlan plan = new TornadoExecutionPlan(graph.snapshot())) {
             plan.execute();

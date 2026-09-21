@@ -223,7 +223,7 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
                         // Nulls first is stated as 0 and could be either: the provider accepts only
                         // a NOT NULL key, because the shim builds a column with no null mask and a
                         // null key would silently order as whatever its bits happen to be.
-                        .libraryTask("order", Cudf::sortedOrder, n, rows.keys(), 0, order)
+                        .libraryTask("order", Cudf::sortedOrder, n, rows.keys(), order)
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, order);
         try (TornadoExecutionPlan plan = new TornadoExecutionPlan(graph.snapshot())) {
             plan.execute();
