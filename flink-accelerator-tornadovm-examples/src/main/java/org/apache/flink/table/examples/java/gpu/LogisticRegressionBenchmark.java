@@ -176,7 +176,8 @@ public final class LogisticRegressionBenchmark {
                                         args.features,
                                         args.iterations,
                                         LEARNING_RATE,
-                                        args.contraction));
+                                        args.contraction,
+                                        args.cudaGraph));
 
         try (CloseableIterator<double[]> it = trained.executeAndCollect()) {
             return it.next();
@@ -200,10 +201,17 @@ public final class LogisticRegressionBenchmark {
         private final int iterations;
         private final double learningRate;
         private final String contraction;
+        private final boolean cudaGraph;
         private transient LogisticRegressionEngine engine;
 
         private LogisticOperator(
-                int rows, int features, int iterations, double learningRate, String contraction) {
+                int rows,
+                int features,
+                int iterations,
+                double learningRate,
+                String contraction,
+                boolean cudaGraph) {
+            this.cudaGraph = cudaGraph;
             this.rows = rows;
             this.features = features;
             this.iterations = iterations;
@@ -216,6 +224,7 @@ public final class LogisticRegressionBenchmark {
             super.open();
             engine =
                     new LogisticRegressionEngine(rows, features, (float) learningRate, contraction);
+            engine.withCudaGraph(cudaGraph);
         }
 
         @Override
@@ -351,6 +360,8 @@ public final class LogisticRegressionBenchmark {
          */
         private String contraction = "library";
 
+        private boolean cudaGraph;
+
         static Args parse(String[] argv) {
             Args args = new Args();
             for (int i = 0; i < argv.length; i++) {
@@ -378,6 +389,8 @@ public final class LogisticRegressionBenchmark {
                                 "--contraction must be library, generated or reduce, not " + mode);
                     }
                     args.contraction = mode;
+                } else if ("--cuda-graph".equals(flag)) {
+                    args.cudaGraph = Boolean.parseBoolean(argv[++i]);
                 } else if ("--generate".equals(flag)) {
                     args.generate = true;
                 } else {

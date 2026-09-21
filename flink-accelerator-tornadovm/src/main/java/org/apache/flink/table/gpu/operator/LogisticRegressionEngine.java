@@ -102,6 +102,17 @@ public final class LogisticRegressionEngine implements AutoCloseable {
 
     private final FloatArray gradient;
 
+    /**
+     * Whether to capture the iteration into a CUDA graph and replay it.
+     *
+     * <p>Off by default and offered only to be measured. A pass here is four launches against
+     * milliseconds of kernel, so there is little launch overhead to remove; the expectation is that
+     * it changes nothing, and the point of the flag is to record that rather than assert it. A
+     * graph containing a cuDF task could not be captured at all -- the shim ends every entry point
+     * with a stream synchronise -- but this engine has only cuBLAS and generated kernels.
+     */
+    private boolean cudaGraph;
+
     private TornadoExecutionPlan plan;
     private int staged;
     private double trainMillis;
@@ -226,6 +237,15 @@ public final class LogisticRegressionEngine implements AutoCloseable {
                                 features)
                         .transferToHost(DataTransferMode.UNDER_DEMAND, weights);
         plan = new TornadoExecutionPlan(graph.snapshot());
+        if (cudaGraph) {
+            // Returns a wrapper rather than mutating, so the result has to be kept.
+            plan = plan.withCUDAGraph();
+        }
+    }
+
+    /** Selects the CUDA-graph arm. Call before {@link #open()}. */
+    public void withCudaGraph(boolean enabled) {
+        this.cudaGraph = enabled;
     }
 
     /**

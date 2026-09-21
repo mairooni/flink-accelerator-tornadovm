@@ -80,7 +80,10 @@ for offload in false true; do
     echo
     echo "############ offload=${offload}  rows=${ROWS}  dims=${DIMS}  clusters=${CLUSTERS}" \
          " stage=${STAGE}  argmin=${ARGMIN}  fuse=${FUSE}  parallelism=${PARALLELISM} ############"
-    "${FLINK_HOME}/bin/flink" run "${JAR}" \
+    # A job that fails fast also returns a time, and a failure takes about 2 s where a working
+    # device arm takes 4-5 -- so it reads as an improvement. Keep the output and check a result
+    # line was printed before believing any timing. See VERIFY.md T13d.
+    OUT=$("${FLINK_HOME}/bin/flink" run "${JAR}" \
         --data "${DATA}" \
         --rows "${ROWS}" \
         --dims "${DIMS}" \
@@ -91,5 +94,10 @@ for offload in false true; do
         --runs "${RUNS}" \
         --format "${FORMAT}" \
         --fuse-aggregate "${FUSE}" \
-        --offload "${offload}"
+        --offload "${offload}" 2>&1)
+    echo "${OUT}"
+    if ! grep -qE '^run ' <<<"${OUT}"; then
+        echo "### FAILED: no result line, so the timings above are not measurements" >&2
+        exit 1
+    fi
 done
