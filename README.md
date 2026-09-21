@@ -25,8 +25,9 @@ description; this ships the rate and the kernel.
   interfaces this implements (`AcceleratorProvider`, `AccelNode`, the IR) exist
   only on the `gpu-offload` branch. Build that with `mvn install -DskipTests`
   first.
-- **TornadoVM 6.0.1-jdk21-dev**, built locally. Its own build installs
-  `tornado-api`, `tornado-annotation` and `tornado-cublas` into `~/.m2`.
+- **TornadoVM 6.1.1-jdk21-dev**, built locally, matching `<tornado.version>` in
+  the pom. Its own build installs `tornado-api`, `tornado-annotation`,
+  `tornado-cublas` and `tornado-cudf` into `~/.m2`.
 - **JDK 21.** TornadoVM's off-heap arrays are built on `java.lang.foreign`, a
   preview API on 21 and final on 22; Flink 2.3 has no JDK 22+ profile, so
   21-with-preview is what a TaskManager running this actually runs on.
@@ -40,6 +41,10 @@ description; this ships the rate and the kernel.
 Put `flink-accelerator-tornadovm/target/flink-accelerator-tornadovm-*.jar` in a
 distribution's `lib/`, and start the TaskManagers with TornadoVM's JVM arguments.
 `flink-accelerator-tornadovm/scripts/gpu-cluster-setup.sh` does both.
+
+**[DEPLOYMENT.md](DEPLOYMENT.md)** has the whole picture: how the four pieces fit
+together, the build order and why it is strict, what the setup script changes, and
+the couplings that fail at runtime rather than at build time.
 
 A TaskManager without the jar, without a device, or without those JVM arguments
 runs the code-generated operator instead and logs why. Nothing fails.
