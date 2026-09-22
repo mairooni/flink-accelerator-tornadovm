@@ -135,6 +135,24 @@ under the License.
 						</configuration>
 					</execution>
 					<execution>
+						<id>BlackScholesBenchmark</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>BlackScholesBenchmark</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.BlackScholesBenchmark</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/BlackScholesBenchmark*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
 						<id>GroupedAggregateBenchmark</id>
 						<phase>package</phase>
 						<goals>
@@ -322,6 +340,7 @@ under the License.
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-ReferenceJoinBenchmark.jar" tofile="${project.build.directory}/ReferenceJoinBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-FeatureGramBenchmark.jar" tofile="${project.build.directory}/FeatureGramBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-KMeansBenchmark.jar" tofile="${project.build.directory}/KMeansBenchmark.jar"/>
+								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-BlackScholesBenchmark.jar" tofile="${project.build.directory}/BlackScholesBenchmark.jar"/>
 							</target>
 						</configuration>
 					</execution>
