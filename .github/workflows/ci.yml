@@ -1,0 +1,147 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# CI for the TornadoVM accelerator provider.
+#
+# Two jobs, and the split is the point. `host` needs no hardware and is the gate;
+# `device` needs a GPU, a TornadoVM SDK and RAPIDS, and is advisory. Neither runs
+# inside Apache Flink's CI and neither should: TornadoVM and RAPIDS have module-path,
+# native-library and CUDA-driver requirements that Flink core must not inherit, which
+# is the whole reason this provider is a separate repository.
+#
+# What a device run proves that a host run cannot: AccelKernelGenerator emits Java that
+# a device compiler lowers, and the lowering is not always the one Java means. `a >= b`
+# was measured on an RTX 4070 keeping every row where `a` is NaN, because it lowers to
+# `!(a < b)` — a changed query result that no host-side test could see, since the
+# reference interpreter is ordinary Java and has always been right.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host:
+    name: host-side (no device)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # The provider compiles against a Flink that is not released: the accelerator SPI
+      # exists only on the gpu-offload branch. Until that lands, the reactor has to be
+      # built and installed first, and the fork/branch to build from are inputs rather
+      # than constants so this does not silently pin someone's personal remote.
+      - name: Build the Flink SPI this compiles against
+        env:
+          FLINK_REPO: ${{ vars.FLINK_REPO || 'https://github.com/apache/flink.git' }}
+          FLINK_REF: ${{ vars.FLINK_REF || 'gpu-offload' }}
+        run: |
+          git clone --depth 1 --branch "$FLINK_REF" "$FLINK_REPO" /tmp/flink
+          cd /tmp/flink
+          ./mvnw -B -q install -DskipTests -Dfast -Pskip-webui-build -T1C \
+            -pl flink-table/flink-table-common,flink-table/flink-table-runtime -am
+
+      # tornado-api is not on Maven Central, so a device-free build still needs the jars
+      # the SDK installs. Building TornadoVM here would cost far more than this job is
+      # worth; the artefacts are cached instead and the job says plainly when they are
+      # missing rather than failing with an unresolved dependency nobody can read.
+      - name: Restore TornadoVM artefacts
+        id: tornado
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/io/github/beehive-lab
+          key: tornado-${{ vars.TORNADO_VERSION || '6.1.1-jdk21-dev' }}
+
+      - name: Explain a cache miss rather than fail obscurely
+        if: steps.tornado.outputs.cache-hit != 'true'
+        run: |
+          echo "::error::No cached TornadoVM artefacts for ${{ vars.TORNADO_VERSION || '6.1.1-jdk21-dev' }}."
+          echo "::error::tornado-api is not on Maven Central. Run the device job once on a"
+          echo "::error::machine with a TornadoVM build to populate this cache."
+          exit 1
+
+      - name: Build and test, formatting checks enabled
+        run: mvn -B -o test -DskipDeviceTests
+
+      - name: Check formatting
+        run: mvn -B -o spotless:check
+
+  device:
+    name: device (GPU, TornadoVM, RAPIDS)
+    # A self-hosted runner with a card. Advisory, not a gate: a repository with no such
+    # runner should still be able to merge host-side work, and a queued job that never
+    # runs is worse than one that is skipped and says so.
+    runs-on: [self-hosted, gpu]
+    continue-on-error: true
+    if: ${{ vars.HAS_GPU_RUNNER == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the environment, because a benchmark without one is not a result
+        run: |
+          echo "### Device environment" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```'
+            nvidia-smi --query-gpu=name,driver_version,memory.total,power.limit \
+              --format=csv || echo "nvidia-smi unavailable"
+            echo "TORNADOVM_HOME=${TORNADOVM_HOME:-(unset)}"
+            java -version 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The two things that decide how much of the suite actually runs, reported before
+      # it runs. A green build in which everything skipped must not look like a green
+      # build in which everything passed.
+      - name: Report what will be skipped, and why
+        run: |
+          missing=""
+          [ -n "$TORNADOVM_HOME" ] || missing="$missing TORNADOVM_HOME"
+          ldconfig -p 2>/dev/null | grep -q libcudf || missing="$missing libcudf(RAPIDS)"
+          if [ -n "$missing" ]; then
+            echo "::warning::Absent:$missing -- the tests needing them will skip, not fail."
+            echo "Absent:$missing" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Device and cuDF both present: the full suite will run." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Device tests
+        run: mvn -B -o test -Pdevice -Dtornado.sdk="$TORNADOVM_HOME"
+
+      # Skips are the thing to surface. DeviceAssumptions skips rather than fails when a
+      # card or the cuDF shim is absent -- correct, because a missing card is not a broken
+      # change -- but a run in which 22 of 42 tests skipped has checked much less than the
+      # summary line suggests, and the difference belongs where a reviewer will see it.
+      - name: Summarise skips
+        if: always()
+        run: |
+          {
+            echo "### Device test results"
+            echo '```'
+            grep -h -E 'Tests run:' \
+              flink-accelerator-tornadovm/target/surefire-reports/*.txt 2>/dev/null \
+              || echo "no surefire reports"
+            echo '```'
+            echo "Skips mean 'not checked here', not 'checked and fine'."
+          } >> "$GITHUB_STEP_SUMMARY"

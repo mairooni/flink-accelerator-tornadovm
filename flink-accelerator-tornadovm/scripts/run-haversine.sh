@@ -41,6 +41,10 @@ PARALLELISM="${3:-1}"
 RUNS="${4:-10}"
 DEPOTS="${DEPOTS:-20}"
 FORMAT="${FORMAT:-csv}"
+# Kilometres for the WHERE arm; 0 leaves the query unfiltered. A filter is what pulls in the
+# cuDF compaction, and the interesting values are selective ones -- the compaction costs three
+# extra device kernels a batch and saves copying only the rows that did not survive.
+NEAR="${NEAR:-0}"
 DATA="${DATA:-/tmp/flink-gpu-points-${ROWS}-${FORMAT}}"
 
 if [[ -z "${FLINK_HOME}" || ! -x "${FLINK_HOME}/bin/flink" ]]; then
@@ -69,12 +73,13 @@ fi
 
 for gpu in false true; do
     echo
-    echo "############ gpu=${gpu}  rows=${ROWS}  parallelism=${PARALLELISM}  format=${FORMAT}  depots=${DEPOTS} ############"
+    echo "############ gpu=${gpu}  rows=${ROWS}  parallelism=${PARALLELISM}  format=${FORMAT}  depots=${DEPOTS}  near=${NEAR} ############"
     "${FLINK_HOME}/bin/flink" run "${JAR}" \
         --data "${DATA}" \
         --parallelism "${PARALLELISM}" \
         --runs "${RUNS}" \
         --format "${FORMAT}" \
         --depots "${DEPOTS}" \
+        --near "${NEAR}" \
         --gpu "${gpu}"
 done

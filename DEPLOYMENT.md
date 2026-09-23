@@ -71,7 +71,11 @@ Four things happen, and each matters:
    the client builds the plan, the JobManager holds it, the TaskManager runs the
    kernel — which is why they go in the `all` key.
 3. **`flink-sql-parquet` is installed**, which the distribution does not ship and
-   the columnar path needs.
+   the columnar path needs. **That jar is necessary and not sufficient**: it calls
+   into `org.apache.hadoop.conf.Configuration`, which the distribution does not
+   ship either, so a parquet run without Hadoop on the classpath dies with a
+   `ClassNotFoundException` from the client before any job is submitted. See
+   "Parquet also needs Hadoop" below.
 4. **Memory and the GPU resource are sized**:
    `taskmanager.memory.task.off-heap.size=512m`, process size 16g, and
    `external-resource.gpu.amount=1`.
@@ -85,6 +89,40 @@ path, so the SDK stays where it is and the cluster references it.
 
 > **Re-run this script after every distribution build.** The assembly regenerates
 > `config.yaml` and silently takes TornadoVM off the module path.
+
+### Parquet also needs Hadoop, and it is worth the trouble
+
+Parquet is the format the operator actually wants: it hands over `ColumnarRowData`,
+which is the layout the bulk columnar gather exists for, and the difference is
+visible in the operator's own report —
+
+```
+gather tiers: tier1-columnar-bulk(100.0% bulk), ...   # parquet
+```
+
+against the per-row tiers a CSV source produces. It is also several times smaller
+on disk, so the source reads fewer bytes to begin with.
+
+The distribution ships neither Hadoop nor a shaded substitute. Flink's
+`config.sh` appends `HADOOP_CLASSPATH` to every JVM it starts, so the fix is to
+set it — and the least error-prone way to build one is to ask Flink's own parquet
+module what it depends on rather than assembling a list by hand:
+
+```bash
+cd flink
+./mvnw -o dependency:build-classpath -pl flink-formats/flink-parquet \
+    -Dmdep.outputFile=/tmp/parquet-cp.txt -Dmdep.includeScope=test
+# drop the flink jars, which would shadow the distribution's own
+tr ':' '\n' < /tmp/parquet-cp.txt | grep -vE '/org/apache/flink/' | grep '\.jar$' \
+  | sort -u | tr '\n' ':' | sed 's/:$//' > /tmp/hadoop-cp.txt
+
+export HADOOP_CLASSPATH=$(cat /tmp/hadoop-cp.txt)
+$FLINK_HOME/bin/start-cluster.sh
+```
+
+It has to be exported **before** `start-cluster.sh`, because the TaskManager reads
+it at start-up, and it has to be present in the client's environment too — the
+client builds the plan and resolves the format.
 
 ### Off-heap sizing is the trap that costs the most time
 
