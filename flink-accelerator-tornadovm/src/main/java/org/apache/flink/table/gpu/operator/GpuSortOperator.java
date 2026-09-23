@@ -66,15 +66,26 @@ import java.util.List;
  * <h2>When the estimate was wrong</h2>
  *
  * <p>An estimate is a statistic and statistics are wrong. If more rows arrive than the staging
- * holds, this stops using the device and finishes on the host: the staged rows are materialised
- * into a list, the overflow joins them, and the ordering is {@code List.sort}. Slower — much slower
- * — and correct, which is the trade a sort has to make, because by then the rows have been consumed
- * and there is no operator left to give them to. It is reported at {@code WARN} and the device
- * gauge goes to zero, so a job doing this is visible rather than merely disappointing.
+ * holds, this <b>fails the task</b> with {@link StagingCapacityExceededException}. It used to
+ * finish on the host instead — staged rows materialised into a list, the overflow joining them,
+ * ordered with {@code List.sort} — and that answer was correct and bounded by nothing but the task
+ * heap. A cardinality miss, which is the one thing that path existed to survive, could therefore
+ * take the TaskManager down rather than merely run slowly.
  *
- * <p>Deliberately not spilling. The heap is the bound on that path, where Flink's own sorter would
- * go to disk. Getting the estimate right is what keeps it rare, and it is why {@code BatchExecSort}
- * was made to carry one.
+ * <p>Failing is the better trade only because of what happens next: Flink does not offer a retried
+ * attempt to an accelerator, so batch failover re-runs this task on {@code SortOperator}, which
+ * spills. One attempt is lost and the query finishes, with a bound that holds at every point.
+ *
+ * <h2>When the device was wrong</h2>
+ *
+ * <p>Different, and still survivable. If ordering fails on the device, every row is already staged
+ * — at most {@code capacity} of them — so materialising them and sorting on the host is bounded by
+ * the reservation that was already held. That path is kept, reported at {@code WARN}, and the
+ * device gauge goes to zero.
+ *
+ * <p>Deliberately not spilling in either case. Flink's own sorter goes to disk and this does not,
+ * which is why the undertaking is checked at {@code open()} against the estimate {@code
+ * BatchExecSort} was made to carry.
  *
  * <h2>Stability</h2>
  *
@@ -158,13 +169,13 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
             return;
         }
         if (count == capacity) {
-            degrade(
-                    "more rows arrived than the planner estimated ("
-                            + spec.estimatedRows()
-                            + "), and the staging holds "
-                            + capacity);
-            onHost.add(copyOf(row));
-            return;
+            // Not survivable here, and the comment on the exception says why: continuing means an
+            // ArrayList bounded by the task heap rather than by the reservation this operator
+            // undertook to stay inside.
+            throw new StagingCapacityExceededException(
+                    "this sort was given more rows than it undertook to hold",
+                    spec.estimatedRows(),
+                    capacity);
         }
         rows.stage(row, count++);
     }

@@ -18,8 +18,6 @@
 
 package org.apache.flink.table.gpu.metrics;
 
-import uk.ac.manchester.tornado.api.TornadoProfilerResult;
-
 /**
  * The gather / copy-in / kernel / copy-out breakdown that is P1's exit criterion.
  *
@@ -50,6 +48,7 @@ public final class OffloadMetrics {
 
     private long bytesCopyIn;
     private long bytesCopyOut;
+    private long onDemandBytesOut;
 
     /** Records one batch. {@code result} may be null when the profiler is disabled. */
     public void recordBatch(
@@ -58,21 +57,38 @@ public final class OffloadMetrics {
             long gather,
             long executeWall,
             long drain,
-            TornadoProfilerResult result) {
+            org.apache.flink.table.gpu.operator.GeneratedKernelEngine.DeviceProfile profile) {
         batches++;
         rowsIn += rows;
         rowsOut += emitted;
         gatherNanos += gather;
         executeWallNanos += executeWall;
         drainNanos += drain;
-        if (result != null) {
-            copyInNanos += result.getDeviceWriteTime();
-            kernelNanos += result.getDeviceKernelTime();
-            copyOutNanos += result.getDeviceReadTime();
-            compileNanos += result.getCompileTime();
-            bytesCopyIn += result.getTotalBytesCopyIn();
-            bytesCopyOut += result.getTotalBytesCopyOut();
+        addProfile(profile);
+    }
+
+    /**
+     * Folds in device numbers that did not come from {@link #recordBatch}.
+     *
+     * <p><b>Not for a second task graph in the same plan.</b> {@code TornadoProfilerResult}
+     * delegates to the <em>executor</em>, so every graph of one execution plan answers with the
+     * same plan-wide cumulative totals; adding two of them counts everything twice. That was done
+     * here and inflated the fused path's reported kernel time and byte counts by a factor of two
+     * until a controlled measurement caught it — the give-away was that the "first graph only"
+     * figure equalled the whole non-compacted plan's, for a graph that contains no {@code
+     * transferToHost} at all.
+     */
+    public void addProfile(
+            org.apache.flink.table.gpu.operator.GeneratedKernelEngine.DeviceProfile profile) {
+        if (profile == null) {
+            return;
         }
+        copyInNanos += profile.copyInNanos();
+        kernelNanos += profile.kernelNanos();
+        copyOutNanos += profile.copyOutNanos();
+        compileNanos += profile.compileNanos();
+        bytesCopyIn += profile.bytesIn();
+        bytesCopyOut += profile.bytesOut();
     }
 
     public long getBatches() {
@@ -119,6 +135,24 @@ public final class OffloadMetrics {
         return bytesCopyIn;
     }
 
+    /**
+     * Bytes fetched by an on-demand partial transfer, which the runtime's profiler never sees.
+     *
+     * <p>The compaction copies out a prefix after the graph has run, sized from a count only the
+     * device knew. That transfer re-enters the runtime and resets the per-execution counters, so
+     * the profiler reports neither the bytes nor the time. The bytes at least are exactly known --
+     * they are what the transfer asked for -- so they are counted here and added into the copy-out
+     * total, with the report naming how much of it came this way.
+     */
+    public void addOnDemandBytesOut(long bytes) {
+        onDemandBytesOut += bytes;
+        bytesCopyOut += bytes;
+    }
+
+    public long getOnDemandBytesOut() {
+        return onDemandBytesOut;
+    }
+
     public long getBytesCopyOut() {
         return bytesCopyOut;
     }
@@ -143,9 +177,9 @@ public final class OffloadMetrics {
                         batches, rowsIn, rowsOut, rowsIn == 0 ? 0.0 : 100.0 * rowsOut / rowsIn));
         sb.append(String.format("%-12s %12s %8s%n", "segment", "ms", "share"));
         sb.append(row("gather", gatherNanos, total));
-        sb.append(row("copy-in", copyInNanos, total));
+        sb.append(transfer("copy-in", copyInNanos, bytesCopyIn, total));
         sb.append(row("kernel", kernelNanos, total));
-        sb.append(row("copy-out", copyOutNanos, total));
+        sb.append(transfer("copy-out", copyOutNanos, bytesCopyOut, total));
         sb.append(row("drain", drainNanos, total));
         sb.append(String.format("%-12s %12.3f%n", "attributed", total / 1e6));
         sb.append(
@@ -158,12 +192,41 @@ public final class OffloadMetrics {
                         "compile", compileNanos / 1e6));
         sb.append(
                 String.format(
-                        "bytes in=%.2f MiB  out=%.2f MiB%n",
-                        bytesCopyIn / 1048576.0, bytesCopyOut / 1048576.0));
+                        "bytes in=%.3f MiB  out=%.3f MiB%s%n",
+                        bytesCopyIn / 1048576.0,
+                        bytesCopyOut / 1048576.0,
+                        onDemandBytesOut == 0
+                                ? ""
+                                : String.format(
+                                        "  (of which %.3f MiB fetched on demand as a prefix)",
+                                        onDemandBytesOut / 1048576.0)));
         return sb.toString();
     }
 
     private static String row(String name, long nanos, long total) {
         return String.format("%-12s %12.3f %7.1f%%%n", name, nanos / 1e6, 100.0 * nanos / total);
+    }
+
+    /**
+     * A transfer segment, which has to distinguish "took no time" from "was not timed".
+     *
+     * <p>TornadoVM accumulates {@code COPY_OUT_TIME} only when the copy produced an event to wait
+     * on. A copy issued without dependency tracking returns {@code -1} instead of an event — see
+     * {@code TornadoVMInterpreter.transferDeviceToHost*}, which guards the timing on {@code
+     * readEvent != -1} while counting the bytes unconditionally. So a transfer that demonstrably
+     * happened can report zero nanoseconds.
+     *
+     * <p>Printing that as {@code 0.000 ms} invites exactly the wrong conclusion — that moving the
+     * data was free, on a path where the review's whole argument is that the interconnect decides
+     * these benchmarks. Bytes moved with no time against them are therefore reported as untimed,
+     * which is a smaller claim and a true one.
+     */
+    private static String transfer(String name, long nanos, long bytes, long total) {
+        if (nanos == 0 && bytes > 0) {
+            return String.format(
+                    "%-12s %12s %7s   (%.2f MiB moved; the runtime produced no event to time)%n",
+                    name, "untimed", "-", bytes / 1048576.0);
+        }
+        return row(name, nanos, total);
     }
 }

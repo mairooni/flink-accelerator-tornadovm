@@ -191,8 +191,40 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
         GeneratedKernelEngine.Execution execution = engine.execute(count);
 
         long drainStart = System.nanoTime();
-        int emitted = 0;
+        int emitted = engine.compactsOnDeviceNow() ? drainCompacted() : drainMasked(count);
+        engine.recordBatch(count, 0, execution, emitted, System.nanoTime() - drainStart);
+    }
+
+    /**
+     * The drain when the device compacted: survivors are packed at the front, in order.
+     *
+     * <p>Computed fields come from the compacted buffers, which hold only what survived. A
+     * pass-through field does not: it is read from the staging buffer on the host, where it already
+     * was, at the position the compaction says the survivor came from. Gathering those on the
+     * device would move a column across the interconnect twice to save a host array index.
+     */
+    private int drainCompacted() {
         int[] layout = spec.outputLayout();
+        int survivors = engine.survivors();
+        for (int j = 0; j < survivors; j++) {
+            int staged = engine.survivorPosition(j);
+            int computed = 0;
+            for (int field = 0; field < layout.length; field++) {
+                if (layout[field] == GpuCalcSpec.COMPUTED) {
+                    outRow.setField(field, engine.compactedOutput(computed++, j));
+                } else {
+                    passThrough[field].writeInto(outRow, field, staged);
+                }
+            }
+            output.collect(outElement.replace(outRow));
+        }
+        return survivors;
+    }
+
+    /** The drain when the whole batch came back: walk it and skip what the mask rejected. */
+    private int drainMasked(int count) {
+        int[] layout = spec.outputLayout();
+        int emitted = 0;
         for (int i = 0; i < count; i++) {
             if (!engine.selected(i)) {
                 continue;
@@ -211,7 +243,7 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
             output.collect(outElement.replace(outRow));
             emitted++;
         }
-        engine.recordBatch(count, 0, execution, emitted, System.nanoTime() - drainStart);
+        return emitted;
     }
 
     /**
@@ -404,6 +436,18 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
     }
 
     /** Metrics for the batches this operator has run so far; exposed for tests. */
+    /**
+     * Whether this subtask's filter compacted on the device rather than on the host.
+     *
+     * <p>Exposed because the fused path is otherwise invisible: it produces the same rows as the
+     * host drain, so a passing correctness test says nothing about which of the two ran. The
+     * conditions are listed on {@code GeneratedKernelEngine.compactsOnDevice()} and one of them is
+     * whether cuDF can run at all, so the answer is a property of the machine and not of the plan.
+     */
+    public boolean compactedOnDevice() {
+        return engine != null && engine.compactsOnDeviceNow();
+    }
+
     public OffloadMetrics metrics() {
         return engine.metrics();
     }

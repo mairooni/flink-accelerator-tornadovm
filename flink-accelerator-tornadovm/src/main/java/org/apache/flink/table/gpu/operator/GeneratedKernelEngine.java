@@ -25,6 +25,7 @@ import org.apache.flink.table.gpu.codegen.GpuValueType;
 import org.apache.flink.table.gpu.gather.RowGather;
 import org.apache.flink.table.gpu.metrics.OffloadMetrics;
 
+import uk.ac.manchester.tornado.api.DataRange;
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
@@ -33,9 +34,11 @@ import uk.ac.manchester.tornado.api.TornadoProfilerResult;
 import uk.ac.manchester.tornado.api.WorkerGrid1D;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 import uk.ac.manchester.tornado.api.enums.ProfilerMode;
+import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
+import uk.ac.manchester.tornado.api.types.arrays.TornadoNativeArray;
 import uk.ac.manchester.tornado.cudf.Cudf;
 
 import javax.annotation.Nullable;
@@ -102,6 +105,26 @@ public final class GeneratedKernelEngine implements AutoCloseable {
 
     private GeneratedKernel generated;
     private TornadoExecutionPlan plan;
+
+    /**
+     * Whether the filter compacts on the device instead of on the host.
+     *
+     * <p>Decided once in {@link #open()} from what the kernel turned out to need. See {@link
+     * #compactsOnDevice()} for the conditions and why each one is there.
+     */
+    private boolean compacting;
+
+    /** The mask as cuDF wants it: one byte a row, and zero past the live row count. */
+    private ByteArray maskBytes;
+
+    /** The surviving positions, in order, as {@code Cudf.selectedIndices} writes them. */
+    private IntArray selectedIndices;
+
+    /** How many survived, written by cuDF and read by the gather kernels and by the host. */
+    private IntArray survivorCount;
+
+    /** The compacted counterpart of each output column: survivors packed at the front. */
+    private Object[] compacted;
 
     /**
      * The same kernel without the cuDF stage, built on the first short batch and only then.
@@ -192,6 +215,19 @@ public final class GeneratedKernelEngine implements AutoCloseable {
             mask = new IntArray(batchSize);
             mask.init(0);
         }
+        compacting = compactsOnDevice();
+        if (compacting) {
+            maskBytes = new ByteArray(batchSize);
+            maskBytes.init((byte) 0);
+            selectedIndices = new IntArray(batchSize);
+            selectedIndices.init(0);
+            survivorCount = new IntArray(1);
+            survivorCount.set(0, 0);
+            compacted = new Object[outputs.length];
+            for (int i = 0; i < compacted.length; i++) {
+                compacted[i] = allocate(kernel.outputTypes()[i], batchSize);
+            }
+        }
         // How many rows the kernel should actually process, re-read by the device on every
         // execution. A one-element array rather than a scalar argument, because a scalar is
         // captured when the graph is built and the last batch of a partition is short.
@@ -278,7 +314,15 @@ public final class GeneratedKernelEngine implements AutoCloseable {
             }
             results = back.toArray();
         }
-        graph = graph.transferToHost(DataTransferMode.EVERY_EXECUTION, results);
+        if (compacting) {
+            // Nothing the kernel wrote goes to the host from here: the projections and the mask
+            // stay where they are and the next graph reads them in place. That alone saves no
+            // bytes -- the next graph would copy out buffers of the same size -- and the saving
+            // arrives with the prefix fetch in fetchSurvivors.
+            graph = graph.persistOnDevice(concat(outputs, mask, rows));
+        } else {
+            graph = graph.transferToHost(DataTransferMode.EVERY_EXECUTION, results);
+        }
 
         // An explicit iteration space, and it is not optional.
         //
@@ -295,10 +339,167 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         grid = new WorkerGrid1D(batchSize);
         GridScheduler scheduler = new GridScheduler();
         scheduler.addWorkerGrid("calc.kernel", grid);
-        plan = new TornadoExecutionPlan(graph.snapshot()).withGridScheduler(scheduler);
+        if (compacting) {
+            TaskGraph compact = compactionGraph(batchSize, scheduler);
+            plan =
+                    new TornadoExecutionPlan(graph.snapshot(), compact.snapshot())
+                            .withGridScheduler(scheduler);
+        } else {
+            plan = new TornadoExecutionPlan(graph.snapshot()).withGridScheduler(scheduler);
+        }
         if (profile) {
             plan = plan.withProfiler(ProfilerMode.SILENT);
         }
+    }
+
+    /**
+     * Whether this kernel's filter can compact on the device rather than on the host.
+     *
+     * <p>Four conditions, and each one is a thing the compaction would otherwise get wrong rather
+     * than merely a thing it has not been tried against:
+     *
+     * <ul>
+     *   <li><b>There is a filter.</b> Without a mask there is nothing to compact, and the gather
+     *       would be an identity copy costing a kernel and a buffer.
+     *   <li><b>There is no grouped aggregate.</b> That path already ends on the device and returns
+     *       one row a group; compacting before it would be work in front of a smaller answer.
+     *   <li><b>Nothing carries validity.</b> Compacting a column means compacting its null bits
+     *       too, in the same permutation, and the validity here is a packed word per row covering
+     *       every column at once. Gathering that word is expressible; getting it wrong is a silent
+     *       wrong answer, so it waits for a test that can see it.
+     *   <li><b>There is at least one computed column.</b> A projection of nothing but pass-through
+     *       columns has no output buffer to gather, and its rows are read from staging on the host
+     *       whatever the device does.
+     *   <li><b>cuDF can run here.</b> The compaction is a library task, and a library task for a
+     *       backend that cannot serve it fails from {@code execute()} — after the batch has been
+     *       consumed, where nothing can recover it. See {@link DeviceCompaction#available()}.
+     * </ul>
+     *
+     * <p>Failing any of them is not a decline: the operator runs exactly as it did before, copying
+     * the batch back and skipping masked-out rows while it builds output rows.
+     */
+    private boolean compactsOnDevice() {
+        return mask != null
+                && aggregate == null
+                && !spec.kernel().carriesValidity()
+                && outputs.length > 0
+                && DeviceCompaction.available();
+    }
+
+    /** The consumer graph: widen the mask, compact with cuDF, gather, and return the survivors. */
+    private TaskGraph compactionGraph(int batchSize, GridScheduler scheduler) {
+        TaskGraph compact =
+                new TaskGraph("compact")
+                        .consumeFromDevice("calc", concat(outputs, mask, rows))
+                        // FIRST_EXECUTION, not EVERY: every one of these is written by this
+                        // graph before it is read, so copying the host's copy in on each batch
+                        // allocates the buffer and then moves bytes nobody will look at. Measured
+                        // on a 2M-row screening job, EVERY_EXECUTION cost 16 MiB of copy-in per
+                        // job for the packed column alone -- a transfer the compaction exists to
+                        // avoid, spent on the wrong side of the bus.
+                        .transferToDevice(
+                                DataTransferMode.FIRST_EXECUTION,
+                                maskBytes,
+                                selectedIndices,
+                                survivorCount)
+                        .transferToDevice(DataTransferMode.FIRST_EXECUTION, compacted)
+                        // rows is read here as well as in the kernel: cuDF captures its row count
+                        // when the graph is built, so a partition's short last batch would compact
+                        // whatever the previous batch left in the tail of the mask. Zeroing the
+                        // tail while widening is what makes the count safe to fix at batchSize.
+                        .task("widen", DeviceCompaction::widenMask, mask, maskBytes, rows)
+                        .libraryTask(
+                                "select",
+                                Cudf::selectedIndices,
+                                batchSize,
+                                batchSize,
+                                maskBytes,
+                                selectedIndices,
+                                survivorCount);
+        scheduler.addWorkerGrid("compact.widen", new WorkerGrid1D(batchSize));
+        for (int i = 0; i < outputs.length; i++) {
+            String task = "gather" + i;
+            compact = gatherTask(compact, task, outputs[i], compacted[i]);
+            scheduler.addWorkerGrid("compact." + task, new WorkerGrid1D(batchSize));
+        }
+        // Only the count comes back in the graph: four bytes, and it is what says how much of
+        // everything else is worth moving. The packed columns and the index array stay on the
+        // device and are fetched afterwards, as a prefix. See drainCompacted below.
+        return compact.transferToHost(DataTransferMode.EVERY_EXECUTION, survivorCount)
+                .persistOnDevice(concat(compacted, selectedIndices));
+    }
+
+    /**
+     * Fetches the survivors, and only the survivors.
+     *
+     * <p>This is the step that makes the compaction worth doing, and without it the whole design
+     * saves nothing. A {@code transferToHost} inside a task graph moves a <em>whole buffer</em>,
+     * and the packed columns are sized to the batch because nothing knows in advance how many rows
+     * will survive — so packing the survivors at the front and then copying the entire buffer moves
+     * exactly as many bytes as never packing them at all. Measured before this existed: 0.75 MiB
+     * out for 65,536 rows at 10% selectivity, with the compaction on and with it off, to three
+     * decimal places the same number.
+     *
+     * <p>{@code TornadoExecutionResult.transferToHost(DataRange)} is the way out. It is a transfer
+     * issued <em>after</em> execution, on demand, for a sub-range — so the count can be read first
+     * and the prefix sized from it. The count is the only thing the graph itself brings back.
+     */
+    private void fetchSurvivors(TornadoExecutionResult result) {
+        int n = survivorCount.get(0);
+        if (n <= 0) {
+            // Nothing survived, so nothing is worth a transfer -- and a DataRange of size 0 means
+            // "to the end of the array" rather than "nothing", which would copy the whole buffer.
+            return;
+        }
+        long bytes = 0;
+        for (Object column : compacted) {
+            TornadoNativeArray array = (TornadoNativeArray) column;
+            result.transferToHost(new DataRange(array).withSize(n));
+            bytes += (long) n * array.getElementSize();
+        }
+        result.transferToHost(new DataRange(selectedIndices).withSize(n));
+        bytes += (long) n * selectedIndices.getElementSize();
+
+        // Counted here rather than read back from the profiler, because the profiler does not see
+        // these at all: a partial transfer is issued after execution and clears the per-execution
+        // counters on its way through. The figure is exact -- it is the size this method asked for.
+        metrics.addOnDemandBytesOut(bytes);
+    }
+
+    /** One gather per column, bound to the pair of buffers whose width it knows how to move. */
+    private TaskGraph gatherTask(TaskGraph graph, String task, Object source, Object target) {
+        if (source instanceof IntArray) {
+            return graph.task(
+                    task,
+                    DeviceCompaction::gatherInts,
+                    selectedIndices,
+                    survivorCount,
+                    (IntArray) source,
+                    (IntArray) target);
+        }
+        if (source instanceof FloatArray) {
+            return graph.task(
+                    task,
+                    DeviceCompaction::gatherFloats,
+                    selectedIndices,
+                    survivorCount,
+                    (FloatArray) source,
+                    (FloatArray) target);
+        }
+        return graph.task(
+                task,
+                DeviceCompaction::gatherDoubles,
+                selectedIndices,
+                survivorCount,
+                (DoubleArray) source,
+                (DoubleArray) target);
+    }
+
+    private static Object[] concat(Object[] head, Object... tail) {
+        Object[] all = new Object[head.length + tail.length];
+        System.arraycopy(head, 0, all, 0, head.length);
+        System.arraycopy(tail, 0, all, head.length, tail.length);
+        return all;
     }
 
     private Method compile(GpuKernelSource kernel) throws Exception {
@@ -391,6 +592,45 @@ public final class GeneratedKernelEngine implements AutoCloseable {
     }
 
     /**
+     * Whether the filter compacted on the device, so the caller must drain survivors by index.
+     *
+     * <p>The two drains are not interchangeable and the difference is not cosmetic. Without
+     * compaction the mask is on the host and {@link #selected} answers for every staged position;
+     * with it, neither the mask nor the uncompacted outputs ever came back, so {@link #selected}
+     * would be reading whatever the host copy last held.
+     */
+    public boolean compactsOnDeviceNow() {
+        return compacting;
+    }
+
+    /** How many rows of the last batch survived the filter. Only meaningful while compacting. */
+    public int survivors() {
+        return survivorCount.get(0);
+    }
+
+    /**
+     * Where the <em>j</em>th survivor was staged.
+     *
+     * <p>Needed because a projection's pass-through fields are read from the staging buffers on the
+     * host, which the device never compacted and had no reason to: they are already there.
+     */
+    public int survivorPosition(int j) {
+        return selectedIndices.get(j);
+    }
+
+    /** One computed value of the <em>j</em>th survivor, boxed as the row type declares it. */
+    public Object compactedOutput(int column, int j) {
+        Object buffer = compacted[column];
+        if (buffer instanceof FloatArray floats) {
+            return floats.get(j);
+        }
+        if (buffer instanceof IntArray ints) {
+            return ints.get(j);
+        }
+        return ((DoubleArray) buffer).get(j);
+    }
+
+    /**
      * How many kernels this JVM has actually compiled.
      *
      * <p>Exposed for tests, and only meaningful as a difference across an operation: the cache is
@@ -407,11 +647,62 @@ public final class GeneratedKernelEngine implements AutoCloseable {
     /** One batch's device timings, pending the caller's gather and drain numbers. */
     public static final class Execution {
         private final long wallNanos;
-        private final TornadoProfilerResult profilerResult;
+        private final @Nullable DeviceProfile profile;
 
-        Execution(long wallNanos, TornadoProfilerResult profilerResult) {
+        Execution(long wallNanos, @Nullable DeviceProfile profile) {
             this.wallNanos = wallNanos;
-            this.profilerResult = profilerResult;
+            this.profile = profile;
+        }
+    }
+
+    /**
+     * The runtime's numbers for one batch, read eagerly.
+     *
+     * <p>A {@code TornadoProfilerResult} is a live view of the executor, not a snapshot: its
+     * getters answer with whatever the counters hold when they are called. The compaction's
+     * on-demand prefix transfer resets those counters, so holding the result and reading it later
+     * yields zeros for a batch that demonstrably moved data. Copying the six figures out at the
+     * moment they are true is the whole of the fix.
+     */
+    public static final class DeviceProfile {
+        private final long copyInNanos;
+        private final long kernelNanos;
+        private final long copyOutNanos;
+        private final long compileNanos;
+        private final long bytesIn;
+        private final long bytesOut;
+
+        public long copyInNanos() {
+            return copyInNanos;
+        }
+
+        public long kernelNanos() {
+            return kernelNanos;
+        }
+
+        public long copyOutNanos() {
+            return copyOutNanos;
+        }
+
+        public long compileNanos() {
+            return compileNanos;
+        }
+
+        public long bytesIn() {
+            return bytesIn;
+        }
+
+        public long bytesOut() {
+            return bytesOut;
+        }
+
+        DeviceProfile(TornadoProfilerResult result) {
+            this.copyInNanos = result.getDeviceWriteTime();
+            this.kernelNanos = result.getDeviceKernelTime();
+            this.copyOutNanos = result.getDeviceReadTime();
+            this.compileNanos = result.getCompileTime();
+            this.bytesIn = result.getTotalBytesCopyIn();
+            this.bytesOut = result.getTotalBytesCopyOut();
         }
     }
 
@@ -428,14 +719,33 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         live.setGlobalWork(stagedRows, 1, 1);
         TornadoExecutionPlan livePlan = tail ? tailPlan : plan;
         long t0 = System.nanoTime();
-        TornadoExecutionResult result = withKernelLoader(livePlan::execute);
+        TornadoExecutionResult result;
+        DeviceProfile profiled = null;
+        if (compacting) {
+            // Two graphs, one plan. The second reads what the first left on the device; running
+            // them as two plans would give the consumer its own, separate buffers.
+            TornadoExecutionResult staged = withKernelLoader(() -> livePlan.withGraph(0).execute());
+            // Snapshotted after the producer and before the consumer, which is where the staging
+            // figures are true. The runtime's counters are per execution: reading them after the
+            // second graph reports that graph's transfers and loses the batch's input staging
+            // entirely, which showed up as a copy-in of exactly one column's worth where five
+            // columns had demonstrably been staged.
+            profiled = profile ? new DeviceProfile(staged.getProfilerResult()) : null;
+            result = withKernelLoader(() -> livePlan.withGraph(1).execute());
+            fetchSurvivors(result);
+        } else {
+            result = withKernelLoader(livePlan::execute);
+        }
         if (tail) {
             groupOnHost(stagedRows);
         } else if (aggregate != null) {
             groups = groupCount.get(0);
         }
         long wall = System.nanoTime() - t0;
-        return new Execution(wall, profile ? result.getProfilerResult() : null);
+        if (!compacting) {
+            profiled = profile ? new DeviceProfile(result.getProfilerResult()) : null;
+        }
+        return new Execution(wall, profiled);
     }
 
     /**
@@ -545,12 +855,7 @@ public final class GeneratedKernelEngine implements AutoCloseable {
     public void recordBatch(
             int count, long gatherNanos, Execution execution, int emitted, long drainNanos) {
         metrics.recordBatch(
-                count,
-                emitted,
-                gatherNanos,
-                execution.wallNanos,
-                drainNanos,
-                execution.profilerResult);
+                count, emitted, gatherNanos, execution.wallNanos, drainNanos, execution.profile);
     }
 
     @Override

@@ -81,9 +81,16 @@ import java.util.Map;
  * <p>Exactly as the sort is, and for the same reason: the build side has to be resident to probe
  * against, and {@code HashJoinOperator} underneath already knows how to spill. A build side larger
  * than the staging is refused in {@link #open()}, which is the last moment {@link
- * FallbackToCpuTwoInputOperator} can hand the task back. If the estimate was wrong and the rows
- * arrive anyway, this finishes on the host with what it is holding — correct, much slower, and
- * reported.
+ * FallbackToCpuTwoInputOperator} can hand the task back.
+ *
+ * <p>If the estimate was wrong and the rows arrive anyway, this <b>fails the task</b> with {@link
+ * StagingCapacityExceededException} rather than moving the build side to a heap {@code HashMap}
+ * that grows with the input. Flink does not offer a retried attempt to an accelerator, so the
+ * re-run lands on {@code HashJoinOperator} and spills.
+ *
+ * <p>A <em>device</em> failure is survivable where a capacity miss is not, and the asymmetry is the
+ * point: when the device fails, the build side is already staged and bounded, so finishing on the
+ * host costs nothing that was not already reserved.
  */
 public class GpuJoinOperator extends AbstractStreamOperator<RowData>
         implements TwoInputStreamOperator<RowData, RowData, RowData>,
@@ -191,13 +198,12 @@ public class GpuJoinOperator extends AbstractStreamOperator<RowData>
             return;
         }
         if (buildRows == buildCapacity) {
-            degrade(
-                    "more build rows arrived than the planner estimated ("
-                            + spec.estimatedBuildRows()
-                            + "), and the staging holds "
-                            + buildCapacity);
-            addToHostTable(row);
-            return;
+            // As in the sort, and for the same reason: the host table that used to take the
+            // overflow grows with the input and nothing bounds it.
+            throw new StagingCapacityExceededException(
+                    "this join was given a larger build side than it undertook to hold",
+                    spec.estimatedBuildRows(),
+                    buildCapacity);
         }
         build.stage(row, buildRows++);
     }
