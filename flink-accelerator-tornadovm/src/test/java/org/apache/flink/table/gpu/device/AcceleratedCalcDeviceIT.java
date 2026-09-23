@@ -375,11 +375,20 @@ class AcceleratedCalcDeviceIT {
      * the threshold does not care much which card it runs on. It is a trap for a catastrophe, not a
      * performance benchmark; re-measure both numbers before moving it, and do not tighten it into a
      * benchmark.
+     *
+     * <p><b>Run without a filter, deliberately.</b> Every other case here carries a {@code WHERE},
+     * and on a host where cuDF is present that turns on the device compaction — whose widen, select
+     * and gather kernels land in the same {@code kernelNanos} this reads. Measured at 17.8 ms for
+     * these 500k rows, which is nowhere near sequential and is well over a threshold calibrated for
+     * one multiply-add. Keeping the filter would mean either loosening the trap until it catches
+     * nothing or asserting a number that means two different things depending on what is installed.
+     * What this test is about is the projection kernel, so it measures that.
      */
     @Test
     @DisplayName("the kernel runs in parallel, which nothing else here can tell")
     void kernelIsNotSilentlySequential() throws Exception {
-        Result result = runOnDevice(headline(), AcceleratedCalcDeviceIT::headlineOnHost, 500_000);
+        Result result =
+                runUnfilteredOnDevice(headline(), AcceleratedCalcDeviceIT::headlineOnHost, 500_000);
 
         assertThat(result.kernelNanos).isPositive();
         assertThat(result.kernelNanos / 1_000_000.0)
@@ -804,6 +813,54 @@ class AcceleratedCalcDeviceIT {
     private Result runOnDevice(AccelExpression projection, DoubleUnaryOperator onHost)
             throws Exception {
         return runOnDevice(projection, onHost, ROWS);
+    }
+
+    /**
+     * The same run with no {@code WHERE}, so nothing but the projection kernel is on the device.
+     *
+     * <p>Only the timing guard wants this. A filter is the more representative shape and is what
+     * every correctness case uses; it is also what pulls the compaction in, and a measurement of
+     * one kernel must not depend on whether a second and third ran beside it.
+     */
+    @SuppressWarnings("unchecked")
+    private Result runUnfilteredOnDevice(
+            AccelExpression projection, DoubleUnaryOperator onHost, int rows) throws Exception {
+        AccelNode subtree = plan(projection, null);
+
+        Optional<AcceleratorPlan> offered =
+                DeviceAssumptions.provider().accept(subtree, work(subtree));
+        assertThat(offered).isPresent();
+
+        StreamOperatorFactory<RowData> factory =
+                DeviceAssumptions.provider().createOperator(offered.get(), CONTEXT);
+
+        List<RowData> emitted = new ArrayList<>();
+        long batches;
+        long kernelNanos;
+        try (OneInputStreamOperatorTestHarness<RowData, RowData> harness =
+                new OneInputStreamOperatorTestHarness<>(factory, 1, 1, 0)) {
+            harness.setup();
+            harness.open();
+            GpuCalcOperator operator = (GpuCalcOperator) harness.getOneInputOperator();
+            assertThat(operator.compactedOnDevice())
+                    .as("no filter, so there is nothing to compact and no extra kernel to time")
+                    .isFalse();
+            for (int i = 0; i < rows; i++) {
+                harness.processElement(new StreamRecord<>(row(i, value(i))));
+            }
+            operator.endInput();
+            batches = operator.metrics().getBatches();
+            kernelNanos = operator.metrics().getKernelNanos();
+            harness.getOutput().stream()
+                    .map(o -> ((StreamRecord<RowData>) o).getValue())
+                    .forEach(emitted::add);
+        }
+
+        List<RowData> expected = new ArrayList<>();
+        for (int i = 0; i < rows; i++) {
+            expected.add(row(i, onHost.applyAsDouble(value(i))));
+        }
+        return new Result(emitted, expected, batches, kernelNanos);
     }
 
     @SuppressWarnings("unchecked")
