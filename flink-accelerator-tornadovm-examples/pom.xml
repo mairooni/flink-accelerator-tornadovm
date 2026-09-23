@@ -117,6 +117,60 @@ under the License.
 						</configuration>
 					</execution>
 					<execution>
+						<id>DeviceConformanceSuite</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>DeviceConformanceSuite</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.DeviceConformanceSuite</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/DeviceConformanceSuite*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
+						<id>VectorScreenBenchmark</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>VectorScreenBenchmark</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.VectorScreenBenchmark</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/VectorScreenBenchmark*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
+						<id>SensorAnomalyBenchmark</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>SensorAnomalyBenchmark</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.SensorAnomalyBenchmark</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/SensorAnomalyBenchmark*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
 						<id>HaversineBenchmark</id>
 						<phase>package</phase>
 						<goals>
@@ -331,6 +385,9 @@ under the License.
 							<target>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-GpuOffloadExample.jar" tofile="${project.build.directory}/GpuOffloadExample.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-HaversineBenchmark.jar" tofile="${project.build.directory}/HaversineBenchmark.jar"/>
+								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-SensorAnomalyBenchmark.jar" tofile="${project.build.directory}/SensorAnomalyBenchmark.jar"/>
+								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-VectorScreenBenchmark.jar" tofile="${project.build.directory}/VectorScreenBenchmark.jar"/>
+								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-DeviceConformanceSuite.jar" tofile="${project.build.directory}/DeviceConformanceSuite.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-GroupedAggregateBenchmark.jar" tofile="${project.build.directory}/GroupedAggregateBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-JoinBenchmark.jar" tofile="${project.build.directory}/JoinBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-OverAggregateBenchmark.jar" tofile="${project.build.directory}/OverAggregateBenchmark.jar"/>

@@ -77,19 +77,50 @@ import java.nio.file.Paths;
  */
 public final class BlackScholesBenchmark {
 
+    /**
+     * Constants as SQL, typed the way the expression means them.
+     *
+     * <p>A bare {@code 0.025} is a {@code DECIMAL(4,3)}, and the provider declines arithmetic with
+     * a {@code DECIMAL} operand because Flink does not evaluate it as double arithmetic. So the
+     * whole pricing expression is refused when written the ordinary way, and this benchmark cannot
+     * reach the device at all. {@code -Dblackscholes.doubleLiterals=true} writes the same values as
+     * SQL approximate-numeric literals ({@code 0.025E0}), which are {@code DOUBLE}.
+     *
+     * <p>Opt-in rather than the default, so the ordinary spelling stays measurable and the
+     * difference between them is itself a reportable number.
+     */
+    private static String lit(String value) {
+        return Boolean.getBoolean("blackscholes.doubleLiterals") ? value + "E0" : value;
+    }
+
+    /** Abramowitz &amp; Stegun 26.2.17. Published absolute error bound 7.5e-8 on N(x). */
+    private static final String AS_P = "0.2316419";
+
+    private static final String AS_B1 = "0.319381530";
+
+    private static final String AS_B2 = "-0.356563782";
+
+    private static final String AS_B3 = "1.781477937";
+
+    private static final String AS_B4 = "-1.821255978";
+
+    private static final String AS_B5 = "1.330274429";
+
+    /** 1/sqrt(2*pi), the standard normal density's scale. */
+    private static final String INV_SQRT_2PI = "0.3989422804014327";
+
     /** One point on the discount curve. A book is valued at one date against one curve. */
-    private static final String RATE = "0.025";
-
-    /** The tanh approximation's two constants, written once. */
-    private static final String CDF_A = "0.7988";
-
-    private static final String CDF_B = "0.04417";
+    private static final String RATE_VALUE = "0.025";
 
     public static void main(String[] args) throws Exception {
         final Args parsed = Args.parse(args);
 
         if (parsed.generate) {
             generate(parsed);
+            return;
+        }
+        if (parsed.validate > 0) {
+            validate(parsed);
             return;
         }
 
@@ -118,6 +149,9 @@ public final class BlackScholesBenchmark {
             Row seen = query(parsed);
             double millis = (System.nanoTime() - start) / 1e6;
             System.out.printf("run %2d  %10.0f ms  %s%n", run, millis, seen);
+            if (run == 1 && !parsed.baseline) {
+                printScenarios(seen, parsed.scenarios);
+            }
             if (result == null) {
                 result = seen;
             } else {
@@ -139,19 +173,56 @@ public final class BlackScholesBenchmark {
             throw new IllegalStateException(
                     "runs saw different row counts: " + first + " then " + second);
         }
-        double a = ((Number) first.getField(1)).doubleValue();
-        double b = ((Number) second.getField(1)).doubleValue();
-        double relative = a == 0.0 ? Math.abs(b) : Math.abs((a - b) / a);
-        if (relative > 1e-12) {
-            throw new IllegalStateException(
-                    "runs disagree by "
-                            + relative
-                            + " relative: "
-                            + first
-                            + " then "
-                            + second
-                            + "; that is far beyond floating-point reassociation");
+        // Every scenario, not just the first: two runs agreeing on one column and differing on
+        // another is exactly the failure a single-column check would report as success.
+        for (int i = 1; i < first.getArity(); i++) {
+            double a = ((Number) first.getField(i)).doubleValue();
+            double b = ((Number) second.getField(i)).doubleValue();
+            double relative = a == 0.0 ? Math.abs(b) : Math.abs((a - b) / a);
+            if (relative > 1e-12) {
+                throw new IllegalStateException(
+                        "runs disagree on scenario "
+                                + (i - 1)
+                                + " by "
+                                + relative
+                                + " relative: "
+                                + first
+                                + " then "
+                                + second
+                                + "; that is far beyond floating-point reassociation");
+            }
         }
+    }
+
+    /**
+     * The scenario table: what each scenario is, what the book is worth under it, and the change.
+     *
+     * <p>Reported per scenario rather than as one total. A single summed number cannot be checked
+     * against anything a risk report would contain, and summing scenarios together exists only to
+     * make the arithmetic happen — which is a benchmark shape, not an application.
+     *
+     * <p>The baseline is scenario 0 by construction (shock 1.0, the unshocked book), so "change
+     * from baseline" is defined rather than relative to whatever came first.
+     */
+    private static void printScenarios(Row row, int scenarios) {
+        final double baseline = ((Number) row.getField(1)).doubleValue();
+        System.out.printf(
+                "%n  %-8s %-12s %20s %20s %12s%n",
+                "scenario", "vol shock", "portfolio value", "change vs baseline", "change %");
+        for (int i = 0; i < scenarios; i++) {
+            final double value = ((Number) row.getField(i + 1)).doubleValue();
+            final double delta = value - baseline;
+            System.out.printf(
+                    "  %-8d %-12.4f %20.4f %20.4f %11.4f%%%n",
+                    i,
+                    shock(i, scenarios),
+                    value,
+                    delta,
+                    baseline == 0.0 ? 0.0 : 100.0 * delta / baseline);
+        }
+        System.out.printf(
+                "  baseline is scenario 0 (vol shock 1.0), %,d positions%n%n",
+                ((Number) row.getField(0)).longValue());
     }
 
     /** Writes the book once, so the benchmark itself never pays for generating rows. */
@@ -194,6 +265,44 @@ public final class BlackScholesBenchmark {
         System.out.printf("done in %.0f ms%n", (System.nanoTime() - start) / 1e6);
     }
 
+    /**
+     * Individual prices, for checking the formula rather than the total.
+     *
+     * <p>A scenario total is a sum of ten million prices: an error in one of them is invisible in
+     * it, and an error in all of them is indistinguishable from a different summation order. So the
+     * formula is validated per option, against an independent reference computed outside Flink from
+     * libm's {@code erfc} — not against the other arm, which would only show that two evaluations
+     * of the same approximation agree.
+     *
+     * <p>Prints the inputs beside the price so the reference can be recomputed from the same
+     * numbers, with no dependence on how the book was generated.
+     */
+    private static void validate(Args args) throws Exception {
+        final TableEnvironment env = batchEnvironment(args);
+        env.executeSql(book(args.data, args.format));
+        if (args.gpu) {
+            env.getConfig().getConfiguration().setString("table.exec.accelerator.enabled", "true");
+        }
+        final String sql =
+                "SELECT id, spot, strike, tau, vol, "
+                        + call("vol")
+                        + " AS price FROM Book WHERE id < "
+                        + args.validate;
+        try (CloseableIterator<Row> rows = env.sqlQuery(sql).execute().collect()) {
+            while (rows.hasNext()) {
+                final Row row = rows.next();
+                System.out.printf(
+                        "PRICE %s %s %s %s %s %s%n",
+                        row.getField(0),
+                        row.getField(1),
+                        row.getField(2),
+                        row.getField(3),
+                        row.getField(4),
+                        row.getField(5));
+            }
+        }
+    }
+
     private static Row query(Args args) throws Exception {
         final TableEnvironment env = batchEnvironment(args);
         env.executeSql(book(args.data, args.format));
@@ -214,13 +323,11 @@ public final class BlackScholesBenchmark {
                             + "FROM Book";
         } else {
             query =
-                    "SELECT COUNT(*) AS rows_seen, SUM(pv) AS total_pv\n"
-                            + "FROM (\n"
-                            + "  SELECT "
-                            + stressed(args.scenarios)
-                            + " AS pv\n"
-                            + "  FROM Book\n"
-                            + ")";
+                    "SELECT COUNT(*) AS rows_seen,\n       "
+                            + scenarioSums(args.scenarios)
+                            + "\nFROM (\n  SELECT "
+                            + scenarioColumns(args.scenarios)
+                            + "\n  FROM Book\n)";
         }
 
         if (args.explain) {
@@ -243,19 +350,50 @@ public final class BlackScholesBenchmark {
      * unshocked price, which is the Amdahl-capped case kept only so the knob starts where a reader
      * expects it to.
      */
-    private static String stressed(int n) {
-        if (n == 1) {
-            return call("vol");
+    /**
+     * The volatility shock applied in scenario {@code i}, with scenario 0 the baseline.
+     *
+     * <p>Scenario 0 is deliberately the unshocked book — shock 1.0 — so "change from baseline" is a
+     * defined quantity rather than a difference from whichever scenario happened to be first. The
+     * rest spread from a halving to a doubling of implied volatility, which is the range a stress
+     * run covers, and are a pure function of the scenario index so a rerun reproduces them.
+     */
+    private static double shock(int i, int n) {
+        if (i == 0 || n == 1) {
+            return 1.0;
         }
+        if (n == 2) {
+            return 0.5;
+        }
+        // The shocked scenarios span a halving to a doubling of implied volatility. Spread over
+        // n-2 intervals rather than n-1 so that none of them lands back on 1.0: a stress table
+        // listing the baseline twice, once as "scenario 0" and once as a shock, is not a stress
+        // table anyone would read.
+        return 0.5 + 1.5 * (i - 1) / (double) (n - 2);
+    }
+
+    /** One priced column per scenario, so each scenario's value survives to the output. */
+    private static String scenarioColumns(int n) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < n; i++) {
             if (i > 0) {
-                sb.append("\n       + ");
+                sb.append(",\n         ");
             }
-            // Spread over roughly a halving to a doubling of implied vol, which is the range a
-            // stress run covers.
-            double shock = 0.5 + i * (1.5 / (n - 1));
-            sb.append(call("(vol * " + shock + ")"));
+            sb.append(call("(vol * " + lit(Double.toString(shock(i, n))) + ")"))
+                    .append(" AS pv")
+                    .append(i);
+        }
+        return sb.toString();
+    }
+
+    /** {@code SUM(pv0) AS s0, SUM(pv1) AS s1, ...}: a portfolio value for each scenario. */
+    private static String scenarioSums(int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            if (i > 0) {
+                sb.append(",\n       ");
+            }
+            sb.append("SUM(pv").append(i).append(") AS s").append(i);
         }
         return sb.toString();
     }
@@ -265,8 +403,10 @@ public final class BlackScholesBenchmark {
         final String sqrtT = "SQRT(tau)";
         final String d1 =
                 "((LN(spot / strike) + ("
-                        + RATE
-                        + " + 0.5 * "
+                        + lit(RATE_VALUE)
+                        + " + "
+                        + lit("0.5")
+                        + " * "
                         + vol
                         + " * "
                         + vol
@@ -276,29 +416,108 @@ public final class BlackScholesBenchmark {
                         + sqrtT
                         + "))";
         final String d2 = "(" + d1 + " - " + vol + " * " + sqrtT + ")";
-        return "(spot * " + cdf(d1) + " - strike * EXP(-" + RATE + " * tau) * " + cdf(d2) + ")";
+        return "(spot * "
+                + cdf(d1)
+                + " - strike * EXP(-"
+                + lit(RATE_VALUE)
+                + " * tau) * "
+                + cdf(d2)
+                + ")";
     }
 
     /**
-     * The standard normal CDF, branchlessly.
+     * The standard normal CDF: Abramowitz &amp; Stegun 26.2.17, branch-free.
      *
-     * <p>{@code x} is substituted three times rather than bound to a name, because SQL has no
-     * let-binding inside an expression. Calcite's {@code RexProgram} eliminates the common
-     * subexpression, so the op count the provider sees counts it once -- which matters, since the
-     * ceiling is on operations per row and this expression is repeated per scenario.
+     * <h2>Why this replaced a tanh approximation</h2>
+     *
+     * <p>The previous formula, {@code 0.5*(1 + TANH(0.7988 x (1 + 0.04417 x^2)))}, was chosen
+     * because it fitted the accelerator's function vocabulary. Measured against {@code erfc} from
+     * libm over x in [-9, 9]:
+     *
+     * <pre>
+     *   max |N_approx - N| :  tanh 1.40e-04      A&amp;S 7.45e-08
+     *   relative error at x = -4 :  tanh 42%     A&amp;S 4.7e-04
+     *   relative error at x = -6 :  tanh 98%     A&amp;S 3.6e-03
+     * </pre>
+     *
+     * <p>A deep out-of-the-money option's price <em>is</em> that tail probability, so the tanh form
+     * priced them wrong by tens of percent. Surveyed over the supported domain, the worst call
+     * price error was <b>3.0e-04 of spot</b> with tanh and <b>1.4e-07 of spot</b> with this. The
+     * mathematics was not chosen to stay inside the whitelist; it happens to fit, needing only
+     * {@code ABS}, {@code SIGN}, {@code EXP} and arithmetic.
+     *
+     * <h2>How the branch is avoided</h2>
+     *
+     * <p>26.2.17 gives the upper tail for x &ge; 0 and relies on symmetry for x &lt; 0, which is
+     * ordinarily a conditional. Writing {@code t = N(-|x|)} and folding with {@code SIGN(x)}:
+     *
+     * <pre>
+     *   N(x) = 0.5 (1 + SIGN(x)) (1 - t) + 0.5 (1 - SIGN(x)) t
+     * </pre>
+     *
+     * <p>which is {@code 1 - t} for x &gt; 0, {@code t} for x &lt; 0, and — since {@code SIGN(0)}
+     * is 0 — exactly {@code 0.5} at zero. No conditional is needed, so no new IR feature is needed
+     * either, and the same expression is evaluated by both arms.
      */
     private static String cdf(String x) {
-        return "(0.5 * (1.0 + TANH("
-                + CDF_A
-                + " * "
-                + x
-                + " * (1.0 + "
-                + CDF_B
-                + " * "
-                + x
-                + " * "
-                + x
-                + "))))";
+        final String u = "ABS(" + x + ")";
+        final String t =
+                "(" + lit("1.0") + " / (" + lit("1.0") + " + " + lit(AS_P) + " * " + u + "))";
+        // Horner, so the polynomial costs five multiply-adds rather than five powers.
+        final String poly =
+                "("
+                        + t
+                        + " * ("
+                        + lit(AS_B1)
+                        + " + "
+                        + t
+                        + " * ("
+                        + lit(AS_B2)
+                        + " + "
+                        + t
+                        + " * ("
+                        + lit(AS_B3)
+                        + " + "
+                        + t
+                        + " * ("
+                        + lit(AS_B4)
+                        + " + "
+                        + t
+                        + " * "
+                        + lit(AS_B5)
+                        + ")))))";
+        final String tail =
+                "("
+                        + lit(INV_SQRT_2PI)
+                        + " * EXP("
+                        + lit("-0.5")
+                        + " * "
+                        + u
+                        + " * "
+                        + u
+                        + ") * "
+                        + poly
+                        + ")";
+        final String sign = "SIGN(" + x + ")";
+        return "("
+                + lit("0.5")
+                + " * ("
+                + lit("1.0")
+                + " + "
+                + sign
+                + ") * ("
+                + lit("1.0")
+                + " - "
+                + tail
+                + ") + "
+                + lit("0.5")
+                + " * ("
+                + lit("1.0")
+                + " - "
+                + sign
+                + ") * "
+                + tail
+                + ")";
     }
 
     private static String book(String path, String format) {
@@ -343,6 +562,10 @@ public final class BlackScholesBenchmark {
         private boolean gpu;
         private boolean generate;
         private boolean explain;
+
+        /** Print this many individual prices and exit, for external numerical validation. */
+        private int validate;
+
         private boolean baseline;
         private int scenarios = 20;
 
@@ -368,6 +591,8 @@ public final class BlackScholesBenchmark {
                     args.scenarios = Integer.parseInt(argv[++i]);
                 } else if ("--baseline".equals(flag)) {
                     args.baseline = true;
+                } else if ("--validate".equals(flag)) {
+                    args.validate = Integer.parseInt(argv[++i]);
                 } else if ("--explain".equals(flag)) {
                     args.explain = true;
                 } else {

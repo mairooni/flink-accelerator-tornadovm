@@ -21,6 +21,7 @@ package org.apache.flink.table.examples.java.gpu;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.gpu.metrics.BenchmarkRun;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 
@@ -64,6 +65,10 @@ import java.nio.file.Paths;
  *
  *   # then: measure
  *   flink run examples/table/HaversineBenchmark.jar --data /tmp/points --depots 20 --gpu true
+ *
+ *   # the filtered shape, which compacts on the device: ordinary SQL, one more flag
+ *   flink run examples/table/HaversineBenchmark.jar --data /tmp/points --depots 20 --gpu true \
+ *       --near 500
  * </pre>
  *
  * <p>Or let {@code scripts/run-haversine.sh} in {@code flink-table-gpu-runtime} do all of it, which
@@ -71,6 +76,14 @@ import java.nio.file.Paths;
  * sides.
  */
 public final class HaversineBenchmark {
+
+    /**
+     * What {@code table.exec.accelerator.batch-size} defaults to, for the run record.
+     *
+     * <p>Stated here rather than read from the configuration because the benchmark never sets it,
+     * and a record that omitted it would leave a reader unable to tell whether it had been changed.
+     */
+    private static final int BATCH_SIZE_DEFAULT = 262_144;
 
     /** Degrees to radians; {@code RADIANS} is not in the generator's function set. */
     private static final String TO_RAD = "0.017453292519943295";
@@ -100,21 +113,45 @@ public final class HaversineBenchmark {
         }
 
         System.out.printf(
-                "data=%s  parallelism=%s  gpu=%s  runs=%d  depots=%d%n",
+                "data=%s  parallelism=%s  gpu=%s  runs=%d  depots=%d  near=%s%n",
                 parsed.data,
                 parsed.parallelism > 0 ? Integer.toString(parsed.parallelism) : "(default)",
                 parsed.gpu,
                 parsed.runs,
-                parsed.depots);
+                parsed.depots,
+                parsed.near > 0.0 ? parsed.near + " km" : "(no filter)");
         if (parsed.baseline) {
             System.out.println("baseline: reading and counting only, no haversine");
         }
+
+        // Printed before the first run, not after the last, so a run that dies half way still
+        // leaves behind the record of what it was. A time with no environment beside it cannot be
+        // compared with a time taken a month later and cannot be reproduced by anyone else.
+        System.out.print(BenchmarkRun.environment());
+        System.out.print(BenchmarkRun.dataset(parsed.data));
+        System.out.print(
+                BenchmarkRun.job(
+                        parsed.parallelism,
+                        BATCH_SIZE_DEFAULT,
+                        parsed.rows,
+                        "depots="
+                                + parsed.depots
+                                + "  gpu="
+                                + parsed.gpu
+                                + (parsed.near > 0.0 ? "  near=" + parsed.near : "")
+                                + (parsed.groups > 0 ? "  groups=" + parsed.groups : "")));
+
+        // The first run pays JIT compilation, kernel compilation and page faults. Folding it into
+        // a mean describes neither a cold start nor a warm one, so it is reported apart.
+        BenchmarkRun timings = new BenchmarkRun("wall time", parsed.runs > 1 ? 1 : 0);
 
         Row result = null;
         for (int run = 1; run <= parsed.runs; run++) {
             long start = System.nanoTime();
             Row seen = query(parsed);
-            double millis = (System.nanoTime() - start) / 1e6;
+            long elapsed = System.nanoTime() - start;
+            timings.record(elapsed);
+            double millis = elapsed / 1e6;
             System.out.printf("run %2d  %10.0f ms  %s%n", run, millis, seen);
             if (result == null) {
                 result = seen;
@@ -122,6 +159,7 @@ public final class HaversineBenchmark {
                 agree(result, seen);
             }
         }
+        System.out.print(timings.summary());
     }
 
     /**
@@ -247,14 +285,22 @@ public final class HaversineBenchmark {
                             + "  GROUP BY k\n"
                             + ")";
         } else {
+            // The WHERE is plain SQL and the query author writes nothing else for it. Calcite
+            // folds it into the same Calc as the projection, so the offloaded subtree is a
+            // projection over a filter -- the shape the device compaction serves.
             query =
-                    "SELECT COUNT(*) AS rows_seen, SUM(km) AS total_km\n"
+                    "SELECT COUNT(*) AS rows_seen, SUM(km) AS total_km"
+                            + (args.checksum
+                                    ? ", SUM(id) AS id_sum, MIN(km) AS min_km, MAX(km) AS max_km"
+                                    : "")
+                            + "\n"
                             + "FROM (\n"
-                            + "  SELECT "
+                            + "  SELECT id, "
                             + nearest(args.depots)
                             + " AS km\n"
                             + "  FROM Points\n"
-                            + ")";
+                            + ")\n"
+                            + (args.near > 0.0 ? "WHERE km < " + args.near : "");
         }
 
         if (args.explain) {
@@ -379,6 +425,33 @@ public final class HaversineBenchmark {
         /** Distinct groups for the GROUP BY arm; 0 means the ungrouped query. */
         private int groups = 0;
 
+        /**
+         * Kilometres for the {@code WHERE} arm; 0 means no filter.
+         *
+         * <p>Ordinary SQL, and that is the whole point of it: a {@code WHERE} on a computed column
+         * is what turns on the device compaction, and the query author writes nothing else. Calcite
+         * folds the predicate into the same {@code Calc} as the projection, the provider compiles
+         * both into one kernel, and the survivors are selected by cuDF where they lie instead of
+         * every projected row being copied back for the host to sift.
+         *
+         * <p>Selective values are the interesting ones. The compaction costs three extra device
+         * kernels a batch and saves copying the rows that did not survive, so a predicate that
+         * keeps almost everything pays for a saving it does not make.
+         */
+        private double near = 0.0;
+
+        /**
+         * Adds order-independent, exact columns beside the floating-point sum.
+         *
+         * <p>{@code SUM(km)} over doubles is the one column whose value depends on the order the
+         * rows were added, so two arms disagreeing on it says nothing about whether they selected
+         * the same rows. {@code SUM(id)} is an exact integer over the survivors and {@code MIN} and
+         * {@code MAX} are order-independent, so together they separate "these arms chose different
+         * rows" from "these arms added the same rows in a different order". Off by default because
+         * it changes what the job computes and so what it costs.
+         */
+        private boolean checksum;
+
         static Args parse(String[] argv) {
             Args args = new Args();
             for (int i = 0; i < argv.length; i++) {
@@ -409,6 +482,10 @@ public final class HaversineBenchmark {
                     args.depots = Integer.parseInt(argv[++i]);
                 } else if ("--groups".equals(flag)) {
                     args.groups = Integer.parseInt(argv[++i]);
+                } else if ("--near".equals(flag)) {
+                    args.near = Double.parseDouble(argv[++i]);
+                } else if ("--checksum".equals(flag)) {
+                    args.checksum = true;
                 } else if ("--baseline".equals(flag)) {
                     args.baseline = true;
                 } else if ("--explain".equals(flag)) {
