@@ -26,11 +26,15 @@ import org.apache.flink.table.accelerator.AccelInputRef;
 import org.apache.flink.table.accelerator.AccelLiteral;
 import org.apache.flink.table.accelerator.AccelNode;
 import org.apache.flink.table.accelerator.AccelProject;
+import org.apache.flink.table.data.DecimalData;
+import org.apache.flink.table.data.DecimalDataUtils;
+import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 
 import javax.annotation.Nullable;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -775,7 +779,7 @@ public final class AccelKernelGenerator {
             if (!(value instanceof Number)) {
                 return null;
             }
-            double d = ((Number) value).doubleValue();
+            double d = asFlinkDouble(value, node.outputType());
             if (!Double.isFinite(d)) {
                 return null;
             }
@@ -852,6 +856,48 @@ public final class AccelKernelGenerator {
         return new Rendered(value, valid);
     }
 
+    /**
+     * A literal as the double <em>Flink</em> would use, which is not always the nearest one.
+     *
+     * <h2>Why this is not {@code Number.doubleValue()}</h2>
+     *
+     * <p>A bare decimal in SQL is a {@code DECIMAL}, and Flink converts one to a double in {@code
+     * DecimalDataUtils.doubleValue}. For a compact decimal — precision 18 or less, held as a {@code
+     * long} — that is {@code ((double) unscaledLong) / POW10[scale]}: a double division, which
+     * rounds, and which is therefore <b>not the correctly rounded value of the decimal</b>. {@code
+     * BigDecimal.doubleValue()} is correctly rounded. The two differ for some literals and not
+     * others.
+     *
+     * <p>Traced from a whole-population disagreement, 2026-09-23. In a screen over 10M rows, one
+     * probe constant disagreed on <em>every</em> row while seven others agreed exactly:
+     *
+     * <pre>
+     *   0.9909456437464825   correctly rounded -> 0.9909456437464825
+     *                        Flink's division  -> 0.9909456437464824   (1 ulp lower)
+     *   0.3729116549965876   both              -> 0.3729116549965876   (agree, by luck of the digits)
+     * </pre>
+     *
+     * <p>That is the whole of the "DECIMAL" discrepancy chased through this document. It was never
+     * about {@code LEAST}, about expression size, or about decimal arithmetic composing: those were
+     * artefacts of which constants happened to be in which query. It is one conversion, in one
+     * place, and the kernel was using the mathematically better one.
+     *
+     * <p>Flink's CPU is the reference, so the kernel matches it — by calling Flink's own conversion
+     * rather than reimplementing the rounding, which would be a second place to get it wrong.
+     */
+    private static double asFlinkDouble(Object value, LogicalType declared) {
+        if (declared instanceof DecimalType && value instanceof BigDecimal) {
+            final DecimalType type = (DecimalType) declared;
+            final DecimalData asFlink =
+                    DecimalData.fromBigDecimal(
+                            (BigDecimal) value, type.getPrecision(), type.getScale());
+            if (asFlink != null) {
+                return DecimalDataUtils.doubleValue(asFlink);
+            }
+        }
+        return ((Number) value).doubleValue();
+    }
+
     /** Whether this rendering is already a single identifier or literal. */
     private static boolean isName(String rendered) {
         if (rendered.isEmpty()) {
@@ -887,17 +933,17 @@ public final class AccelKernelGenerator {
             case NEGATE:
                 return operands.size() == 1 ? "(-" + operands.get(0) + ")" : null;
             case GREATER_THAN:
-                return infix(operands, ">");
+                return comparison(call, operands, ">");
             case GREATER_OR_EQUAL:
-                return infix(operands, ">=");
+                return comparison(call, operands, ">=");
             case LESS_THAN:
-                return infix(operands, "<");
+                return comparison(call, operands, "<");
             case LESS_OR_EQUAL:
-                return infix(operands, "<=");
+                return comparison(call, operands, "<=");
             case EQUALS:
-                return infix(operands, "==");
+                return comparison(call, operands, "==");
             case NOT_EQUALS:
-                return infix(operands, "!=");
+                return comparison(call, operands, "!=");
             case AND:
                 return infix(operands, "&&");
             case OR:
@@ -1053,6 +1099,164 @@ public final class AccelKernelGenerator {
             return null;
         }
         return "TornadoMath." + fn + "(" + String.join(", ", operands) + ")";
+    }
+
+    /**
+     * A comparison, in whichever of SQL's two orderings Flink would have used for these operands.
+     *
+     * <h2>There are two, and the SQL does not show which</h2>
+     *
+     * <p>{@code WHERE val > 0.5} and {@code WHERE val > CAST(0.5 AS DOUBLE)} are not the same
+     * predicate. A bare literal is {@code DECIMAL}, and {@code
+     * ScalarOperatorGens.generateComparisonSameType} takes its decimal branch whenever either
+     * operand is one, emitting {@code DecimalDataUtils.compare(l, r) op 0} — which for an
+     * approximate numeric against a decimal is {@code Double.compare}, a <b>total order</b> in
+     * which NaN is greater than everything and equal to itself, and {@code -0.0} is strictly less
+     * than {@code 0.0}. Written as a {@code DOUBLE}, the same predicate is ordinary IEEE, where
+     * every comparison involving NaN is false and the two zeros are equal.
+     *
+     * <p>Generating IEEE for both is a changed query result, not a rounding difference: a row whose
+     * value is NaN is kept by Flink and dropped by the kernel. {@code AcceleratorConformanceIT}
+     * found it, and the IR needed nothing new to fix it — the literal already carries its declared
+     * type.
+     *
+     * <h2>Why this is a handful of extra terms and not a compare function</h2>
+     *
+     * <p>{@code Double.compare} is not available in a kernel, and a general total-order comparison
+     * of two arbitrary doubles needs NaN tests and signed-zero tests on <em>both</em> sides. It is
+     * not needed: a {@code DECIMAL} operand here is always a literal, because a decimal column
+     * cannot be staged at all. A literal is a compile-time constant, is never NaN, and is never
+     * {@code -0.0} — {@code BigDecimal} has no negative zero. So only the other side can carry
+     * either, and each operator needs at most two extra terms, both of which fold away when the
+     * literal is not zero.
+     */
+    private static @Nullable String comparison(AccelCall call, List<String> operands, String op) {
+        if (operands.size() != 2 || call.operands().size() != 2) {
+            return null;
+        }
+        int literalSide = decimalLiteralSide(call);
+        if (literalSide < 0) {
+            // No decimal operand, so Flink compares the two numerics with IEEE rules -- but the
+            // rendering still has to be the NaN-safe one. See ordered().
+            return ordered(operands.get(0), operands.get(1), op);
+        }
+        String value = operands.get(1 - literalSide);
+        String literal = operands.get(literalSide);
+        String effective = literalSide == 0 ? reversed(op) : op;
+        if (effective == null) {
+            return null;
+        }
+        boolean zero = isZeroLiteral(call.operands().get(literalSide));
+        boolean nanPossible = isApproximate(call.operands().get(1 - literalSide).outputType());
+
+        // Written as (value effective literal), so the literal is always on the right below.
+        String ieee = ordered(value, literal, effective);
+        String equal = "(" + value + " == " + literal + ")";
+        String isNan = "(" + value + " != " + value + ")";
+        String isNegativeZero = "(" + value + " == 0.0 && (1.0 / " + value + ") < 0.0)";
+        String equalTotal = zero ? "(" + equal + " && !" + isNegativeZero + ")" : equal;
+
+        switch (effective) {
+            case ">":
+                // -0.0 is not greater than +0.0 under either ordering, so only NaN moves.
+                return nanPossible ? "(" + ieee + " || " + isNan + ")" : ieee;
+            case ">=":
+                String ge = zero ? "(" + ieee + " && !" + isNegativeZero + ")" : ieee;
+                return nanPossible ? "(" + ge + " || " + isNan + ")" : ge;
+            case "<":
+                // NaN is greatest, so it is below nothing; only the signed zero moves.
+                return zero ? "(" + ieee + " || " + isNegativeZero + ")" : ieee;
+            case "<=":
+                // Unchanged: NaN is already false under IEEE, and -0.0 <= 0.0 holds in both.
+                return ieee;
+            case "==":
+                return equalTotal;
+            case "!=":
+                return "(!" + equalTotal + ")";
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * A comparison written so that NaN answers false, whatever the device compiler lowers it to.
+     *
+     * <h2>{@code >=} and {@code <=} cannot be emitted as themselves</h2>
+     *
+     * <p>Measured on an RTX 4070 through TornadoVM's CUDA backend: a kernel containing {@code a >=
+     * b} <b>keeps</b> the rows where {@code a} is NaN, and so does {@code a <= b}. Both are false
+     * in Java and in IEEE 754. The lowering is the ordinary one — {@code a >= b} becomes {@code !(a
+     * < b)}, which is {@code !false} and therefore true when either operand is unordered — and it
+     * is the reason a device comparison cannot simply be the Java operator spelled out.
+     *
+     * <p>{@code >} and {@code <} do not have the problem, because the unordered case is already
+     * their false answer. So the fix is to say {@code >=} as "greater or equal" rather than "not
+     * less": {@code (a > b || a == b)} is unordered-false under any lowering of its three parts.
+     *
+     * <p>The cost is one extra comparison on two of the six operators, in a kernel that is bound by
+     * reading its input. The alternative was a filter that silently kept every NaN row, which is a
+     * wrong answer of exactly the kind no row count catches.
+     */
+    private static String ordered(String left, String right, String op) {
+        switch (op) {
+            case ">=":
+                return "((" + left + " > " + right + ") || (" + left + " == " + right + "))";
+            case "<=":
+                return "((" + left + " < " + right + ") || (" + left + " == " + right + "))";
+            case "!=":
+                // Also stated through equality, so it cannot be lowered to an ordered test either.
+                return "(!(" + left + " == " + right + "))";
+            default:
+                return "(" + left + " " + op + " " + right + ")";
+        }
+    }
+
+    /** Which operand is a {@code DECIMAL} literal, or -1 when neither is. */
+    private static int decimalLiteralSide(AccelCall call) {
+        for (int i = 0; i < call.operands().size(); i++) {
+            AccelExpression operand = call.operands().get(i);
+            if (operand instanceof AccelLiteral
+                    && operand.outputType().getTypeRoot() == LogicalTypeRoot.DECIMAL) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean isZeroLiteral(AccelExpression literal) {
+        Object value = ((AccelLiteral) literal).value();
+        return value instanceof Number && ((Number) value).doubleValue() == 0.0;
+    }
+
+    /** Whether a NaN can reach this side at all. An integral column cannot carry one. */
+    private static boolean isApproximate(LogicalType type) {
+        switch (type.getTypeRoot()) {
+            case FLOAT:
+            case DOUBLE:
+            case DECIMAL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** The same comparison written with its operands the other way round. */
+    private static @Nullable String reversed(String op) {
+        switch (op) {
+            case ">":
+                return "<";
+            case ">=":
+                return "<=";
+            case "<":
+                return ">";
+            case "<=":
+                return ">=";
+            case "==":
+            case "!=":
+                return op;
+            default:
+                return null;
+        }
     }
 
     private static @Nullable String infix(List<String> operands, String op) {

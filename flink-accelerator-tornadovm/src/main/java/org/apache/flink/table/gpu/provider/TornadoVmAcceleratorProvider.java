@@ -34,6 +34,8 @@ import org.apache.flink.table.accelerator.AccelSort;
 import org.apache.flink.table.accelerator.AccelWorkProfile;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gpu.codegen.AccelKernelGenerator;
+import org.apache.flink.table.gpu.codegen.DecimalCoercion;
+import org.apache.flink.table.gpu.codegen.DriftSensitivePredicate;
 import org.apache.flink.table.gpu.codegen.GpuAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
 import org.apache.flink.table.gpu.codegen.GpuGramSpec;
@@ -42,6 +44,7 @@ import org.apache.flink.table.gpu.codegen.GpuKernelSource;
 import org.apache.flink.table.gpu.codegen.GpuOverAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuSortSpec;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
+import org.apache.flink.table.gpu.codegen.StrictArithmetic;
 import org.apache.flink.table.gpu.operator.GpuCalcOperator;
 import org.apache.flink.table.gpu.operator.GpuGramOperator;
 import org.apache.flink.table.gpu.operator.GpuGroupedAggregateOperator;
@@ -199,6 +202,31 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             // because the next card will sustain something else.
             return Optional.empty();
         }
+        // A filter whose outcome depends on a device transcendental can select a different set
+        // of rows than the same SQL on the CPU -- demonstrated, not hypothetical. Refusing is the
+        // conservative answer and it is the default; see DriftSensitivePredicate.
+        String unsafePredicate = DriftSensitivePredicate.refuse(subtree);
+        if (unsafePredicate != null) {
+            LOG.debug("declining: {}", unsafePredicate);
+            return Optional.empty();
+        }
+        // The same hazard, reached through arithmetic rather than through a library function: a
+        // device that fuses multiply-add computes a different value from the CPU, which moves a
+        // projected column and can move the row past a filter. Asked of the device rather than
+        // inferred from a flag, once per JVM. Applies to projections too, not only predicates.
+        String fused = StrictArithmetic.refuse();
+        if (fused != null) {
+            LOG.debug("declining: {}", fused);
+            return Optional.empty();
+        }
+        // A third way to the same failure, and the one the device is not at fault for: Flink does
+        // not evaluate arithmetic with a DECIMAL operand as double arithmetic, and the kernel
+        // does. Same 24-versus-23 row disagreement, same query, no transcendental involved.
+        String decimal = DecimalCoercion.refuse(subtree);
+        if (decimal != null) {
+            LOG.debug("declining: {}", decimal);
+            return Optional.empty();
+        }
         Optional<GpuKernelSource> kernel =
                 AccelKernelGenerator.generate(subtree, Integer.toHexString(subtree.hashCode()));
         if (!kernel.isPresent()) {
@@ -263,6 +291,14 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         if (call.function() != AccelAggFunction.SUM
                 || call.inputField() == AccelAggCall.NO_INPUT_FIELD) {
             LOG.info("declining the aggregate: {} is not a SUM over a column", call);
+            return Optional.empty();
+        }
+        // A grouped aggregate offloads a projection too, and its computed column is subject to
+        // the same multiply-add fusion; the SUM over it carries the difference straight into the
+        // answer.
+        String fusedAgg = StrictArithmetic.refuse();
+        if (fusedAgg != null) {
+            LOG.info("declining the aggregate: {}", fusedAgg);
             return Optional.empty();
         }
         AccelNode projection = agg.inputs().get(0);
@@ -529,6 +565,13 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         GpuGramSpec.Recognition recognised = GpuGramSpec.recognise(agg);
         if (!recognised.recognised()) {
             LOG.info("declining the ungrouped aggregate: {}", recognised.reason());
+            return Optional.empty();
+        }
+        // The Gram matrix is a sum of products of a computed feature map: fusion moves every
+        // entry of it.
+        String fusedGram = StrictArithmetic.refuse();
+        if (fusedGram != null) {
+            LOG.info("declining the Gram matrix: {}", fusedGram);
             return Optional.empty();
         }
         GpuGramSpec spec = recognised.spec();
