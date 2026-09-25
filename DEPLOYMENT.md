@@ -172,12 +172,32 @@ grep -E "Accelerated on this TaskManager|Accelerator declined" \
   $FLINK_HOME/log/flink-*-taskexecutor-*.log
 ```
 
-## The two flags that nothing checks for you
+## Strict arithmetic is now requested per query, not configured
+
+**Since 2026-09-25 the provider asks for it.** The planner decides whether a value
+a kernel computes can reach anything that decides which rows come back — a
+filter, a join condition, a grouping key, a sort key, a limit — or whether the
+deployment has asked for values matching Flink's at all
+(`table.exec.accelerator.approximate-projections`, off by default). Where either
+holds, the work description carries a strictness requirement, and the provider
+turns it into `TornadoExecutionPlan.withStrictFloatingPoint()`, which suppresses
+both halves of multiply-add fusion for that plan.
+
+That needs TornadoVM **7.0.1-jdk21-dev or newer**, where the switch exists. The
+flags below are no longer the thing standing between a cluster and a correct
+answer, and `gpu-cluster-setup.sh` deliberately still does not set them: setting
+them globally would turn off fusion for every query including the ones that do
+not need it, which is a performance cost paid for nothing.
+
+They remain useful for one thing — running the whole cluster in a reproducible
+arithmetic mode regardless of what any query asked for — and the table below is
+why both are needed if you do.
+
+## The two flags, and why one is never enough
 
 **`-Dtornado.enable.fma=false -Dtornado.cuda.compile.profile=repro`, on every JVM
-that runs a task.** Not a tuning knob, not optional, and **not verified** — since
-2026-09-25 the provider trusts them rather than probing for them, so getting them
-wrong is silent.
+that runs a task**, if you want the whole cluster strict rather than the queries
+that need it.
 
 A GPU computes `a * b + c` as one fused operation with a single rounding. That is a
 *more* accurate answer than SQL's and a **different** one, and a filter over a
@@ -212,14 +232,13 @@ TornadoVM's own argfile into `env.java.opts.all`, and the argfile does not carry
 them. Append them by hand, or use `scripts/run-sql-demos.sh`, which passes them on
 the command line.
 
-**What removing the probe gave up.** Until 2026-09-25 a `StrictArithmetic`
-cancellation kernel ran once per JVM and declined every projection if the device
-disagreed with the CPU, so a cluster missing these flags was slow rather than
-wrong. It no longer exists. A cluster missing these flags now offloads and may
-return a different set of rows, with nothing in any log to say so. The intended
-replacement is a plan-scoped strictness switch in TornadoVM — see the note at the
-end of this section in the project's TASKS/README discussion — after which the
-flags stop being a deployment obligation at all.
+**What replaced the probe.** Until 2026-09-25 a `StrictArithmetic` cancellation
+kernel ran once per JVM and declined every projection if the device disagreed
+with the CPU. It was removed, which left a window in which a cluster missing
+these flags could return a different set of rows with nothing in any log to say
+so. That window is closed: the planner now decides per query and the provider
+asks per plan, so the guarantee no longer depends on a deployment remembering
+two JVM options.
 
 ## The cuDF operators need RAPIDS libcudf
 

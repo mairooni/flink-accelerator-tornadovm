@@ -51,12 +51,36 @@ public final class GpuCalcSpec implements Serializable {
     private final RowType outputType;
     private final int batchSize;
 
+    /** See {@link #requiresStrictArithmetic()}. */
+    private final boolean strictArithmetic;
+
     public GpuCalcSpec(
             GpuKernelSource kernel, int[] outputLayout, RowType outputType, int batchSize) {
+        this(kernel, outputLayout, outputType, batchSize, false);
+    }
+
+    public GpuCalcSpec(
+            GpuKernelSource kernel,
+            int[] outputLayout,
+            RowType outputType,
+            int batchSize,
+            boolean strictArithmetic) {
         this.kernel = kernel;
         this.outputLayout = outputLayout;
         this.outputType = outputType;
         this.batchSize = batchSize;
+        this.strictArithmetic = strictArithmetic;
+    }
+
+    /**
+     * Whether this kernel must round floating-point arithmetic the way Flink's CPU operator does.
+     *
+     * <p>Decided by the planner, which can see whether a value this kernel computes reaches
+     * anything that decides which rows a query returns. The engine turns it into {@code
+     * TornadoExecutionPlan.withStrictFloatingPoint()}.
+     */
+    public boolean requiresStrictArithmetic() {
+        return strictArithmetic;
     }
 
     /**

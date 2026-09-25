@@ -228,6 +228,15 @@ public final class HaversineBenchmark {
 
         if (args.gpu) {
             env.getConfig().getConfiguration().setString("table.exec.accelerator.enabled", "true");
+            // Haversine is SIN, COS and ASIN, which a device's math library computes to its own
+            // accuracy specification rather than java.lang.Math's. Since the drift work that is
+            // refused by default, and without this the accelerated arm is silently a second CPU
+            // arm -- which is exactly what it measured as before this line existed. The membership
+            // guarantee is unaffected: a drifting value that could reach a filter, join, grouping
+            // or sort is refused whatever this says.
+            env.getConfig()
+                    .getConfiguration()
+                    .setString("table.exec.accelerator.approximate-projections", "true");
             if (!args.fuseAggregate) {
                 // The unfused arm: the Calc still runs on the device, the SUM above it still runs
                 // on the CPU, and the projected rows travel between them. That is what fusing is

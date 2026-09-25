@@ -347,6 +347,13 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         } else {
             plan = new TornadoExecutionPlan(graph.snapshot()).withGridScheduler(scheduler);
         }
+        if (spec.requiresStrictArithmetic()) {
+            // The planner found this kernel's value can reach something that decides which rows
+            // come back, so the device must round a multiply and an add separately, as Flink's
+            // own operator does. Scoped to this plan rather than the JVM, and it can only make
+            // the arithmetic stricter than the deployment already asked for.
+            plan = plan.withStrictFloatingPoint();
+        }
         if (profile) {
             plan = plan.withProfiler(ProfilerMode.SILENT);
         }

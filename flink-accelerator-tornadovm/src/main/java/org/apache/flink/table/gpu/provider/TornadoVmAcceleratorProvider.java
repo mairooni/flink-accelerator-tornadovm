@@ -164,6 +164,20 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
 
     @Override
     public Optional<AcceleratorPlan> accept(AccelNode originalSubtree, AccelWorkProfile work) {
+        Optional<AcceleratorPlan> plan = acceptSubtree(originalSubtree, work);
+        if (plan.isPresent() && work.requiresStrictArithmetic()) {
+            // The planner found that a value this subtree computes can reach something that
+            // decides which rows come back. A device is free to fuse a multiply and an add into
+            // one rounding, which is a different number from the CPU's two roundings, so the
+            // kernel has to be compiled without that freedom or the same SQL answers differently
+            // depending on where it ran.
+            ((TornadoPlan) plan.get()).strictArithmetic = true;
+        }
+        return plan;
+    }
+
+    private Optional<AcceleratorPlan> acceptSubtree(
+            AccelNode originalSubtree, AccelWorkProfile work) {
         if (UNAVAILABLE != null) {
             return Optional.empty();
         }
@@ -686,7 +700,8 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                             kernel,
                             kernel.outputLayout(),
                             aggregate.projectionType(),
-                            context.maxBatchSize());
+                            context.maxBatchSize(),
+                            ((TornadoPlan) plan).strictArithmetic);
             return SimpleOperatorFactory.of(
                     new GpuGroupedAggregateOperator(
                             spec, aggregate, context.maxBatchSize(), PROFILE, null));
@@ -696,7 +711,8 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                         kernel,
                         kernel.outputLayout(),
                         context.outputType(),
-                        context.maxBatchSize());
+                        context.maxBatchSize(),
+                        ((TornadoPlan) plan).strictArithmetic);
         return SimpleOperatorFactory.of(new GpuCalcOperator(spec, context.maxBatchSize(), PROFILE));
     }
 
@@ -996,6 +1012,15 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         private final @Nullable GpuOverAggregateSpec over;
         private final @Nullable GpuGramSpec gram;
         private final AcceleratorCost cost;
+
+        /**
+         * Whether the planner requires this subtree to round the way Flink's CPU operator does.
+         *
+         * <p>Set after construction because every {@code accept} path builds a plan and only one of
+         * them has the work profile in hand; making it a constructor parameter would mean threading
+         * it through six signatures to reach one assignment.
+         */
+        private boolean strictArithmetic;
 
         private TornadoPlan(
                 @Nullable GpuKernelSource kernel,
