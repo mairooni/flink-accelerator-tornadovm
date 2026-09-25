@@ -59,12 +59,19 @@ import java.util.Set;
  * multiplication, division and comparison are exact under IEEE 754 and agree bit for bit on both
  * sides; so do {@code ABS}, {@code FLOOR}, {@code CEIL} and {@code SIGN}, which only inspect or
  * clear bits. What differs is the functions CUDA implements in its own math library to its own
- * accuracy specification — and {@code SQRT} sits with them deliberately even though IEEE 754
- * requires it to be correctly rounded, because whether a given device build honours that is a
- * property of the toolchain rather than of this code, and the conservative reading is the one that
- * cannot silently change a result. {@link #DRIFT_SENSITIVE} is the list, and {@code
+ * accuracy specification. {@link #DRIFT_SENSITIVE} is the list, and {@code
  * TranscendentalDriftDeviceIT} measures each of them so the list is evidence-led rather than
  * guessed.
+ *
+ * <p><b>{@code SQRT} was on the list and came off it on 2026-09-25</b>, on a measurement rather
+ * than a re-reading. It was there because IEEE 754 requires {@code sqrt} to be correctly rounded
+ * but whether a device build honours that was treated as unknowable from here. It is not: on {@code
+ * f64} the CUDA toolchain emits {@code sqrt.rn.f64} whatever it is asked for — {@code --prec-sqrt}
+ * governs single precision only, verified by compiling both ways — and this generator evaluates
+ * every expression in {@code double}. So the device's square root is the correctly rounded one,
+ * which is exactly what {@code java.lang.Math.sqrt} promises, and the two agree bit for bit. {@code
+ * POWER} stays, because a general exponent has no such guarantee; {@link ExactPowers} rewrites the
+ * two exponents that do.
  *
  * <h2>The escape hatch, which is not the default</h2>
  *
@@ -84,7 +91,6 @@ public final class DriftSensitivePredicate {
      */
     public static final Set<AccelFunction> DRIFT_SENSITIVE =
             EnumSet.of(
-                    AccelFunction.SQRT,
                     AccelFunction.EXP,
                     AccelFunction.LN,
                     AccelFunction.LOG2,

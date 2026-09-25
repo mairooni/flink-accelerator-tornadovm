@@ -100,8 +100,8 @@ class DriftSensitivePredicateTest {
                 call(
                         AccelFunction.PLUS,
                         call(AccelFunction.TIMES, col(1), lit(2.0)),
-                        call(AccelFunction.SQRT, col(1)));
-        assertThat(DriftSensitivePredicate.refuse(filtered(deep))).isNotNull().contains("SQRT");
+                        call(AccelFunction.EXP, col(1)));
+        assertThat(DriftSensitivePredicate.refuse(filtered(deep))).isNotNull().contains("EXP");
     }
 
     @Test
@@ -135,7 +135,7 @@ class DriftSensitivePredicateTest {
     @Test
     @DisplayName("the research mode allows it, and is off unless explicitly set")
     void researchModeIsOptIn() {
-        AccelNode plan = filtered(call(AccelFunction.SQRT, col(1)));
+        AccelNode plan = filtered(call(AccelFunction.EXP, col(1)));
         assertThat(DriftSensitivePredicate.approximateAllowed()).isFalse();
         assertThat(DriftSensitivePredicate.refuse(plan)).isNotNull();
 
@@ -159,12 +159,12 @@ class DriftSensitivePredicateTest {
                         new AccelFilter(
                                 predicate(
                                         AccelFunction.GREATER_THAN,
-                                        call(AccelFunction.SQRT, col(1)),
+                                        call(AccelFunction.EXP, col(1)),
                                         decimalLit),
                                 new AccelInput(ROW),
                                 ROW),
                         ROW);
-        assertThat(DriftSensitivePredicate.refuse(plan)).isNotNull().contains("SQRT");
+        assertThat(DriftSensitivePredicate.refuse(plan)).isNotNull().contains("EXP");
     }
 
     @Test
@@ -248,5 +248,17 @@ class DriftSensitivePredicateTest {
 
     private static AccelExpression predicate(AccelFunction fn, AccelExpression... ops) {
         return new AccelCall(fn, Arrays.asList(ops), new BooleanType(false));
+    }
+
+    @Test
+    @DisplayName("SQRT in a filter is allowed: f64 square root is correctly rounded on both sides")
+    void squareRootIsNoLongerDriftSensitive() {
+        // SQRT was on the drift-sensitive list on the reasoning that whether a device honours
+        // IEEE 754's correctly-rounded square root is a property of the toolchain. It is not
+        // unknowable: on f64 the CUDA toolchain emits sqrt.rn.f64 whatever it is asked for
+        // (--prec-sqrt governs single precision only), and the generator evaluates in double. So
+        // the device's result is the correctly rounded one, which is what Math.sqrt promises.
+        assertThat(DriftSensitivePredicate.refuse(filtered(call(AccelFunction.SQRT, col(1)))))
+                .isNull();
     }
 }

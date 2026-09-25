@@ -36,6 +36,7 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gpu.codegen.AccelKernelGenerator;
 import org.apache.flink.table.gpu.codegen.DecimalCoercion;
 import org.apache.flink.table.gpu.codegen.DriftSensitivePredicate;
+import org.apache.flink.table.gpu.codegen.ExactPowers;
 import org.apache.flink.table.gpu.codegen.GpuAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
 import org.apache.flink.table.gpu.codegen.GpuGramSpec;
@@ -44,7 +45,6 @@ import org.apache.flink.table.gpu.codegen.GpuKernelSource;
 import org.apache.flink.table.gpu.codegen.GpuOverAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuSortSpec;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
-import org.apache.flink.table.gpu.codegen.StrictArithmetic;
 import org.apache.flink.table.gpu.operator.GpuCalcOperator;
 import org.apache.flink.table.gpu.operator.GpuGramOperator;
 import org.apache.flink.table.gpu.operator.GpuGroupedAggregateOperator;
@@ -163,10 +163,16 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
     }
 
     @Override
-    public Optional<AcceleratorPlan> accept(AccelNode subtree, AccelWorkProfile work) {
+    public Optional<AcceleratorPlan> accept(AccelNode originalSubtree, AccelWorkProfile work) {
         if (UNAVAILABLE != null) {
             return Optional.empty();
         }
+        // Before anything looks at the expressions, replace the two exponents a device can compute
+        // exactly: POWER(x, 2) becomes a multiply and POWER(x, 0.5) a square root. Both are faster
+        // and both agree with java.lang.Math bit for bit where a device pow does not, so this runs
+        // ahead of the drift analysis rather than after it -- the point is that the rewritten form
+        // is no longer drift-prone. See ExactPowers.
+        AccelNode subtree = ExactPowers.rewrite(originalSubtree);
         if (subtree instanceof AccelAggregate) {
             return acceptAggregate((AccelAggregate) subtree, work);
         }
@@ -210,15 +216,11 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             LOG.debug("declining: {}", unsafePredicate);
             return Optional.empty();
         }
-        // The same hazard, reached through arithmetic rather than through a library function: a
-        // device that fuses multiply-add computes a different value from the CPU, which moves a
-        // projected column and can move the row past a filter. Asked of the device rather than
-        // inferred from a flag, once per JVM. Applies to projections too, not only predicates.
-        String fused = StrictArithmetic.refuse();
-        if (fused != null) {
-            LOG.debug("declining: {}", fused);
-            return Optional.empty();
-        }
+        // No multiply-add conformance probe here. A device that fuses multiply-add computes a
+        // different value from the CPU, which can move a projected column and move a row past a
+        // filter -- so the TaskManager must be started with
+        // -Dtornado.enable.fma=false -Dtornado.cuda.compile.profile=repro, and that is now a
+        // deployment obligation rather than something this provider verifies. See DEPLOYMENT.md.
         // A third way to the same failure, and the one the device is not at fault for: Flink does
         // not evaluate arithmetic with a DECIMAL operand as double arithmetic, and the kernel
         // does. Same 24-versus-23 row disagreement, same query, no transcendental involved.
@@ -291,14 +293,6 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         if (call.function() != AccelAggFunction.SUM
                 || call.inputField() == AccelAggCall.NO_INPUT_FIELD) {
             LOG.info("declining the aggregate: {} is not a SUM over a column", call);
-            return Optional.empty();
-        }
-        // A grouped aggregate offloads a projection too, and its computed column is subject to
-        // the same multiply-add fusion; the SUM over it carries the difference straight into the
-        // answer.
-        String fusedAgg = StrictArithmetic.refuse();
-        if (fusedAgg != null) {
-            LOG.info("declining the aggregate: {}", fusedAgg);
             return Optional.empty();
         }
         AccelNode projection = agg.inputs().get(0);
@@ -565,13 +559,6 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         GpuGramSpec.Recognition recognised = GpuGramSpec.recognise(agg);
         if (!recognised.recognised()) {
             LOG.info("declining the ungrouped aggregate: {}", recognised.reason());
-            return Optional.empty();
-        }
-        // The Gram matrix is a sum of products of a computed feature map: fusion moves every
-        // entry of it.
-        String fusedGram = StrictArithmetic.refuse();
-        if (fusedGram != null) {
-            LOG.info("declining the Gram matrix: {}", fusedGram);
             return Optional.empty();
         }
         GpuGramSpec spec = recognised.spec();

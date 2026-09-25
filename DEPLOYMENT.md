@@ -172,6 +172,55 @@ grep -E "Accelerated on this TaskManager|Accelerator declined" \
   $FLINK_HOME/log/flink-*-taskexecutor-*.log
 ```
 
+## The two flags that nothing checks for you
+
+**`-Dtornado.enable.fma=false -Dtornado.cuda.compile.profile=repro`, on every JVM
+that runs a task.** Not a tuning knob, not optional, and **not verified** — since
+2026-09-25 the provider trusts them rather than probing for them, so getting them
+wrong is silent.
+
+A GPU computes `a * b + c` as one fused operation with a single rounding. That is a
+*more* accurate answer than SQL's and a **different** one, and a filter over a
+computed value then selects a different set of rows depending on where the query
+ran. Measured here on a query with no transcendental in it at all — only `-`, `*`,
+`+` and `LEAST` — the CPU returned 24 rows and the device 23.
+
+**Both flags are needed**, because the CUDA backend fuses at two independent stages
+and disabling either alone leaves the other:
+
+| `tornado.enable.fma` | `cuda.compile.profile` | result |
+|---|---|---|
+| true (default) | default | fused |
+| true | repro | fused |
+| false | default | **fused** |
+| false | repro | separate — matches the CPU |
+
+`enable.fma=false` stops Graal's `CUDAFMAPhase` emitting a literal `fma(...)` call
+into the generated CUDA C — which `--fmad` cannot undo, since you cannot decontract
+a function call. `--fmad=false` (what the `repro` profile sets) stops NVRTC
+contracting the separated pair back together on the way to PTX. Verified with
+`nvcc -ptx` on exactly the source TornadoVM emits:
+
+```
+--fmad=true  (default)   fma.rn.f64  %fd4, %fd1, %fd2, %fd3;
+--fmad=false             mul.rn.f64  %fd3, %fd1, %fd2;
+                         add.rn.f64  %fd5, %fd3, %fd4;
+```
+
+**`gpu-cluster-setup.sh` does not add them** (checked 2026-09-25): it writes
+TornadoVM's own argfile into `env.java.opts.all`, and the argfile does not carry
+them. Append them by hand, or use `scripts/run-sql-demos.sh`, which passes them on
+the command line.
+
+**What removing the probe gave up.** Until 2026-09-25 a `StrictArithmetic`
+cancellation kernel ran once per JVM and declined every projection if the device
+disagreed with the CPU, so a cluster missing these flags was slow rather than
+wrong. It no longer exists. A cluster missing these flags now offloads and may
+return a different set of rows, with nothing in any log to say so. The intended
+replacement is a plan-scoped strictness switch in TornadoVM — see the note at the
+end of this section in the project's TASKS/README discussion — after which the
+flags stop being a deployment obligation at all.
+
 ## The cuDF operators need RAPIDS libcudf
 
 `GROUP BY`, `ORDER BY`, the join and the filter go through `tornado-cudf`, which
@@ -191,11 +240,25 @@ still fails without `rapids_logger` and `libnvcomp`:
 ```bash
 SP=$(echo /tmp/cudfenv/lib/python3.*/site-packages)
 export LD_LIBRARY_PATH=$SP/libcudf/lib64:$SP/librmm/lib64:$SP/libkvikio/lib64\
-:$SP/rapids_logger/lib64:$SP/nvidia/libnvcomp/lib64:$SP/nvidia/cufile/lib:$LD_LIBRARY_PATH
+:$SP/rapids_logger/lib64:$SP/nvidia/libnvcomp/lib64:$SP/nvidia/cufile/lib\
+:$SP/libkvikio_cu12.libs:$LD_LIBRARY_PATH
+```
+
+`libkvikio_cu12.libs` was added 2026-09-25 and is easy to miss: it is not a
+RAPIDS package but auditwheel's side-car directory, holding a `libzstd` renamed
+to `libzstd-0d65387f.so.1.5.7`. Nothing but that directory provides that exact
+soname, so leaving it out fails the same way a missing shim does.
+
+The check that names the missing one, rather than leaving you with a boolean:
+
+```bash
+ldd $TORNADOVM_HOME/lib/libtornado-cudf.so | grep 'not found'
 ```
 
 Without it the binding reports itself unavailable and the cuDF-backed operators
 decline cleanly — the same thing cuSPARSE does on a host with no CUDA toolkit.
+The line to look for is `declining the sort: the cuDF binding is not usable in
+this JVM`, and the query still returns the right answer on the CPU.
 
 ## Couplings that fail at runtime, not at build time
 
