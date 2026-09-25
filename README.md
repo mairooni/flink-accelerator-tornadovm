@@ -59,6 +59,46 @@ runs the code-generated operator instead and logs why. Nothing fails.
 `flink-accelerator-tornadovm/FINDINGS.md` is the measurement record: where the
 time actually goes, and which of the original predictions it contradicted.
 
+## Two examples to read first
+
+Everything else in `flink-accelerator-tornadovm-examples` is a benchmark: a
+command line, several arms, and an environment record, built to answer a question
+rather than to be read. These two are not. They are written the way
+`WordCountSQLExample` is — one class, one `main`, the SQL in the middle of it —
+they run the query once, and they report no timings at all. Between them they show
+the two halves of the integration.
+
+| example | what runs on the device | how you see that it did |
+|---|---|---|
+| `HaversineSQLExample` | a **CUDA kernel generated from the query**. Flink lowers the projection to the accelerator IR, the provider compiles that IR at job start, and the kernel exists only for this query. | `--printKernel` prints the generated `evaluate`, with `sin`, `pow` and `asin` in it |
+| `CudfSortSQLExample` | an **`ORDER BY` served by a library**. No generated kernel at all: the provider recognises the operator and hands it to `cudf::stable_sorted_order` through TornadoVM's `tornado-cudf` binding. | `--printBytecodes` prints `LAUNCH task - sort.order[sortedOrder]` on the CUDA device |
+
+```bash
+flink-accelerator-tornadovm/scripts/run-sql-demos.sh haversine --printKernel
+flink-accelerator-tornadovm/scripts/run-sql-demos.sh cudf-sort --printBytecodes
+```
+
+Both run in one JVM against an in-process MiniCluster, so there is no cluster to
+start. Neither says anywhere in its output where the query ran, and that is the
+claim: the answer does not depend on it. The evidence is asked of TornadoVM
+instead, which is why `--printKernel` prints something no file in this repository
+contains.
+
+`--printKernel` prints **nothing** for the cuDF example, and that absence is the
+point rather than a gap: there is no generated kernel, because the operator was
+served by a library.
+
+The script assembles the four things that are properties of the deployment rather
+than of the query — TornadoVM's JVM arguments, the two flags that make device
+arithmetic agree with the CPU's, RAPIDS on `LD_LIBRARY_PATH`, and the provider jar
+— and validates them before starting a JVM. `VERBOSE=1` turns on the accelerator's
+own logging, which is what to do if no kernel and no `LAUNCH` appear. See
+`DEPLOYMENT.md`.
+
+**Neither example measures anything.** They demonstrate that the mechanism works
+and let you see it working. For a number, with an environment record, repetitions
+and a CPU arm behind it, use `HaversineBenchmark` and `SortBenchmark`.
+
 ## What each benchmark is evidence of
 
 The examples do not all claim the same thing, and the difference is the difference
@@ -78,6 +118,7 @@ for itself. This is the claim the integration exists to support.
 | `BlackScholesBenchmark` | a second arithmetic stress case. **Its normal CDF is a `tanh` approximation**, chosen because it is branchless and therefore expressible as one projection. It is not a financially authoritative pricing implementation and must not be quoted as one; what it measures is arithmetic throughput. Both paths use the same approximation, so the CPU/GPU comparison is exact even where the approximation is not. |
 | `GroupedAggregateBenchmark`, `JoinBenchmark`, `SortBenchmark`, `OverAggregateBenchmark` | operator-seam tests. They show that the seam works and what it costs. They are **not** headline performance claims: row marshalling and whole-partition buffering dominate them. |
 | `MixedTypeVerification` | correctness across column types, not speed. |
+| **`HaversineSQLExample`**, **`CudfSortSQLExample`** | the two above. They are demonstrations, not measurements: one run, one arm, no timings. They are evidence that a query reached a device, and of nothing else. |
 
 ### Accelerator-native resident experiments
 

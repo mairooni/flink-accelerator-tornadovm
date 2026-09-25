@@ -351,6 +351,42 @@ under the License.
 						</configuration>
 					</execution>
 					<execution>
+						<id>HaversineSQLExample</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>HaversineSQLExample</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.HaversineSQLExample</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/HaversineSQLExample*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
+						<id>CudfSortSQLExample</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>CudfSortSQLExample</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.CudfSortSQLExample</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/CudfSortSQLExample*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
 						<id>KMeansBenchmark</id>
 						<phase>package</phase>
 						<goals>
@@ -398,6 +434,8 @@ under the License.
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-FeatureGramBenchmark.jar" tofile="${project.build.directory}/FeatureGramBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-KMeansBenchmark.jar" tofile="${project.build.directory}/KMeansBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-BlackScholesBenchmark.jar" tofile="${project.build.directory}/BlackScholesBenchmark.jar"/>
+								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-HaversineSQLExample.jar" tofile="${project.build.directory}/HaversineSQLExample.jar"/>
+								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-CudfSortSQLExample.jar" tofile="${project.build.directory}/CudfSortSQLExample.jar"/>
 							</target>
 						</configuration>
 					</execution>
