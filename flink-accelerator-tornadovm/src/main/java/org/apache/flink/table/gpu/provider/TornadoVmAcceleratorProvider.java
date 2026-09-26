@@ -50,6 +50,7 @@ import org.apache.flink.table.gpu.operator.GpuGramOperator;
 import org.apache.flink.table.gpu.operator.GpuGroupedAggregateOperator;
 import org.apache.flink.table.gpu.operator.GpuJoinOperator;
 import org.apache.flink.table.gpu.operator.GpuOverAggregateOperator;
+import org.apache.flink.table.gpu.operator.GpuProjectedSortOperator;
 import org.apache.flink.table.gpu.operator.GpuSortOperator;
 import org.apache.flink.table.runtime.accelerator.AcceleratorContext;
 import org.apache.flink.table.runtime.accelerator.AcceleratorCost;
@@ -386,9 +387,51 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         }
         GpuSortSpec spec =
                 new GpuSortSpec(sort.sortField(), sort.outputType(), work.estimatedRows());
+
+        // A sort whose input is a projection rather than a leaf is a fused pair, and the whole
+        // point of fusing is that the projection's output never leaves the device: the kernel
+        // writes the columns, cuDF orders the key column where it lies, and one drain takes the
+        // ordered rows back. Unfused, the same two nodes are two operators, two task graphs and
+        // two round trips -- and the drain is 95% of what an offloaded sort costs (VERIFY T12),
+        // so paying it twice is most of what there is to save.
+        AccelNode input = sort.inputs().get(0);
+        if (input instanceof AccelInput) {
+            return Optional.of(
+                    new TornadoPlan(
+                            null, null, spec, sortCost(work, sort.outputType().getFieldCount())));
+        }
+        Optional<GpuKernelSource> kernel =
+                AccelKernelGenerator.generate(input, Integer.toHexString(input.hashCode()));
+        if (!kernel.isPresent()) {
+            LOG.info("declining the sort: no kernel for the fused projection {}", input);
+            return Optional.empty();
+        }
+        if (kernel.get().hasFilter() || kernel.get().carriesValidity()) {
+            // The same refusal the fused aggregate makes, for the same reason: the kernel writes a
+            // selection mask rather than compacting, so the rows a filter excluded are still in
+            // the buffers the sort would order.
+            LOG.info("declining the sort: the fused projection filters or carries nulls");
+            return Optional.empty();
+        }
+        GpuCalcSpec probe =
+                new GpuCalcSpec(kernel.get(), kernel.get().outputLayout(), input.outputType(), 1);
+        if (!probe.canStage()) {
+            LOG.info(
+                    "declining the sort: cannot stage the fused projection {}", input.outputType());
+            return Optional.empty();
+        }
+        if (probe.fieldType(sort.sortField()) != GpuValueType.INT) {
+            LOG.info(
+                    "declining the sort: cuDF sortedOrder takes an INT key, not {}",
+                    probe.fieldType(sort.sortField()));
+            return Optional.empty();
+        }
         return Optional.of(
                 new TornadoPlan(
-                        null, null, spec, sortCost(work, sort.outputType().getFieldCount())));
+                        kernel.get(),
+                        null,
+                        spec,
+                        sortCost(work, sort.outputType().getFieldCount())));
     }
 
     /**
@@ -686,6 +729,25 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         }
         GpuSortSpec sort = ((TornadoPlan) plan).sort;
         if (sort != null) {
+            if (kernel != null) {
+                // A fused pair: the kernel writes its columns and cuDF orders them where they lie,
+                // in one graph, so the projection's output never crosses the bus. See
+                // GpuProjectedSortOperator for what that is worth.
+                GpuCalcSpec projection =
+                        new GpuCalcSpec(
+                                kernel,
+                                kernel.outputLayout(),
+                                sort.rowType(),
+                                sortCapacity(sort, context),
+                                ((TornadoPlan) plan).strictArithmetic);
+                return SimpleOperatorFactory.of(
+                        new GpuProjectedSortOperator(
+                                projection,
+                                sort,
+                                sortCapacity(sort, context),
+                                PROFILE,
+                                context.providesOffHeap() ? context::allocateOffHeap : null));
+            }
             return SimpleOperatorFactory.of(
                     new GpuSortOperator(
                             sort,
