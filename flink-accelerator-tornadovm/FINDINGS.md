@@ -701,6 +701,14 @@ can offload.
 **The accelerated arm wins while losing on inference.** jitllm spends 1.19 s more writing the same
 note; the preprocessing it replaces is 7.6 s cheaper.
 
+**The two engines write the same note.** Captured from a run of each arm and compared character by
+character, the generated text is identical for all 255 tokens and diverges only where jitllm hits
+its cap one token earlier: `...these machines have the highest` against `...these machines have the
+highest number`. Same weights, greedy sampling, the same prompt, two independently written engines
+on two different runtimes. That they agree token for token says the TornadoVM implementation is
+numerically faithful to the model and not merely fast, and it is a third check -- unplanned -- that
+the prompt really is identical between the arms.
+
 ## The arithmetic decides it, and the ceiling decides how much is allowed
 
 Job execution at the application's own threshold:
@@ -757,6 +765,15 @@ shows the same shape more mildly — 123.3 tok/s at a context depth near 1900 ag
 where llama.cpp gives up 148.2 against 177.7. Both are inside the engine and neither is reachable
 from the deployment. It costs this application 1.19 s against a 7.6 s preprocessing saving, so it
 does not change the verdict, but it is what would have to move next.
+
+## Running it again
+
+`scripts/llm-bench-setup.sh` prepares everything once, in the one order that works, and
+`scripts/llm-bench-run.sh --gpu|--cpu` starts a cluster, runs one arm and stops it again. Add
+`--warm` to reproduce the headline: without it the run is cold, and cold the two arms are level.
+`EXPERIMENTS.md` at the repository root is the long form -- prerequisites, the TornadoVM patch
+that is not upstream, how to reproduce each number above on its own, and what each failure mode
+actually means.
 
 ## A measurement bug worth not repeating
 
