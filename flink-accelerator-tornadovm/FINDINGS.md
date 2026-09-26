@@ -607,3 +607,158 @@ the submitting thread's.
 `max_rel_err=5.26e-15` and "ran on the device", which was true — but it was running sequentially,
 and nothing in the output would have revealed it. Correctness was never in question; the speed
 implied by "ran on the device" was.
+
+---
+
+# A Flink query and a language model on one GPU
+
+Measured 2026-09-27. Two applications over one SQL text, differing in where the telemetry is
+scored and which engine writes the note. `GpuTriagePipeline` scores on the device through the
+accelerator and generates from jitllm loaded into the TaskManager's own JVM; `CpuTriagePipeline`
+runs the identical SQL with the accelerator off and reaches llama.cpp over HTTP. Sources under
+`flink-accelerator-tornadovm-examples/.../java/gpu/llm/`.
+
+**Machine.** RTX 4070 Laptop (8 GiB, driver 595.71.05), i9-13900H, 30 GiB RAM, JDK 21.0.3,
+TornadoVM 7.0.1-jdk21-dev (CUDA, built through the cuda-wrapper), Flink 2.3.0, parallelism 1,
+one TaskManager, shipped `maxOpsPerRow` unless a row says otherwise.
+**Model.** `Qwen3-0.6B-f16.gguf`, 1.4 GiB, the same file for both engines.
+**Data.** 8,000,000 rows of machine telemetry as Parquet; 310 MiB read per query.
+**Query.** Score every reading against 8 operating baselines — 946 arithmetic operations a row —
+keep what exceeds the threshold, roll up per machine. 2,908 anomalies over 48 machines become a
+1,657-token prompt; 256 tokens are generated.
+
+## The engines are close before Flink is involved
+
+`jitllm --bench` against `llama-bench`, same model, same card, standalone:
+
+| | jitllm (TornadoVM CUDA) | llama.cpp (CUDA) | ratio |
+|---|---:|---:|---:|
+| pp256 | 5562 ± 76 tok/s | 18752 ± 4899 tok/s | 0.30x |
+| tg64 | 145.2 ± 1.0 tok/s | 177.7 ± 0.6 tok/s | 0.82x |
+
+Decode is near parity. Prefill is not, and that gap is what the accelerated arm has to cover.
+
+## End to end
+
+`./bin/flink run` wall time, five repetitions, arms interleaved, medians:
+
+| arm | warm | cold |
+|---|---:|---:|
+| GPU preprocess + jitllm | **7.68 s** | 14.90 s |
+| CPU preprocess + llama.cpp | **14.13 s** | 17.88 s |
+
+**1.84x warm, 1.20x cold.** Warm means the engine is already resident in the TaskManager, which is
+what a cluster that has answered one query looks like; cold is the first query after a restart, and
+the difference between the columns is the model load the warm case does not repeat.
+
+## Where the time goes
+
+Both halves were measured in separate runs, so none of this instrumentation is inside the number
+above.
+
+**Preprocessing, with no model in the job** — the JobManager's own job duration, three
+interleaved repetitions:
+
+| | GPU | CPU | speedup |
+|---|---:|---:|---:|
+| job execution | 878 / 850 / 860 ms | 8450 / 8283 / 8561 ms | 9.62x – 9.95x |
+
+Both arms return `+I[48, 2908, 1128, 192.59903094408028]`, identical to the last bit. That is what
+the exactly-rounded score buys: the arms can be compared on time because they cannot differ on
+value.
+
+The offloaded `Calc`, from the operator's own metrics — and this is also the evidence that the
+offload happened at all, since the TaskManager decides:
+
+| segment | ms | share |
+|---|---:|---:|
+| gather | 0.000 | 0.0% — tier1 columnar bulk |
+| copy-in | 26.7 | 40.3% |
+| kernel | 27.1 | 40.9% |
+| drain | 12.5 | 18.8% |
+| attributed | 66.2 | |
+| execute wall | 94.8 | incl. dispatch |
+| compile | 4.5 | once per task |
+
+310 MiB in, 93 MiB out, 31 batches, 8,000,000 rows in and 2,908 out. The log line beside it reads
+`Accelerated on this TaskManager: provider tornadovm claims 15.15x over CPU`; the measured
+end-to-end preprocessing speedup is 10x, the difference being the Parquet scan, which neither arm
+can offload.
+
+**Inference, from each engine's own counters**, warm, medians of five:
+
+| | jitllm | llama.cpp |
+|---|---:|---:|
+| prompt tokens | 1657 | 1657 |
+| generated | 255 | 256 |
+| prefill | 942.9 ms (1758 tok/s) | 97.9 ms (16 925 tok/s) |
+| decode | 2068.1 ms (123.3 tok/s) | 1727.2 ms (148.2 tok/s) |
+| inference total | 3011 ms | 1825 ms |
+
+**The accelerated arm wins while losing on inference.** jitllm spends 1.19 s more writing the same
+note; the preprocessing it replaces is 7.6 s cheaper.
+
+## The arithmetic decides it, and the ceiling decides how much is allowed
+
+Job execution at the application's own threshold:
+
+| modes | ops/row | GPU | CPU | speedup | kernel | digests |
+|---:|---:|---:|---:|---:|---:|---|
+| 8 | 946 | 849 ms | 8467 ms | 9.97x | 28.0 ms | identical |
+| 16 | 1890 | 935 ms | 15 351 ms | 16.42x | 53.8 ms | identical |
+| 32 | 3778 | 1019 ms | 31 613 ms | 31.02x | 105.8 ms | identical |
+
+The kernel barely notices while the CPU pays linearly. 16 and 32 modes need
+`-Dflink.accelerator.tornadovm.maxOpsPerRow` raised above the shipped 1024, and the digests stayed
+bit-identical at every size, so on this card and driver that ceiling is conservative — which is
+what its own comment predicts, since it was set from an OpenCL measurement.
+
+## Five things had to be fixed to get here
+
+1. **TornadoVM's device-reset flag was per device, not per execution plan.** Freeing the offloaded
+   operator's plan at the end of a job marked the *device* as reset, and the resident model's
+   warmed-up plan then died with `reset() was called after warmup()`. Fixed in TornadoVM on
+   `fix/device-reset-scoped-to-execution-plan`. Without it there is no resident model, and without
+   a resident model there is no warm number.
+2. **The session has to be reset per query.** A `GenerationSession` continues its own sequence and
+   this one outlives the job, so the second query arrived with the first query's conversation still
+   in context — longer prompt, three times the prefill — and the third generated nothing at all,
+   having exhausted the context.
+3. **`session.prepare()` belongs in load, not in the first `generate()`.** The transformer's
+   kernels are JIT-compiled on first use: 10.6 s of the first measurement's 13.8 s inference wall
+   was compilation that no phase counter accounted for.
+4. **`SQRT` cannot appear in the score.** Calcite rewrites it to `POWER`, which the planner refuses
+   to let a device evaluate when the value reaches a filter — and here it reaches a filter, a
+   grouping and a sort. Squaring the threshold keeps the ordering, the exactness and the
+   eligibility together. `EXPLAIN`'s `GPU Offload` section names the refusal precisely enough to
+   act on; without it this would have read as the accelerator simply not working.
+5. **The TaskManager needs task off-heap memory for the engine.** jitllm's workspaces are direct
+   buffers and are charged against Flink's direct-memory budget, which is sized from Flink's own
+   memory model and knows nothing about a model sharing the JVM. At a prefill width of 1024 the
+   default 512 MiB gives `OutOfMemoryError: Direct buffer memory` inside `TornadoWorkspaces.floats`.
+   `scripts/llm-pipeline-setup.sh` carries this and the rest of the deployment.
+
+## Things that did not help, having been tried and measured
+
+| lever | result |
+|---|---|
+| prefill batch 256 -> 512 -> 1024 | no gain at any width, and 1024 needs the larger off-heap |
+| `tornado.enable.fastMathOptimizations=true` | no measurable change — and digests stayed bit-exact, which is independent confirmation that the provider's per-plan `withStrictFloatingPoint` overrides it |
+| `jitllm.deviceSample=true` | 117.9 against 117.5 tok/s |
+
+## The wall
+
+jitllm's prefill degrades with prompt length in a way llama.cpp's does not: 1758 tok/s at 1657
+tokens against its own 5562 tok/s at 256, while llama.cpp holds 16 925 against 18 752. Decode
+shows the same shape more mildly — 123.3 tok/s at a context depth near 1900 against 145.2 at 64,
+where llama.cpp gives up 148.2 against 177.7. Both are inside the engine and neither is reachable
+from the deployment. It costs this application 1.19 s against a 7.6 s preprocessing saving, so it
+does not change the verdict, but it is what would have to move next.
+
+## A measurement bug worth not repeating
+
+The first several hours of numbers here said the two arms were identical. `collect()` returns its
+iterator as soon as the job is *submitted*, so timing that call measures planning and submission —
+about two seconds, the same in both arms — and nothing of execution. A twentyfold difference was
+invisible. The clock now stops after the last row has been read, and the JobManager's own job
+duration is used wherever the client's view could be doubted.
