@@ -90,6 +90,10 @@ class RowGatherTypeTest {
                                         GpuValueType.INT,
                                         (position, value) -> {})
                                 .tier())
-                .isEqualTo("tier4-generic");
+                // Names the class, not just the tier: which gather applies is decided by what
+                // the plan put upstream, and "generic" alone does not say what that was. Finding
+                // the shape that delivers BinaryRowData to an accelerated operator took reading
+                // this string rather than reasoning about the plan.
+                .isEqualTo("tier4-generic(GenericRowData)");
     }
 }

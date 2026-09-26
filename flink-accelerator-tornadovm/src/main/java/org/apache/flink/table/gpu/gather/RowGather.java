@@ -124,7 +124,7 @@ public interface RowGather {
         if (sample instanceof BinaryRowData) {
             return new BinaryGather(field, type, target);
         }
-        return new GenericGather(field, type, target);
+        return new GenericGather(field, type, target, sample);
     }
 
     /**
