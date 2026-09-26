@@ -18,6 +18,8 @@
 
 package org.apache.flink.table.gpu.operator;
 
+import org.apache.flink.core.memory.MemorySegment;
+import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.metrics.Gauge;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
@@ -202,11 +204,28 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
             }
             long executeNanos = System.nanoTime() - start;
             long drainStart = System.nanoTime();
-            for (int i = 0; i < n; i++) {
-                outWriter.reset();
-                rows.writeInto(outWriter, 0, permutation[i]);
-                outWriter.complete();
-                output.collect(outElement.replace(outRow));
+            if (BLOCK_DRAIN) {
+                // One transpose into a block of binary rows, then a pointer a row. See
+                // StagedColumns.writeBlock: building the rows one at a time is 97 ns each
+                // against 20 ns for the collect that has to happen either way.
+                final int rowBytes = StagedColumns.rowBytes(fields);
+                final MemorySegment block = blockFor(n, rowBytes);
+                rows.writeBlock(block, permutation, n, fields, rowBytes);
+                final MemorySegment[] one = new MemorySegment[] {block};
+                for (int i = 0; i < n; i++) {
+                    // A view, not a copy. Safe because a batch operator's consumer may not hold a
+                    // row past the call -- the same object-reuse contract every operator here
+                    // already relies on, and the reason outRow is reused above.
+                    outRow.pointTo(one, i * rowBytes, rowBytes);
+                    output.collect(outElement.replace(outRow));
+                }
+            } else {
+                for (int i = 0; i < n; i++) {
+                    outWriter.reset();
+                    rows.writeInto(outWriter, 0, permutation[i]);
+                    outWriter.complete();
+                    output.collect(outElement.replace(outRow));
+                }
             }
             count = 0;
             // Gather is reported as zero rather than estimated. Staging here is one write per
@@ -244,6 +263,31 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
             permutation[i] = order.get(i);
         }
         return permutation;
+    }
+
+    /**
+     * Draining through one block rather than a row at a time.
+     *
+     * <p>On by default is not yet justified: the block is a second buffer the size of the output,
+     * and the operator's contract about staging capacity has not been extended to cover it.
+     */
+    static final boolean BLOCK_DRAIN =
+            Boolean.parseBoolean(
+                    System.getProperty("flink.accelerator.tornadovm.blockDrain", "false"));
+
+    private transient MemorySegment drainBlock;
+
+    /** The output block, grown once and reused: a partition is drained exactly once. */
+    private MemorySegment blockFor(int rows, int rowBytes) {
+        final long bytes = (long) rows * rowBytes;
+        if (bytes > Integer.MAX_VALUE) {
+            throw new IllegalStateException(
+                    "a drain block of " + bytes + " bytes does not fit an int-indexed segment");
+        }
+        if (drainBlock == null || drainBlock.size() < bytes) {
+            drainBlock = MemorySegmentFactory.allocateUnpooledOffHeapMemory((int) bytes);
+        }
+        return drainBlock;
     }
 
     /** Stops using the device, keeping every row that has arrived so far. */
