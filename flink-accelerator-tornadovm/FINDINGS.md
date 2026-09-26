@@ -644,12 +644,15 @@ Decode is near parity. Prefill is not, and that gap is what the accelerated arm 
 
 | arm | warm | cold |
 |---|---:|---:|
-| GPU preprocess + jitllm | **7.68 s** | 14.90 s |
-| CPU preprocess + llama.cpp | **14.13 s** | 17.88 s |
+| GPU preprocess + jitllm | **7.68 s** | 14.90 – 14.95 s |
+| CPU preprocess + llama.cpp | **14.13 s** | 14.96 – 17.88 s |
 
-**1.84x warm, 1.20x cold.** Warm means the engine is already resident in the TaskManager, which is
-what a cluster that has answered one query looks like; cold is the first query after a restart, and
-the difference between the columns is the model load the warm case does not repeat.
+**1.84x warm; cold the two are level.** Warm means the engine is already resident in the
+TaskManager, which is what a cluster that has answered one query looks like. Cold is the first
+query after a restart, and there the accelerated arm spends its whole preprocessing advantage
+loading a model: 5.0 s against llama-server's 0.9 – 2.7 s, the spread being whether the GGUF is
+still in page cache. Two cold measurements of the CPU arm gave 17.88 s and 14.96 s for that
+reason, so the cold column is a range and not a verdict.
 
 ## Where the time goes
 
