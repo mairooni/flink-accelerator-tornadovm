@@ -237,14 +237,19 @@ public final class HaversineBenchmark {
             env.getConfig()
                     .getConfiguration()
                     .setString("table.exec.accelerator.approximate-projections", "true");
-            if (!args.fuseAggregate) {
-                // The unfused arm: the Calc still runs on the device, the SUM above it still runs
-                // on the CPU, and the projected rows travel between them. That is what fusing is
-                // measured against, and both arms have to be one session apart at most.
-                env.getConfig()
-                        .getConfiguration()
-                        .setString("table.exec.accelerator.fuse-aggregate", "false");
-            }
+            // Set in both directions, and that is not redundant. The option's own default is
+            // false -- M4.0 measured a CPU fused pair as worth nothing -- so writing it only for
+            // the unfused arm left both arms unfused while reporting one of them as fused. The
+            // two arms then differed in nothing at all, which is exactly what they measured.
+            //
+            // Unfused: the Calc runs on the device, the SUM above it runs separately, and the
+            // projected rows travel between them. Fused: one task graph, and one row a group
+            // comes back instead of one a row.
+            env.getConfig()
+                    .getConfiguration()
+                    .setString(
+                            "table.exec.accelerator.fuse-aggregate",
+                            Boolean.toString(args.fuseAggregate));
             if (args.requireDevice) {
                 // Asks the scheduler for a slot that declares the resource, rather than taking
                 // whatever slot arrives and finding out on the TaskManager. Requesting one means
@@ -380,10 +385,17 @@ public final class HaversineBenchmark {
     }
 
     private static String points(String path, String format) {
+        // NOT NULL is load-bearing, and it is the one thing the transparency invariant lets a
+        // query author be asked for (review S0.1). A nullable column makes the generated kernel
+        // carry a validity mask, and the fused grouped aggregate refuses a projection that does:
+        // cuDF's groupSum takes a dense INT key and a dense DOUBLE value, with nowhere to put
+        // "this row has no key". Without these three words the planner still builds the fused
+        // node, the provider still declines it, and the job silently runs the whole projection on
+        // the CPU -- which is a 12x difference here, reported as if it were the device path.
         return "CREATE TABLE Points (\n"
-                + "  id INT,\n"
-                + "  lat DOUBLE,\n"
-                + "  lon DOUBLE\n"
+                + "  id INT NOT NULL,\n"
+                + "  lat DOUBLE NOT NULL,\n"
+                + "  lon DOUBLE NOT NULL\n"
                 + ") WITH (\n"
                 + "  'connector' = 'filesystem',\n"
                 + "  'path' = '"

@@ -108,8 +108,14 @@ public interface RowGather {
         if (sample instanceof ColumnarRowData) {
             // The bulk path copies a HeapDoubleVector's backing array wholesale into a
             // double-typed segment, so it has nothing to offer a narrower column; those fall back
-            // to the per-row columnar tier rather than getting a second bulk implementation for a
-            // path that is not reachable yet anyway (it needs a vectorized source).
+            // to the per-row columnar tier.
+            //
+            // Measured reachable on 2026-09-26, which this comment previously denied: an 8M-row
+            // haversine GROUP BY over a Parquet source reported
+            // `tier1-columnar-bulk(100.0% bulk)` for both DOUBLE columns. The INT grouping key
+            // reported `tier1-columnar(per-row; not a DOUBLE column)` in the same run, so the
+            // narrow-column gap is real rather than hypothetical -- it is just not yet shown to
+            // cost enough to justify a second bulk implementation.
             boolean bulk = BULK_COLUMNAR && targetSegment != null && type == GpuValueType.DOUBLE;
             return bulk
                     ? new BulkColumnarDoubleGather(field, target, targetSegment)
