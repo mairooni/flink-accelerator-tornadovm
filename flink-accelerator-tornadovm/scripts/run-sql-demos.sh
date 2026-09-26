@@ -23,7 +23,7 @@
 #   run-sql-demos.sh haversine  [--printKernel]     [--rows N] [--data DIR]
 #   run-sql-demos.sh cudf-sort  [--printBytecodes]  [--rows N] [--data DIR]
 #
-# --rows            defaults to 2,000,000 for haversine and 4,000,000 for cudf-sort.
+# --rows            defaults to 2,000,000 for haversine and 4,000,000 for the cuDF demos.
 #                   Lower them with care: setting a device up costs a fixed ~300 ms and
 #                   the accelerator refuses work that cannot repay it, so cudf-sort is
 #                   DECLINED below about two million rows -- it answers correctly on
@@ -86,7 +86,8 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <haversine|cudf-sort> [--printKernel] [--printBytecodes] [--rows N] [--data DIR]" >&2
+    echo "usage: $0 <haversine|cudf-sort|cudf-groupby> [--printKernel] [--printBytecodes]" \
+         "[--rows N] [--data DIR]" >&2
     exit 1
 }
 
@@ -95,6 +96,7 @@ shift || true
 case "${DEMO}" in
     haversine)  MAIN=org.apache.flink.table.examples.java.gpu.HaversineSQLExample ;;
     cudf-sort)  MAIN=org.apache.flink.table.examples.java.gpu.CudfSortSQLExample ;;
+    cudf-groupby) MAIN=org.apache.flink.table.examples.java.gpu.CudfGroupBySQLExample ;;
     *)          usage ;;
 esac
 
@@ -140,9 +142,13 @@ if ! grep -q 'tornado.drivers.cuda' "${TORNADO_SDK}/tornado-argfile"; then
     echo "${TORNADO_SDK} is not a CUDA build (no tornado.drivers.cuda in its argfile)" >&2
     exit 1
 fi
-if [[ "${DEMO}" == "cudf-sort" && ! -f "${TORNADO_SDK}/lib/libtornado-cudf.so" ]]; then
-    echo "note: ${TORNADO_SDK}/lib/libtornado-cudf.so is missing; the sort will run on the host." \
-         "Install RAPIDS libcudf and rebuild TornadoVM with 'make BACKEND=cuda'." >&2
+if [[ "${DEMO}" == cudf-* && ! -f "${TORNADO_SDK}/lib/libtornado-cudf.so" ]]; then
+    # Fatal for a demo rather than a note. Without the shim the provider declines and the query
+    # runs on the CPU, printing the same numbers -- which is a CPU run presented as a device one.
+    echo "${TORNADO_SDK}/lib/libtornado-cudf.so is missing, so ${DEMO} would run on the host" \
+         "and still print the right answer. Install RAPIDS libcudf and rebuild TornadoVM with" \
+         "'make BACKEND=cuda'." >&2
+    exit 1
 fi
 # Exported because the provider and BenchmarkRun read it to report what they ran against.
 TORNADOVM_HOME="${TORNADO_SDK}"
@@ -185,9 +191,10 @@ if [[ -d "${RAPIDS_HOME}" ]]; then
     export LD_LIBRARY_PATH="${RAPIDS_HOME}/libcudf/lib64:${RAPIDS_HOME}/librmm/lib64:\
 ${RAPIDS_HOME}/libkvikio/lib64:${RAPIDS_HOME}/rapids_logger/lib64:\
 ${RAPIDS_HOME}/nvidia/libnvcomp/lib64:${RAPIDS_HOME}/libkvikio_cu12.libs:${LD_LIBRARY_PATH:-}"
-elif [[ "${DEMO}" == "cudf-sort" ]]; then
-    echo "note: RAPIDS_HOME=${RAPIDS_HOME} does not exist; cuDF will report itself" \
-         "unavailable and the sort will run on the host" >&2
+elif [[ "${DEMO}" == cudf-* ]]; then
+    echo "RAPIDS_HOME=${RAPIDS_HOME} does not exist, so cuDF will report itself unavailable and" \
+         "${DEMO} will run on the host while printing the right answer. Set RAPIDS_HOME." >&2
+    exit 1
 fi
 
 # Quiet by default. These are meant to be watched, and the accelerator's own INFO logging

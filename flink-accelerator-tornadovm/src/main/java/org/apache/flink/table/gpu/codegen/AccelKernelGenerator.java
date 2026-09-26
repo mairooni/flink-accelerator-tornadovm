@@ -146,6 +146,35 @@ public final class AccelKernelGenerator {
      */
     public static Optional<GpuKernelSource> generate(
             AccelNode subtree, String classNameSuffix, int packedStride, int packedInputStride) {
+        return generate(subtree, classNameSuffix, packedStride, packedInputStride, NOTHING_EXTRA);
+    }
+
+    /** No column has to be staged beyond the ones the expressions read. */
+    private static final int[] NOTHING_EXTRA = new int[0];
+
+    /**
+     * As above, and staging {@code alsoStage} whether any expression reads it or not.
+     *
+     * <p>A projection's pass-through column is normally the host's business: the kernel never sees
+     * it, and {@code GpuCalcOperator} copies it beside the computed columns. That breaks down when
+     * something <em>on the device</em> needs it, and the grouped aggregate is exactly that case —
+     * {@code cudf::groupby} reads its key column out of device memory, so a query grouped by a
+     * plain column rather than a computed one has no key to group by.
+     *
+     * <p>Which is the ordinary shape of the query: {@code SELECT region, SUM(f(x)) GROUP BY region}
+     * groups by a column the scan read. Before this, that threw out of the provider and the whole
+     * query fell back to the CPU; only a computed key such as {@code id - (id / n) * n} worked,
+     * which is why the benchmarks did not catch it.
+     *
+     * <p>The staged column becomes a kernel parameter the kernel does not read. That costs a
+     * transfer of a column the device needs anyway and an unused argument in the generated source.
+     */
+    public static Optional<GpuKernelSource> generate(
+            AccelNode subtree,
+            String classNameSuffix,
+            int packedStride,
+            int packedInputStride,
+            int[] alsoStage) {
 
         if (!(subtree instanceof AccelProject)) {
             return Optional.empty();
@@ -202,6 +231,18 @@ public final class AccelKernelGenerator {
         if (computed.isEmpty()) {
             // Nothing to compute; the CPU path already handles pure projection.
             return Optional.empty();
+        }
+
+        for (int field : alsoStage) {
+            final AccelExpression source = passThroughOf(project, field);
+            if (source == null || !isDoubleSafeInput(source.outputType())) {
+                // Asked to stage something this projection does not pass through, or a type the
+                // staging cannot hold. Declining is the caller's cue to fall back rather than
+                // produce a kernel whose key column is missing.
+                return Optional.empty();
+            }
+            inputTypes.putIfAbsent(field, valueTypeOf(source.outputType()));
+            inputs.computeIfAbsent(field, index -> "c" + index);
         }
 
         String renderedCondition = null;
@@ -749,6 +790,17 @@ public final class AccelKernelGenerator {
      */
     private static final ThreadLocal<Set<Integer>> NULLABLE_INPUTS =
             ThreadLocal.withInitial(LinkedHashSet::new);
+
+    /** The pass-through projection reading this input field, or null if there is none. */
+    private static @Nullable AccelExpression passThroughOf(AccelProject project, int inputField) {
+        for (AccelExpression expression : project.projections()) {
+            if (expression instanceof AccelInputRef
+                    && ((AccelInputRef) expression).index() == inputField) {
+                return expression;
+            }
+        }
+        return null;
+    }
 
     private static @Nullable Rendered render(
             AccelExpression node, Map<Integer, String> inputs, Map<Integer, GpuValueType> types) {

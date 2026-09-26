@@ -23,8 +23,10 @@ import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
 import org.apache.flink.table.accelerator.AccelAggCall;
 import org.apache.flink.table.accelerator.AccelAggFunction;
 import org.apache.flink.table.accelerator.AccelAggregate;
+import org.apache.flink.table.accelerator.AccelExpression;
 import org.apache.flink.table.accelerator.AccelFunction;
 import org.apache.flink.table.accelerator.AccelInput;
+import org.apache.flink.table.accelerator.AccelInputRef;
 import org.apache.flink.table.accelerator.AccelIrVersion;
 import org.apache.flink.table.accelerator.AccelJoin;
 import org.apache.flink.table.accelerator.AccelNode;
@@ -283,6 +285,35 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      *       point; widening it adds entry points rather than changing anything here.
      * </ul>
      */
+    /**
+     * The input field a grouping key is passed through from, as the one-element list the generator
+     * wants; empty when the key is computed and therefore already a device column.
+     */
+    private static int[] keyInputFields(AccelNode projection, int keyOutputField) {
+        if (!(projection instanceof AccelProject)) {
+            return new int[0];
+        }
+        final AccelProject project = (AccelProject) projection;
+        if (keyOutputField >= project.projections().size()) {
+            return new int[0];
+        }
+        final AccelExpression key = project.projections().get(keyOutputField);
+        return key instanceof AccelInputRef
+                ? new int[] {((AccelInputRef) key).index()}
+                : new int[0];
+    }
+
+    /** Whether the kernel stages the input column this output field is copied from. */
+    private static boolean stages(GpuKernelSource kernel, GpuCalcSpec spec, int field) {
+        final int source = spec.outputLayout()[field];
+        for (int staged : kernel.inputFieldIndexes()) {
+            if (staged == source) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private Optional<AcceleratorPlan> acceptAggregate(AccelAggregate agg, AccelWorkProfile work) {
         if (agg.grouping().length == 0) {
             return acceptGram(agg, work);
@@ -311,9 +342,19 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             return Optional.empty();
         }
         AccelNode projection = agg.inputs().get(0);
+        // cudf::groupby reads the key column from device memory, so the key has to be staged even
+        // when the projection only passes it through -- which is the ordinary shape of the query,
+        // SELECT region, SUM(f(x)) ... GROUP BY region. Naming it here is what makes a plain
+        // column groupable; without it only a computed key worked, and a pass-through key threw
+        // out of stagedColumn and took the whole query to the CPU.
+        final int keyOutputField = agg.grouping()[0];
         Optional<GpuKernelSource> kernel =
                 AccelKernelGenerator.generate(
-                        projection, Integer.toHexString(projection.hashCode()));
+                        projection,
+                        Integer.toHexString(projection.hashCode()),
+                        0,
+                        0,
+                        keyInputFields(projection, keyOutputField));
         if (!kernel.isPresent()) {
             LOG.info("declining the aggregate: no kernel for the projection {}", projection);
             return Optional.empty();
@@ -332,7 +373,7 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             LOG.info("declining the aggregate: cannot stage {}", projection.outputType());
             return Optional.empty();
         }
-        int keyField = agg.grouping()[0];
+        int keyField = keyOutputField;
         int valueField = call.inputField();
         if (probe.fieldType(keyField) != GpuValueType.INT
                 || probe.fieldType(valueField) != GpuValueType.DOUBLE) {
@@ -341,6 +382,17 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                             + "not {} and {}",
                     probe.fieldType(keyField),
                     probe.fieldType(valueField));
+            return Optional.empty();
+        }
+        // The engine reads the key column through stagedColumn, which throws when the field is
+        // neither computed nor staged. That is a programming error rather than a plan this cannot
+        // serve, so it is checked here and declined -- a provider that throws out of accept()
+        // violates the SPI and is caught only by a safety net meant for third-party code.
+        if (probe.computedSlot(keyField) < 0 && !stages(kernel.get(), probe, keyField)) {
+            LOG.info(
+                    "declining the aggregate: the grouping key (field {}) is neither computed nor"
+                            + " staged, so the device has no column to group by",
+                    keyField);
             return Optional.empty();
         }
         GpuAggregateSpec aggregate =

@@ -404,6 +404,24 @@ under the License.
 							</includes>
 						</configuration>
 					</execution>
+										<execution>
+						<id>CudfGroupBySQLExample</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>CudfGroupBySQLExample</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.CudfGroupBySQLExample</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/CudfGroupBySQLExample*</include>
+							</includes>
+						</configuration>
+					</execution>
 					<execution>
 						<id>KMeansBenchmark</id>
 						<phase>package</phase>
@@ -455,6 +473,7 @@ under the License.
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-BlackScholesBenchmark.jar" tofile="${project.build.directory}/BlackScholesBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-HaversineSQLExample.jar" tofile="${project.build.directory}/HaversineSQLExample.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-CudfSortSQLExample.jar" tofile="${project.build.directory}/CudfSortSQLExample.jar"/>
+															<copy file="${project.build.directory}/${project.artifactId}-${project.version}-CudfGroupBySQLExample.jar" tofile="${project.build.directory}/CudfGroupBySQLExample.jar"/>
 							</target>
 						</configuration>
 					</execution>
