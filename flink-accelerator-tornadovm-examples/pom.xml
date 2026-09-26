@@ -83,6 +83,19 @@ under the License.
 			<version>${tornado.version}</version>
 			<scope>provided</scope>
 		</dependency>
+		<!--
+			jitllm is compiled against but never packaged. It is deployed into the distribution's
+			lib/, the same way the provider jar is, which is not a packaging convenience but a
+			requirement: a model kept resident across jobs has to be held by a class the parent
+			classloader owns, and anything inside a job jar is discarded with that job's
+			classloader. See ResidentEngines.
+		-->
+		<dependency>
+			<groupId>io.github.beehive-lab</groupId>
+			<artifactId>jitllm</artifactId>
+			<version>${jitllm.version}</version>
+			<scope>provided</scope>
+		</dependency>
 	</dependencies>
 
 	<build>
@@ -437,6 +450,42 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/KMeansBenchmark*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
+						<id>GpuTriagePipeline</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>GpuTriagePipeline</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.llm.GpuTriagePipeline</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/llm/**</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
+						<id>CpuTriagePipeline</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>CpuTriagePipeline</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.llm.CpuTriagePipeline</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/llm/**</include>
 							</includes>
 						</configuration>
 					</execution>

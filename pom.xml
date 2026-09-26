@@ -69,6 +69,7 @@ under the License.
 			"Kernel entry ... has no writeReplace()".
 		-->
 		<tornado.version>7.0.1-jdk21-dev</tornado.version>
+		<jitllm.version>1.0.1-jdk21</jitllm.version>
 
 		<junit5.version>5.10.2</junit5.version>
 		<assertj.version>3.25.3</assertj.version>
