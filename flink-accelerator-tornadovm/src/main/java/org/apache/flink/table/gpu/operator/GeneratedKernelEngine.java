@@ -21,7 +21,9 @@ package org.apache.flink.table.gpu.operator;
 import org.apache.flink.table.gpu.codegen.GpuAggregateSpec;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
+import org.apache.flink.table.gpu.codegen.GpuSortSpec;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
+import org.apache.flink.table.gpu.gather.RowBlockGather;
 import org.apache.flink.table.gpu.gather.RowGather;
 import org.apache.flink.table.gpu.metrics.OffloadMetrics;
 
@@ -161,6 +163,32 @@ public final class GeneratedKernelEngine implements AutoCloseable {
     /** The grouped aggregate to run over the kernel's output, or null to stop at the kernel. */
     private final @Nullable GpuAggregateSpec aggregate;
 
+    /**
+     * The row block the device transposes, or null when staging stays column by column.
+     *
+     * <p>Allocated only once {@link #bindRowBlock} has been told the source row's arity, which is
+     * not knowable until a row has arrived: {@code BinaryRowData}'s null-bit header is sized from
+     * it, and the header decides where every field sits.
+     */
+    private @Nullable DoubleArray rowBlock;
+
+    /** Slots in one staged row, header included. Zero while the block path is not in use. */
+    private int blockSlots;
+
+    /** The slot each staged column occupies within a row, parallel to {@code inputs}. */
+    @Nullable private int[] columnSlots;
+
+    /**
+     * Built on first use rather than in {@link #open()}, because the block path needs the arity.
+     */
+    private boolean planBuilt;
+
+    /** Present when this engine's projection feeds a device sort in the same graph. */
+    private final @Nullable GpuSortSpec sort;
+
+    /** The permutation cuDF writes back, allocated only for the fused sort. */
+    private transient IntArray order;
+
     public GeneratedKernelEngine(GpuCalcSpec spec, boolean profile) {
         this(spec, profile, null);
     }
@@ -187,10 +215,73 @@ public final class GeneratedKernelEngine implements AutoCloseable {
             @Nullable GpuAggregateSpec aggregate,
             boolean profile,
             @Nullable Staging staging) {
+        this(spec, aggregate, null, profile, staging);
+    }
+
+    public GeneratedKernelEngine(
+            GpuCalcSpec spec,
+            @Nullable GpuAggregateSpec aggregate,
+            @Nullable GpuSortSpec sort,
+            boolean profile,
+            @Nullable Staging staging) {
         this.spec = spec;
         this.aggregate = aggregate;
+        this.sort = sort;
         this.profile = profile;
         this.staging = staging;
+    }
+
+    /**
+     * Orders the projection's own output, on the device, without it ever coming back.
+     *
+     * <p>The graph is built here rather than in {@code open()} because {@code Cudf.sortedOrder}
+     * captures its row count when the graph is built, the way {@code Cudf.runningSum} does, and a
+     * sort's row count is not known until the last row has arrived. A sort flushes once per
+     * partition, so there is nothing to amortise a prebuilt graph over.
+     *
+     * @return the permutation, as row positions into the projection's output columns
+     */
+    public int[] projectAndOrder(int count) throws Exception {
+        buildPlan();
+        if (sort == null) {
+            throw new IllegalStateException("this engine was not built with a sort stage");
+        }
+        rows.set(0, count);
+        TaskGraph graph = new TaskGraph("calc-sort");
+        graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inputs);
+        graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, rows);
+        graph = graph.task("kernel", entry, kernelArgs);
+        // The key the ordering reads is a column the task above just wrote, still on the device.
+        graph =
+                graph.libraryTask(
+                        "order",
+                        Cudf::sortedOrder,
+                        count,
+                        (IntArray) bufferFor(sort.sortField()),
+                        order);
+        graph = graph.transferToHost(DataTransferMode.EVERY_EXECUTION, concat(outputs, order));
+
+        WorkerGrid1D sortGrid = new WorkerGrid1D(count);
+        GridScheduler sortScheduler = new GridScheduler();
+        sortScheduler.addWorkerGrid("calc-sort.kernel", sortGrid);
+        TornadoExecutionPlan sortPlan =
+                new TornadoExecutionPlan(graph.snapshot()).withGridScheduler(sortScheduler);
+        if (spec.requiresStrictArithmetic()) {
+            sortPlan = sortPlan.withStrictFloatingPoint();
+        }
+        try (TornadoExecutionPlan closeable = sortPlan) {
+            closeable.execute();
+        }
+        int[] permutation = new int[count];
+        for (int i = 0; i < count; i++) {
+            permutation[i] = order.get(i);
+        }
+        return permutation;
+    }
+
+    /** The staged column for a field of the projection's output, for the fused drain. */
+    public Object outputBuffer(int field) {
+        return bufferFor(field);
     }
 
     /** Where a staging buffer comes from. Exactly {@code AcceleratorContext::allocateOffHeap}. */
@@ -210,6 +301,9 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         outputs = new Object[kernel.outputCount()];
         for (int i = 0; i < outputs.length; i++) {
             outputs[i] = allocate(kernel.outputTypes()[i], batchSize);
+        }
+        if (sort != null) {
+            order = new IntArray(batchSize);
         }
         if (kernel.hasFilter()) {
             mask = new IntArray(batchSize);
@@ -276,16 +370,87 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         }
         args[at] = rows;
         kernelArgs = args;
+    }
+
+    /**
+     * Whether this engine will take the row block, and with what layout.
+     *
+     * <p>Called by the operator once it has seen a row, because the layout depends on the row: the
+     * null-bit header is sized from the source arity and everything after it moves with it. Returns
+     * false when the block path does not apply, and the operator then stages column by column as
+     * before.
+     *
+     * <p>Refused for anything but all-{@code DOUBLE} inputs. The block is a {@code DoubleArray} and
+     * the device reads slots out of it as doubles; a four-byte {@code INT} sits in the low half of
+     * its slot and reading the slot as a double gives a number, not a failure. Recovering it needs
+     * a bit reinterpretation and an {@code IntArray} output, which is a second family of kernels
+     * for a case no measured query here has.
+     */
+    public boolean bindRowBlock(int sourceArity) {
+        if (planBuilt || !BLOCK_STAGING) {
+            return rowBlock != null;
+        }
+        final GpuKernelSource kernel = spec.kernel();
+        final int[] fields = kernel.inputFieldIndexes();
+        if (fields.length == 0 || fields.length > DeviceDeinterleave.MAX_COLUMNS) {
+            return false;
+        }
+        for (GpuValueType type : kernel.inputTypes()) {
+            if (type != GpuValueType.DOUBLE) {
+                return false;
+            }
+        }
+        if (kernel.carriesValidity()) {
+            // The kernel reads a validity mask the host builds per column; the block path writes
+            // no such mask, and a projection over nullable inputs is refused elsewhere anyway.
+            return false;
+        }
+        blockSlots = RowBlockGather.slotsFor(sourceArity);
+        columnSlots = new int[fields.length];
+        for (int c = 0; c < fields.length; c++) {
+            columnSlots[c] = RowBlockGather.slotOf(sourceArity, fields[c]);
+        }
+        rowBlock = (DoubleArray) allocate(GpuValueType.DOUBLE, spec.batchSize() * blockSlots);
+        return true;
+    }
+
+    /** The block's buffer and TornadoVM's header size, for the gather that fills it. */
+    public @Nullable RowBlockGather blockGather() {
+        if (rowBlock == null) {
+            return null;
+        }
+        return new RowBlockGather(GeneratedKernel.segmentOf(rowBlock).asByteBuffer(), blockSlots);
+    }
+
+    /** Builds the task graph, on first use, once the block decision is settled. */
+    private void buildPlan() throws Exception {
+        if (planBuilt) {
+            return;
+        }
+        planBuilt = true;
+        final GpuKernelSource kernel = spec.kernel();
+        final int batchSize = spec.batchSize();
 
         TaskGraph graph = new TaskGraph("calc");
-        graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inputs);
+        if (rowBlock != null) {
+            // C. One transfer of the row block, and the columns the kernel reads are produced on
+            // the device by the task below rather than sent. Nothing about `inputs` changes --
+            // they are the same buffers, filled in a different place -- so the generated kernel is
+            // untouched by this path.
+            graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, rowBlock);
+        } else {
+            graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inputs);
+        }
         graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, rows);
         if (inNulls != null) {
             graph = graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, inNulls);
         }
+        if (rowBlock != null) {
+            graph = graph.task("deinterleave", deinterleaveEntry(), deinterleaveArgs());
+        }
         // Naming the kernel by Method rather than by a method reference is what makes a generated
         // kernel possible at all: a method reference would have to exist in source.
-        graph = graph.task("kernel", entry, args);
+        graph = graph.task("kernel", entry, kernelArgs);
         Object[] results;
         if (aggregate != null) {
             // The two columns the group-by reads are the ones the task above just wrote, still on
@@ -339,6 +504,12 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         grid = new WorkerGrid1D(batchSize);
         GridScheduler scheduler = new GridScheduler();
         scheduler.addWorkerGrid("calc.kernel", grid);
+        if (rowBlock != null) {
+            // Same iteration space and the same narrowing, for the same reason the kernel needs
+            // its grid stated: the loop bound is read from a buffer, so TornadoVM cannot infer one
+            // and silently emits a sequential loop if it is not told.
+            scheduler.addWorkerGrid("calc.deinterleave", grid);
+        }
         if (compacting) {
             TaskGraph compact = compactionGraph(batchSize, scheduler);
             plan =
@@ -357,6 +528,39 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         if (profile) {
             plan = plan.withProfiler(ProfilerMode.SILENT);
         }
+    }
+
+    /**
+     * Off by default.
+     *
+     * <p>The kernel is 1.96x over the host gather on the transpose itself, but the transpose is a
+     * small share of any pipeline measured here -- a Parquet source never reaches this path at all,
+     * and on the CSV source the parse outweighs the whole operator. Default-on would put a second
+     * staging mode in front of every row-major batch to move an end-to-end number by about a
+     * percent, so it is opt-in until a pipeline is found where it is not.
+     */
+    static final boolean BLOCK_STAGING =
+            Boolean.parseBoolean(
+                    System.getProperty("flink.accelerator.tornadovm.blockStaging", "false"));
+
+    private Method deinterleaveEntry() throws NoSuchMethodException {
+        return DeviceDeinterleave.entryFor(inputs.length);
+    }
+
+    /** {@code (block, c0..cN, slots, off0..offN, rows)}, matching the arity's signature. */
+    private Object[] deinterleaveArgs() {
+        final Object[] args = new Object[1 + inputs.length + 1 + inputs.length + 1];
+        int at = 0;
+        args[at++] = rowBlock;
+        for (Object in : inputs) {
+            args[at++] = in;
+        }
+        args[at++] = blockSlots;
+        for (int slot : columnSlots) {
+            args[at++] = slot;
+        }
+        args[at] = rows;
+        return args;
     }
 
     /**
@@ -720,6 +924,13 @@ public final class GeneratedKernelEngine implements AutoCloseable {
      *     of the buffers is left alone rather than evaluated and discarded.
      */
     public Execution execute(int stagedRows) {
+        try {
+            // Built here rather than in open(), because the row-block layout is not knowable
+            // until a row has arrived. A no-op after the first batch.
+            buildPlan();
+        } catch (Exception cannotBuild) {
+            throw new IllegalStateException("could not build the device plan", cannotBuild);
+        }
         rows.set(0, stagedRows);
         boolean tail = aggregate != null && stagedRows != spec.batchSize();
         WorkerGrid1D live = tail ? tailGrid() : grid;

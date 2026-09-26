@@ -188,6 +188,24 @@ under the License.
 							</includes>
 						</configuration>
 					</execution>
+										<execution>
+						<id>FleetCentroidBenchmark</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>FleetCentroidBenchmark</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.FleetCentroidBenchmark</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/FleetCentroidBenchmark*</include>
+							</includes>
+						</configuration>
+					</execution>
 					<execution>
 						<id>BlackScholesBenchmark</id>
 						<phase>package</phase>
@@ -421,6 +439,7 @@ under the License.
 							<target>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-GpuOffloadExample.jar" tofile="${project.build.directory}/GpuOffloadExample.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-HaversineBenchmark.jar" tofile="${project.build.directory}/HaversineBenchmark.jar"/>
+																<copy file="${project.build.directory}/${project.artifactId}-${project.version}-FleetCentroidBenchmark.jar" tofile="${project.build.directory}/FleetCentroidBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-SensorAnomalyBenchmark.jar" tofile="${project.build.directory}/SensorAnomalyBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-VectorScreenBenchmark.jar" tofile="${project.build.directory}/VectorScreenBenchmark.jar"/>
 								<copy file="${project.build.directory}/${project.artifactId}-${project.version}-DeviceConformanceSuite.jar" tofile="${project.build.directory}/DeviceConformanceSuite.jar"/>

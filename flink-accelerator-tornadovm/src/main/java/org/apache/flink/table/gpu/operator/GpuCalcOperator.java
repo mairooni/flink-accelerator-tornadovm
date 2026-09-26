@@ -27,6 +27,7 @@ import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gpu.codegen.GpuCalcSpec;
 import org.apache.flink.table.gpu.codegen.GpuValueType;
+import org.apache.flink.table.gpu.gather.RowBlockGather;
 import org.apache.flink.table.gpu.gather.RowGather;
 import org.apache.flink.table.gpu.metrics.OffloadMetrics;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -63,6 +64,10 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
 
     private transient GeneratedKernelEngine engine;
     private transient RowGather[] gathers;
+
+    /** The whole-row staging path, when this input can take it. Null means column by column. */
+    private transient RowBlockGather block;
+
     private transient PassThroughBuffer[] passThrough;
     private transient GenericRowData outRow;
     private transient StreamRecord<RowData> outElement;
@@ -114,20 +119,31 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
     @Override
     public void processElement(StreamRecord<RowData> element) throws Exception {
         RowData row = element.getValue();
-        if (gathers[0] == null) {
+        if (gathers[0] == null && block == null) {
             // The concrete RowData implementation is not knowable at plan time -- the planner
             // declares only InternalTypeInfo<RowData> and the connector picks the class -- so the
             // gather strategy is chosen from the first record actually seen.
-            int[] fields = spec.kernel().inputFieldIndexes();
-            GpuValueType[] types = spec.kernel().inputTypes();
-            for (int c = 0; c < fields.length; c++) {
-                gathers[c] =
-                        RowGather.forColumn(
-                                row,
-                                fields[c],
-                                types[c],
-                                engine.inputColumn(c),
-                                engine.inputSegment(c));
+            //
+            // C first, where it applies: a binary row's fixed-width part is one contiguous run, so
+            // the whole row copies in one call and the device does the transpose. The engine has
+            // the final say, because the block's layout depends on this row's arity and it has to
+            // allocate before the task graph is built.
+            if (RowBlockGather.canCopy(row, row.getArity())
+                    && engine.bindRowBlock(row.getArity())) {
+                block = engine.blockGather();
+            }
+            if (block == null) {
+                int[] fields = spec.kernel().inputFieldIndexes();
+                GpuValueType[] types = spec.kernel().inputTypes();
+                for (int c = 0; c < fields.length; c++) {
+                    gathers[c] =
+                            RowGather.forColumn(
+                                    row,
+                                    fields[c],
+                                    types[c],
+                                    engine.inputColumn(c),
+                                    engine.inputSegment(c));
+                }
             }
         }
         if (engine.carriesValidity()) {
@@ -151,6 +167,9 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
                 }
                 gathers[c].accept(row, buffered);
             }
+        } else if (block != null) {
+            // One copy for the whole row. The transpose happens on the device.
+            block.accept(row, buffered);
         } else {
             for (RowGather g : gathers) {
                 g.accept(row, buffered);
@@ -255,6 +274,9 @@ public class GpuCalcOperator extends AbstractStreamOperator<RowData>
      * dictionary-encoded or nullable. A correct result says nothing about which of those happened.
      */
     public String[] gatherTiers() {
+        if (block != null) {
+            return new String[] {block.tier()};
+        }
         if (gathers == null) {
             return new String[0];
         }

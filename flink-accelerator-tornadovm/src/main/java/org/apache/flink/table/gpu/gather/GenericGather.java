@@ -30,6 +30,9 @@ import org.apache.flink.table.gpu.codegen.GpuValueType;
  */
 final class GenericGather implements RowGather {
 
+    /** The concrete row class, recorded once so the tier string can name it. */
+    private String seen;
+
     private final int field;
     private final GpuValueType type;
     private final StagingColumn target;
@@ -42,6 +45,9 @@ final class GenericGather implements RowGather {
 
     @Override
     public void accept(RowData row, int position) {
+        if (seen == null) {
+            seen = row.getClass().getSimpleName();
+        }
         switch (type) {
             case INT:
                 target.set(position, row.getInt(field));
@@ -57,6 +63,9 @@ final class GenericGather implements RowGather {
 
     @Override
     public String tier() {
-        return "tier4-generic";
+        // Names the class, because "generic" only says which gather was chosen and the useful
+        // question is what the plan put upstream. Whether a faster tier could apply is a property
+        // of that class, and guessing it from the plan has been wrong before.
+        return "tier4-generic(" + (seen == null ? "?" : seen) + ")";
     }
 }
