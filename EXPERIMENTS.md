@@ -142,13 +142,14 @@ and JIT-compiles the model's kernels. Expect roughly:
 
 | | cold (`--gpu` / `--cpu`) | warm (`--warm`) |
 |---|---:|---:|
-| GPU preprocess + jitllm | 15 – 24 s | **~7.7 s** |
-| CPU preprocess + llama.cpp | 15 – 18 s | ~14.1 s |
+| GPU preprocess + jitllm | 15.4 – 16.6 s | **~6.8 s** |
+| CPU preprocess + llama.cpp | 17.9 – 18.0 s | ~14.1 s |
 
-**Cold, the two arms are level.** The accelerated arm saves about 7.6 s on preprocessing and
-spends all of it loading the model. The 1.84x in the report is the warm number, which is what a
-long-lived TaskManager actually serves — it loads the model once and answers thousands of
-queries. If you run each arm once and conclude they are the same, that is the reason.
+**Cold the two arms are close**; the accelerated one saves about 7.5 s on preprocessing and spends
+most of it loading a model the other keeps in a server. The 2.06x in the report is the warm
+number, which is what a long-lived TaskManager actually serves — it loads the model once and
+answers thousands of queries. If you run each arm once and conclude there is little in it, that is
+the reason.
 
 Cold timings also vary by several seconds with page cache: a 1.4 GiB GGUF that is already cached
 loads in about a second, and one that is not takes three.
@@ -248,13 +249,16 @@ done
 **The engines on their own**, with the cluster stopped:
 
 ```bash
-cd $JITLLM_SRC   && ./jitllm --gpu --model $MODEL --bench --bench-args "-p 256 -n 64 -r 2 -b 256"
-cd $LLAMACPP_SRC && ./build/bin/llama-bench -m $MODEL -p 256 -n 64 -ngl 99 -r 2
+cd $JITLLM_SRC   && ./jitllm --gpu --model $MODEL --with-native-libraries \\
+                      --bench --bench-args "-p 2048 -n 64 -r 2 -b 2048"
+cd $LLAMACPP_SRC && ./build/bin/llama-bench -m $MODEL -p 2048 -n 64 -ngl 99 -r 2
 ```
 
-`-b 256` is not optional for a fair reading of jitllm. Without it prompt processing runs one
-token per forward — 138 tok/s instead of 5422 — because the batched-prefill MMA path is gated on
-system properties read when the state buffers are allocated.
+Neither flag is optional for a fair reading of jitllm, and `--with-native-libraries` matters more
+than the batch width. Without `-b` at all, prompt processing runs one token per forward — 138
+tok/s. With `-b` but without the native path, every chunk past the first uses a JIT attention
+kernel. With both, and a batch that covers the prompt, a 2048-token prefill runs at 20,905 tok/s
+against llama.cpp's 26,021.
 
 ---
 
@@ -293,8 +297,20 @@ CUDA toolkit under `~/.local/lib/python3.*/site-packages/nvidia/`, the runtime t
 prefers that `nvcc` and its include tree has no `nv/target`. 63 non-whitelisted failures, all
 pre-existing, none related to this work. Baseline with your change stashed before believing it.
 
-**The two arms take the same time.** Check `resident=` in the output. Cold, they are level, and
+**The two arms take the same time.** Check `resident=` in the output. Cold they are close, and
 that is the honest result — see the table above.
+
+**jitllm's prefill is ten times slower than it should be.** Check two settings, which are really
+one setting: `-Djitllm.nativeLibraries=true` must be on, **and** `-Djitllm.prefillBatchSize` must
+be at least the prompt length. jitllm's fast prefill is cuDNN's fused attention, and its causal
+mask is only correct when the query block is the whole prefix — so only a chunk starting at
+position zero can use it, and every later chunk falls back to a JIT kernel about twenty times
+slower. Measured on a 2048-token prompt: **20,905 tok/s with the native path, 998 without**.
+
+The default for `nativeLibraries` is *off*, so a run that sets neither gets the slow kernel for
+every chunk. Sweeping the batch width alone changes nothing, because width only decides how many
+chunks there are and all of them are slow anyway — which is exactly the wrong conclusion this
+benchmark reached for a day. `llm-pipeline-setup.sh` sets both.
 
 **The job appears to hang while generating data.** `datagen` defaults to 10,000 rows a second,
 which makes 8M rows a fourteen-minute sleep. The example sets `rows-per-second` high; if you have

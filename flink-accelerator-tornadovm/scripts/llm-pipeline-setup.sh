@@ -60,9 +60,20 @@ echo "installed $(basename "${JITLLM_JAR}") into lib/"
 #
 # PREFILL_BATCH is the width of the batched-prefill MMA path. It must be at least as large as a
 # prompt chunk for the path to be worth entering, and it costs device memory proportional to it.
-PREFILL_BATCH="${PREFILL_BATCH:-256}"
+PREFILL_BATCH="${PREFILL_BATCH:-2048}"
 DEVICE_MEMORY="${DEVICE_MEMORY:-5GB}"
 
+# jitllm.nativeLibraries and the prefill width are ONE setting, and either one alone does
+# nothing. The fast prefill is cuDNN's fused attention, whose causal mask is only correct when
+# the query block is the whole prefix -- so only a chunk starting at position zero may use it,
+# and every later chunk drops to a JIT paged-attention kernel about twenty times slower.
+#
+# So: the batch must be wide enough for the whole prompt (one chunk), AND the native path must
+# be on. Measured here on a 2048-token prompt, native on against off: 20,905 against 998 tokens
+# a second. The default is off, which is why this has to be set.
+#
+# The width costs what it reserves -- the kernel computes the padding rows too, so prefill takes
+# a flat ~90 ms for any prompt that fits. Size it to the prompt, not to the context.
 ADDITIONS=(
     "--add-modules jdk.incubator.vector"
     "-Dtornado.device.memory=${DEVICE_MEMORY}"
@@ -72,6 +83,7 @@ ADDITIONS=(
     "-Dtornado.loop.interchange=true"
     "-Dtornado.eventpool.maxwaitevents=32000"
     "-Djitllm.withPrefillDecode=true"
+    "-Djitllm.nativeLibraries=true"
     "-Djitllm.prefillBatchSize=${PREFILL_BATCH}"
 )
 

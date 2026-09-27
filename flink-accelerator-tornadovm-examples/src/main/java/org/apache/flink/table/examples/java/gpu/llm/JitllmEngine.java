@@ -68,17 +68,24 @@ public final class JitllmEngine implements TriageEngine {
     private final int contextLength;
     private final int prefillBatch;
     private final boolean deviceSampling;
+    private final boolean nativeLibraries;
 
     private LocalModel loaded;
     private GenerationSession session;
     private long loadNanos;
     private boolean reused;
 
-    public JitllmEngine(Path model, int contextLength, int prefillBatch, boolean deviceSampling) {
+    public JitllmEngine(
+            Path model,
+            int contextLength,
+            int prefillBatch,
+            boolean deviceSampling,
+            boolean nativeLibraries) {
         this.model = model;
         this.contextLength = contextLength;
         this.prefillBatch = prefillBatch;
         this.deviceSampling = deviceSampling;
+        this.nativeLibraries = nativeLibraries;
     }
 
     /**
@@ -92,6 +99,21 @@ public final class JitllmEngine implements TriageEngine {
      * line, which is belt and braces for exactly this ordering hazard.
      */
     private void arm() {
+        // The native (cuDNN) attention path, and a batch wide enough to hold the whole prompt.
+        //
+        // These two are one setting, and getting either wrong costs an order of magnitude.
+        // jitllm's fast prefill uses cuDNN's fused attention, whose causal mask is only correct
+        // when the query block IS the whole prefix -- so only a chunk starting at position zero
+        // can use it, and every later chunk falls back to a JIT paged-attention kernel. Measured
+        // on a 2048-token prompt: 20,905 tokens a second through the native path against 998
+        // through the fallback, a factor of 21.
+        //
+        // So a prompt longer than the batch is not merely chunked, it is chunked onto a
+        // different and far slower kernel. `jitllm.nativeLibraries` defaults to false, which
+        // makes the fallback the only path there is; this benchmark ran that way for a day and
+        // concluded, wrongly, that jitllm's prefill degrades with prompt length. It does not.
+        // What degrades is a prompt that does not fit in one chunk.
+        System.setProperty("jitllm.nativeLibraries", Boolean.toString(nativeLibraries));
         if (prefillBatch > 1) {
             System.setProperty("jitllm.withPrefillDecode", "true");
             System.setProperty("jitllm.prefillBatchSize", Integer.toString(prefillBatch));
@@ -105,7 +127,8 @@ public final class JitllmEngine implements TriageEngine {
     public void load() throws Exception {
         arm();
         final String key =
-                "jitllm:" + model.toAbsolutePath() + ":" + contextLength + ":" + prefillBatch;
+                "jitllm:" + model.toAbsolutePath() + ":" + contextLength + ":" + prefillBatch
+                        + ":" + nativeLibraries;
         long start = System.nanoTime();
         // Two subtasks opening at once must not both load 1.4 GiB onto an 8 GiB card. One wins the
         // lock and loads; the other waits and finds the model already there.
@@ -186,6 +209,7 @@ public final class JitllmEngine implements TriageEngine {
     public String describe() {
         return "jitllm (TornadoVM CUDA, in-process, prefill batch "
                 + prefillBatch
+                + (nativeLibraries ? ", native attention" : ", JIT attention")
                 + (deviceSampling ? ", device sampling" : "")
                 + ")";
     }
@@ -205,9 +229,11 @@ public final class JitllmEngine implements TriageEngine {
     }
 
     /** Releases the resident model, for a run that wants a cold start on purpose. */
-    public static void evict(Path model, int contextLength, int prefillBatch) {
+    public static void evict(
+            Path model, int contextLength, int prefillBatch, boolean nativeLibraries) {
         final String key =
-                "jitllm:" + model.toAbsolutePath() + ":" + contextLength + ":" + prefillBatch;
+                "jitllm:" + model.toAbsolutePath() + ":" + contextLength + ":" + prefillBatch
+                        + ":" + nativeLibraries;
         synchronized (ResidentEngines.lockFor(key)) {
             // A session is closed before its model: the session holds a lease on the KV pool that
             // the model owns, and releasing them the other way round leaks the lease.

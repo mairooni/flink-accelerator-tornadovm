@@ -417,10 +417,13 @@ public final class TelemetryTriage {
         public int parallelism = 1;
         public int maxAccelParallelism = 0;
         public int contextLength = 4096;
-        public int promptBatch = 256;
+        // Wide enough to hold the whole digest prompt in one chunk. A prompt that spills
+        // into a second chunk leaves jitllm's native attention path; see JitllmEngine.
+        public int promptBatch = 2048;
         public int maxNewTokens = 256;
         public int port = 18080;
         public boolean deviceSampling = false;
+        public boolean nativeLibraries = true;
         public boolean cold = false;
         public boolean generate = false;
         public boolean explain = false;
@@ -448,6 +451,7 @@ public final class TelemetryTriage {
                     case "--max-new-tokens" -> a.maxNewTokens = Integer.parseInt(argv[++i]);
                     case "--port" -> a.port = Integer.parseInt(argv[++i]);
                     case "--device-sampling" -> a.deviceSampling = Boolean.parseBoolean(argv[++i]);
+                    case "--native" -> a.nativeLibraries = Boolean.parseBoolean(argv[++i]);
                     case "--cold" -> a.cold = true;
                     case "--generate" -> a.generate = true;
                     case "--explain" -> a.explain = true;

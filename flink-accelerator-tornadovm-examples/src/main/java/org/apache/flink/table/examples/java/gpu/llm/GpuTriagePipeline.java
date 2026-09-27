@@ -57,6 +57,7 @@ public final class GpuTriagePipeline {
                         parsed.maxNewTokens,
                         parsed.port,
                         parsed.deviceSampling,
-                        parsed.cold));
+                        parsed.cold,
+                        parsed.nativeLibraries));
     }
 }

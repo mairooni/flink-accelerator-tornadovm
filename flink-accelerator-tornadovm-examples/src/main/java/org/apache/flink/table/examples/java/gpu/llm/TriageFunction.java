@@ -64,6 +64,7 @@ public final class TriageFunction extends ScalarFunction {
     private final int port;
     private final boolean deviceSampling;
     private final boolean cold;
+    private final boolean nativeLibraries;
 
     private transient TriageEngine engine;
     private transient long loadNanos;
@@ -79,7 +80,8 @@ public final class TriageFunction extends ScalarFunction {
             int maxNewTokens,
             int port,
             boolean deviceSampling,
-            boolean cold) {
+            boolean cold,
+            boolean nativeLibraries) {
         this.engineKind = engineKind;
         this.modelPath = modelPath;
         this.binaryPath = binaryPath;
@@ -90,6 +92,7 @@ public final class TriageFunction extends ScalarFunction {
         this.port = port;
         this.deviceSampling = deviceSampling;
         this.cold = cold;
+        this.nativeLibraries = nativeLibraries;
     }
 
     @Override
@@ -98,7 +101,7 @@ public final class TriageFunction extends ScalarFunction {
             // A cold run on purpose: drop whatever an earlier job left resident, so that the load
             // column measures a first query on a fresh TaskManager rather than a second one.
             if ("jitllm".equals(engineKind)) {
-                JitllmEngine.evict(Path.of(modelPath), contextLength, promptBatch);
+                JitllmEngine.evict(Path.of(modelPath), contextLength, promptBatch, nativeLibraries);
             } else {
                 LlamaCppEngine.evict(Path.of(modelPath), contextLength, port);
             }
@@ -106,7 +109,11 @@ public final class TriageFunction extends ScalarFunction {
         engine =
                 "jitllm".equals(engineKind)
                         ? new JitllmEngine(
-                                Path.of(modelPath), contextLength, promptBatch, deviceSampling)
+                                Path.of(modelPath),
+                                contextLength,
+                                promptBatch,
+                                deviceSampling,
+                                nativeLibraries)
                         : new LlamaCppEngine(
                                 Path.of(binaryPath),
                                 Path.of(modelPath),
