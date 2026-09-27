@@ -688,7 +688,7 @@ all, since the TaskManager decides and a green run proves nothing:
 
 | segment | ms | share |
 |---|---:|---:|
-| gather | 0.000 | 0.0% — tier1 columnar bulk |
+| gather | *not timed* | staged per row, outside this breakdown |
 | copy-in | 27.0 | 40.2% |
 | kernel | 27.1 | 40.4% |
 | drain | 13.0 | 19.4% |
@@ -697,6 +697,16 @@ all, since the TaskManager decides and a green run proves nothing:
 | compile | 4.4 | once per task |
 
 31 batches, 8,000,000 rows in, 2,908 out, 310 MiB in and 93 MiB out.
+
+**The `gather` row is not a measurement.** `GpuCalcOperator` passes a hardcoded zero for it, as
+every production operator does — only `GeneratedKernelSweep`, a standalone micro-benchmark, times
+the staging — and the row-to-column conversion runs in `processElement` and `flush()`, before the
+drain timer starts. So the breakdown above covers the device work and not the staging that feeds
+it, and the operator's real cost is higher than the 81.9 ms of `execute()` wall. The staging may
+well be cheap on the tier-1 bulk columnar path all five columns took; this does not show it.
+Reading that zero as "the gather is free" is a mistake this record made once and should not make
+again: the report prints `untimed` where it means untimed, and `0.000` where nobody set the
+field.
 `Accelerated on this TaskManager: provider tornadovm claims 15.15x over CPU`; measured end to end
 it is 9.2x, the difference being the Parquet scan, which neither arm can offload.
 
