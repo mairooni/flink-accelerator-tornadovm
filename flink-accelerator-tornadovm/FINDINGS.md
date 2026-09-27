@@ -662,10 +662,10 @@ is inside the number above.
 |---|---:|---:|
 | preprocessing (job execution) | 0.92 s | 8.44 s |
 | inference (prefill + decode) | 2.21 s | 1.83 s |
-| client, planning and scheduling | 3.72 s | 3.81 s |
+| client, planning and scheduling | 3.716 s | 3.811 s |
 | **total** | **6.84 s** | **14.08 s** |
 
-The third row is the residual — everything neither measurement covers — and it comes out 90 ms
+The third row is the residual — everything neither measurement covers — and it comes out 95 ms
 apart on two independently measured runs of 6.8 and 14.1 seconds. That agreement is the check on
 the decomposition.
 
@@ -678,7 +678,7 @@ after one discarded JIT warm-up:
 
 | | GPU | CPU | speedup |
 |---|---:|---:|---:|
-| job execution | 870 – 1001 ms (median 919) | 8354 – 8617 ms (median 8440) | **9.2x** |
+| job execution | 870 – 1001 ms (median 919) | 8354 – 8586 ms (median 8440) | **9.2x** |
 
 Every run of both arms returned `+I[48, 2908, 1128, 192.59903094408028]` — identical to the last
 bit, which is what the exactly-rounded score is for.
