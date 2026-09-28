@@ -143,7 +143,8 @@ public final class LlamaCppEngine implements TriageEngine {
         try {
             HttpResponse<String> response =
                     http.send(
-                            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/health"))
+                            HttpRequest.newBuilder(
+                                            URI.create("http://127.0.0.1:" + port + "/health"))
                                     .timeout(Duration.ofSeconds(2))
                                     .GET()
                                     .build(),
@@ -201,7 +202,9 @@ public final class LlamaCppEngine implements TriageEngine {
                 http.send(
                         HttpRequest.newBuilder(
                                         URI.create(
-                                                "http://127.0.0.1:" + port + "/v1/chat/completions"))
+                                                "http://127.0.0.1:"
+                                                        + port
+                                                        + "/v1/chat/completions"))
                                 .timeout(Duration.ofMinutes(10))
                                 .header("Content-Type", "application/json")
                                 .POST(HttpRequest.BodyPublishers.ofString(body))
@@ -227,9 +230,9 @@ public final class LlamaCppEngine implements TriageEngine {
      *
      * <p>Taking the last match rather than the first, because a response may carry more than one
      * {@code content} -- a reasoning block before the answer, or an echoed message -- and the
-     * assistant's text is the last of them. This is the one place a real JSON parser would earn
-     * its dependency; the example jars here carry only their own classes, so the shape is pinned
-     * here and the assumption written down rather than left to be discovered.
+     * assistant's text is the last of them. This is the one place a real JSON parser would earn its
+     * dependency; the example jars here carry only their own classes, so the shape is pinned here
+     * and the assumption written down rather than left to be discovered.
      */
     private static String lastContent(String json) {
         Matcher m = CONTENT.matcher(json);
@@ -302,7 +305,9 @@ public final class LlamaCppEngine implements TriageEngine {
         return "llama.cpp llama-server (CUDA, out of process, -ngl 99, batch " + promptBatch + ")";
     }
 
-    /** Drops this job's client and leaves the server running, for the same reason jitllm's stays. */
+    /**
+     * Drops this job's client and leaves the server running, for the same reason jitllm's stays.
+     */
     @Override
     public void close() {
         http = null;

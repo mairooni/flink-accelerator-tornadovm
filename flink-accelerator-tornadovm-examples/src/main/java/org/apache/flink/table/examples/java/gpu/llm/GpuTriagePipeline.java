@@ -21,10 +21,10 @@ package org.apache.flink.table.examples.java.gpu.llm;
 /**
  * Arm A: score the telemetry on the GPU, then write the note on the same GPU, in the same JVM.
  *
- * <p>Both halves of the pipeline run on the device, and neither of them leaves the TaskManager.
- * The offloaded {@code Calc} produces the anomalies; TornadoVM's runtime is already initialised
- * and its CUDA context already current when jitllm loads the model into it; the digest reaches the
- * model as a Java string. There is no second process, no socket and no second copy of anything.
+ * <p>Both halves of the pipeline run on the device, and neither of them leaves the TaskManager. The
+ * offloaded {@code Calc} produces the anomalies; TornadoVM's runtime is already initialised and its
+ * CUDA context already current when jitllm loads the model into it; the digest reaches the model as
+ * a Java string. There is no second process, no socket and no second copy of anything.
  *
  * <p>The comparison this is half of is {@link CpuTriagePipeline}, which runs the identical SQL
  * without the accelerator and reaches llama.cpp over HTTP. The two differ in the two things being

@@ -103,13 +103,8 @@ public final class TelemetryTriage {
         final String dp = "((pressure - " + (100.0 + mode * 0.8) + ") / 1.8)";
         final String da = "((amps - " + (3.6 + mode * 0.3) + ") / 0.35)";
         final String st = "((temp - pressure * 0.2) / 4.0)";
-        return "("
-                + dt + " * " + dt
-                + " + " + dv + " * " + dv
-                + " + " + dp + " * " + dp
-                + " + " + da + " * " + da
-                + " + " + st + " * " + st
-                + ")";
+        return "(" + dt + " * " + dt + " + " + dv + " * " + dv + " + " + dp + " * " + dp + " + "
+                + da + " * " + da + " + " + st + " * " + st + ")";
     }
 
     /** The smallest deviation across the modes; more modes is more arithmetic on the same read. */
@@ -184,7 +179,6 @@ public final class TelemetryTriage {
                 + where(args).stripLeading()
                 + "GROUP BY machine_id";
     }
-
 
     /**
      * The screen, or nothing.
@@ -444,8 +438,8 @@ public final class TelemetryTriage {
                     case "--modes" -> a.modes = Integer.parseInt(argv[++i]);
                     case "--threshold" -> a.threshold = argv[++i];
                     case "--parallelism" -> a.parallelism = Integer.parseInt(argv[++i]);
-                    case "--accel-parallelism" -> a.maxAccelParallelism =
-                            Integer.parseInt(argv[++i]);
+                    case "--accel-parallelism" ->
+                            a.maxAccelParallelism = Integer.parseInt(argv[++i]);
                     case "--context" -> a.contextLength = Integer.parseInt(argv[++i]);
                     case "--prompt-batch" -> a.promptBatch = Integer.parseInt(argv[++i]);
                     case "--max-new-tokens" -> a.maxNewTokens = Integer.parseInt(argv[++i]);
@@ -470,8 +464,17 @@ public final class TelemetryTriage {
                     Locale.ROOT,
                     "arm=%s  data=%s  rows=%,d  machines=%d  modes=%d  threshold=%s%n"
                             + "model=%s  context=%d  prompt-batch=%d  max-new-tokens=%d  cold=%s%n",
-                    arm, data, rows, machines, modes, threshold,
-                    model, contextLength, promptBatch, maxNewTokens, cold);
+                    arm,
+                    data,
+                    rows,
+                    machines,
+                    modes,
+                    threshold,
+                    model,
+                    contextLength,
+                    promptBatch,
+                    maxNewTokens,
+                    cold);
         }
     }
 }

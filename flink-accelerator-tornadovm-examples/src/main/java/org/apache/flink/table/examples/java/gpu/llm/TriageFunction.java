@@ -143,11 +143,7 @@ public final class TriageFunction extends ScalarFunction {
         try {
             TriageEngine.Completion completion = engine.generate(prompt, maxNewTokens);
             return TelemetryTriage.report(
-                            engine.describe(),
-                            reused,
-                            loadNanos,
-                            prompt.length(),
-                            completion)
+                            engine.describe(), reused, loadNanos, prompt.length(), completion)
                     + completion.text;
         } catch (Exception e) {
             throw new RuntimeException("inference failed", e);

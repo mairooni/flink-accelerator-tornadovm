@@ -127,8 +127,14 @@ public final class JitllmEngine implements TriageEngine {
     public void load() throws Exception {
         arm();
         final String key =
-                "jitllm:" + model.toAbsolutePath() + ":" + contextLength + ":" + prefillBatch
-                        + ":" + nativeLibraries;
+                "jitllm:"
+                        + model.toAbsolutePath()
+                        + ":"
+                        + contextLength
+                        + ":"
+                        + prefillBatch
+                        + ":"
+                        + nativeLibraries;
         long start = System.nanoTime();
         // Two subtasks opening at once must not both load 1.4 GiB onto an 8 GiB card. One wins the
         // lock and loads; the other waits and finds the model already there.
@@ -232,8 +238,14 @@ public final class JitllmEngine implements TriageEngine {
     public static void evict(
             Path model, int contextLength, int prefillBatch, boolean nativeLibraries) {
         final String key =
-                "jitllm:" + model.toAbsolutePath() + ":" + contextLength + ":" + prefillBatch
-                        + ":" + nativeLibraries;
+                "jitllm:"
+                        + model.toAbsolutePath()
+                        + ":"
+                        + contextLength
+                        + ":"
+                        + prefillBatch
+                        + ":"
+                        + nativeLibraries;
         synchronized (ResidentEngines.lockFor(key)) {
             // A session is closed before its model: the session holds a lease on the KV pool that
             // the model owns, and releasing them the other way round leaks the lease.
