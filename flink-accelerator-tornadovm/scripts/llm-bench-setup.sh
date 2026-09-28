@@ -102,8 +102,25 @@ fi
 # 1. TornadoVM. Installs tornado-* into ~/.m2 and builds the SDK the cluster runs on.
 # ---------------------------------------------------------------------------------------
 if (( do_tornadovm )); then
-    say "building TornadoVM (CUDA backend) -- several minutes"
-    ( cd "$TORNADOVM_SRC" && make BACKEND=cuda )
+    # `make BACKEND=cuda` runs `mvn clean install`: it deletes dist/ before it builds,
+    # so a build that fails leaves no SDK at all and every demo stops working. On a
+    # machine whose toolchain cannot complete that build -- gcc newer than nvcc
+    # supports, a CUDA install without nvrtc.h -- this turns a working setup into a
+    # broken one, and it has. So a usable SDK is never overwritten without being asked.
+    existing="$(ls -d "$TORNADOVM_SRC"/dist/*/*/ 2>/dev/null | head -1)"
+    if [[ -n "$existing" && -f "${existing}tornado-argfile" && -f "${existing}lib/libtornado-cudf.so" && -z "${FORCE_TORNADOVM:-}" ]]; then
+        say "a usable TornadoVM SDK is already built -- keeping it"
+        say "  rebuild deliberately with FORCE_TORNADOVM=1, or run $TORNADOVM_SRC/rebuild-for-demos.sh"
+    else
+        say "building TornadoVM (CUDA backend) -- several minutes"
+        if [[ -x "$TORNADOVM_SRC/rebuild-for-demos.sh" ]]; then
+            # Knows which modules this machine cannot build, and writes the argfile a
+            # plain maven build leaves out.
+            ( cd "$TORNADOVM_SRC" && ./rebuild-for-demos.sh )
+        else
+            ( cd "$TORNADOVM_SRC" && make BACKEND=cuda )
+        fi
+    fi
 fi
 TORNADOVM_HOME="$(ls -d "$TORNADOVM_SRC"/dist/*/*/ 2>/dev/null | head -1)"
 [[ -n "$TORNADOVM_HOME" && -f "$TORNADOVM_HOME/tornado-argfile" ]] \
