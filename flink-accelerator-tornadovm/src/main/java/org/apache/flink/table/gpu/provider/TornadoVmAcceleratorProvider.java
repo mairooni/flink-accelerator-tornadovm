@@ -121,8 +121,23 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      */
     private static final boolean CUDF_AVAILABLE = probeCudf();
 
+    /**
+     * Turns the cuDF binding off without uninstalling it.
+     *
+     * <p>A deployment switch rather than a query one, and it exists to make the difference the
+     * library makes visible: the same SQL, the same jar, the same device, with the relational
+     * operators either served by cuDF or left to Flink. Without it the only way to run that
+     * comparison is to break {@code LD_LIBRARY_PATH}, which is indistinguishable from a
+     * misconfigured cluster and produces the same silent CPU fallback.
+     */
+    private static final String DISABLE_CUDF = "flink.accelerator.tornadovm.disableCudf";
+
     private static boolean probeCudf() {
         if (UNAVAILABLE != null) {
+            return false;
+        }
+        if (Boolean.getBoolean(DISABLE_CUDF)) {
+            LOG.info("cuDF is installed but {} is set, so the binding is off", DISABLE_CUDF);
             return false;
         }
         try {

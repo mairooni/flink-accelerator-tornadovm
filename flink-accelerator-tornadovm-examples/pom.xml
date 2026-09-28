@@ -83,6 +83,12 @@ under the License.
 			<version>${tornado.version}</version>
 			<scope>provided</scope>
 		</dependency>
+			<dependency>
+			<groupId>io.github.beehive-lab</groupId>
+			<artifactId>tornado-cudf</artifactId>
+			<version>${tornado.version}</version>
+			<scope>provided</scope>
+		</dependency>
 		<!--
 			jitllm is compiled against but never packaged. It is deployed into the distribution's
 			lib/, the same way the provider jar is, which is not a packaging convenience but a
@@ -450,6 +456,24 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/KMeansBenchmark*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
+						<id>KernelAndLibrarySQLExample</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>KernelAndLibrarySQLExample</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.KernelAndLibrarySQLExample</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/KernelAndLibrarySQLExample*</include>
 							</includes>
 						</configuration>
 					</execution>
