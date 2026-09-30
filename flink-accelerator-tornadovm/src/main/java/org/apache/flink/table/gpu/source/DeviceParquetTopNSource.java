@@ -198,21 +198,28 @@ public final class DeviceParquetTopNSource
 
         @Override
         public void handleSplitRequest(int subtask, String hostname) {
-            assign(subtask);
+            assignAll(subtask);
         }
 
+        /**
+         * Hands the reader every split it will get, then says there are no more.
+         *
+         * <p>All of them, not one. {@link DeviceReader} does not call {@code sendSplitRequest} --
+         * it has no reason to ask for work it was given -- so an enumerator that handed out one
+         * split per call left the reader with the first file processed, {@code noMoreSplits} never
+         * signalled, and {@code pollNext} returning NOTHING_AVAILABLE for ever. A single-file table
+         * hid it completely, because the list emptied on the first call and the signal fired.
+         */
         @Override
         public void addReader(int subtask) {
-            assign(subtask);
+            assignAll(subtask);
         }
 
-        private void assign(int subtask) {
-            if (!remaining.isEmpty()) {
+        private void assignAll(int subtask) {
+            while (!remaining.isEmpty()) {
                 context.assignSplit(remaining.remove(0), subtask);
             }
-            if (remaining.isEmpty()) {
-                context.signalNoMoreSplits(subtask);
-            }
+            context.signalNoMoreSplits(subtask);
         }
 
         @Override
