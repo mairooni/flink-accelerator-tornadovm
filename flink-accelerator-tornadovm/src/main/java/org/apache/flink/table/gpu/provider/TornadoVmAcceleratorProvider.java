@@ -453,7 +453,8 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             return Optional.empty();
         }
         GpuSortSpec spec =
-                new GpuSortSpec(sort.sortField(), sort.outputType(), work.estimatedRows());
+                new GpuSortSpec(
+                        sort.sortField(), sort.outputType(), work.estimatedRows(), sort.limit());
 
         // A sort whose input is a projection rather than a leaf is a fused pair, and the whole
         // point of fusing is that the projection's output never leaves the device: the kernel
@@ -465,7 +466,14 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         if (input instanceof AccelInput) {
             return Optional.of(
                     new TornadoPlan(
-                            null, null, spec, sortCost(work, sort.outputType().getFieldCount())));
+                            null,
+                            null,
+                            spec,
+                            sortCost(
+                                    work,
+                                    sort.outputType().getFieldCount(),
+                                    emittedFraction(sort, work),
+                                    keyedRows(sort, work))));
         }
         Optional<GpuKernelSource> kernel =
                 AccelKernelGenerator.generate(input, Integer.toHexString(input.hashCode()));
@@ -498,7 +506,40 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                         kernel.get(),
                         null,
                         spec,
-                        sortCost(work, sort.outputType().getFieldCount())));
+                        sortCost(
+                                work,
+                                sort.outputType().getFieldCount(),
+                                emittedFraction(sort, work),
+                                keyedRows(sort, work))));
+    }
+
+    /**
+     * What fraction of the rows read are emitted: 1.0 unbounded, {@code limit/rows} for a top-N.
+     *
+     * <p>Falls back to 1.0 when the cardinality is unknown, which is the conservative direction --
+     * an unknown input may be no larger than the limit, in which case nothing is saved.
+     */
+    /**
+     * How many rows Flink's sorter keeps ordered, which sets the depth of its comparisons.
+     *
+     * <p>All of them for a plain sort; the limit for a top-N, because {@code SortLimitOperator}
+     * holds a heap of that size rather than ordering the input.
+     */
+    private static double keyedRows(AccelSort sort, AccelWorkProfile work) {
+        long rows = work.estimatedRows();
+        double n = rows > 0 ? rows : 2.0;
+        return sort.isBounded() ? Math.min(n, (double) sort.limit()) : n;
+    }
+
+    private static double emittedFraction(AccelSort sort, AccelWorkProfile work) {
+        if (!sort.isBounded()) {
+            return 1.0;
+        }
+        long rows = work.estimatedRows();
+        if (rows <= 0) {
+            return 1.0;
+        }
+        return Math.min(1.0, (double) sort.limit() / (double) rows);
     }
 
     /**
@@ -513,9 +554,18 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      * point: without it Flink prices a comparison at a nanosecond and refuses a sort whose CPU
      * operator it has just been told takes two seconds.
      */
-    private static AcceleratorCost sortCost(AccelWorkProfile work, int fields) {
-        double comparisons = Math.max(1, work.totalOpsPerRow());
-        double cpuNanosPerRow = comparisons * CPU_NANOS_COMPARISON;
+    private static AcceleratorCost sortCost(
+            AccelWorkProfile work, int fields, double emitted, double keyedRows) {
+        // M8.2. The planner charges an ordering exactly one LESS_THAN, so reading the CPU side
+        // straight out of the work profile said Flink's sorter does one comparison a row. A
+        // comparison sort does log2(n) -- about 23 at eight million -- and a top-N compares
+        // against a heap of the limit, so log2(min(limit, n)), which is smaller and correctly
+        // less flattering to us. Any operations a fused projection brought with it still cost
+        // what they cost; only the ordering's own contribution changes.
+        double charged = Math.max(1, work.totalOpsPerRow());
+        double ordering = Math.log(Math.max(2.0, keyedRows)) / Math.log(2.0);
+        double comparisons = (charged - 1.0) + ordering;
+        double cpuNanosPerRow = comparisons * CPU_NANOS_COMPARISON + CPU_NANOS_SORT_FIELD * fields;
         // Per field rather than per byte, which is the thing this measurement changed. Everything
         // above prices host work as bytes moved, because for a Calc it is: a columnar gather is a
         // bulk copy. A sort's host work is not -- it writes each field into staging on arrival and
@@ -524,7 +574,15 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         //
         // The key out and the permutation back are the only part that really is bytes, and they
         // are eight of them.
-        double gpuNanosPerRow = SORT_NANOS_PER_FIELD * fields + HOST_NANOS_PER_BYTE * 8;
+        //
+        // The two halves are not both paid on every row once a limit is in play. Staging-in is per
+        // input row and unavoidable -- cuDF orders the whole key column either way. Draining-out is
+        // per *emitted* row, and a top-N emits N however many it read. `emitted` is that fraction,
+        // 1.0 for an unbounded sort, and it is the only reason a bounded sort is worth offering
+        // when an unbounded one is not: the drain is the half that dominates.
+        double drainShare = 0.5 * Math.max(0.0, Math.min(1.0, emitted));
+        double gpuNanosPerRow =
+                SORT_NANOS_PER_FIELD * fields * (0.5 + drainShare) + HOST_NANOS_PER_BYTE * 8;
         return new AcceleratorCost(
                 cpuNanosPerRow / gpuNanosPerRow,
                 SORT_FIXED_COST_NANOS,
@@ -975,7 +1033,32 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      * dereference on a tie, and a cache miss, inside an operator that is also serialising every row
      * into managed memory. Pricing it as arithmetic prices the wrong thing.
      */
-    private static final double CPU_NANOS_COMPARISON = 22.1;
+    private static final double CPU_NANOS_COMPARISON = 15.4;
+
+    /**
+     * What Flink's sorter pays per field of the row, per row, independent of the comparisons.
+     *
+     * <p>M8.2, measured 2026-09-30. The constant above was fitted on one point — 4M CSV rows of
+     * three columns — and read as if a sort's cost were comparisons alone. It is not: {@code
+     * SortLimitOperator} serialises every row into managed memory and copies it again on the way
+     * out, so the cost carries a width term exactly as the device side does, and a model without
+     * one is calibrated for the row it was measured on and wrong for every other.
+     *
+     * <p>The two points, both on this host:
+     *
+     * <ul>
+     *   <li>4M CSV rows, 3 fields, one INT key, {@code log2(4M) = 22} -- 1948 ms, 487 ns a row.
+     *   <li>8M Parquet rows, 32 fields, top-N to 1M, {@code log2(1M) = 19.93} -- 15,235 ms, 1900 ns
+     *       a row. Isolated by difference: {@code COUNT(*)} over the same scan is 981 ms and the
+     *       same query with {@code ORDER BY prio LIMIT} is 16,216 ms.
+     * </ul>
+     *
+     * <p>Solving the pair gives 15.4 ns a comparison-row and 49.8 ns a field-row, and reproduces
+     * both to within a nanosecond. <b>It is still a two-point fit</b> and should be treated as
+     * such: it spans 3 to 32 fields and says nothing about a wider row, a multi-key sort, or a
+     * machine that is not this one.
+     */
+    private static final double CPU_NANOS_SORT_FIELD = 49.8;
 
     /**
      * What one field of one row costs this operator on the host, staged in and written back out.
@@ -1220,5 +1303,67 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             }
             return over != null ? over : gram;
         }
+    }
+
+    /**
+     * A source that reads the scan itself, for a top-N directly over a Parquet file.
+     *
+     * <p>Narrow by design. The shape served is an {@link AccelSort} with a limit, one INT32 key,
+     * over an {@link AccelScan} of {@code parquet} whose other columns are FP64 -- the operand
+     * contract the cuDF binding states. Everything else declines, and declining costs nothing:
+     * Flink plans the source it would have planned anyway.
+     *
+     * <p>Answered without touching a device. The claim is that this deployment has libcudf and the
+     * shim, which is a property of the installation rather than of the moment, and the alternative
+     * -- initialising CUDA on the JobManager to find out -- would cost every query a context on a
+     * machine that may have no GPU at all.
+     */
+    @Override
+    public Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>> createScanSource(
+            AccelNode subtree, RowType outputType) {
+        if (!uk.ac.manchester.tornado.cudf.Cudf.isParquetAvailable()) {
+            return Optional.empty();
+        }
+        if (!(subtree instanceof AccelSort)) {
+            return Optional.empty();
+        }
+        final AccelSort sort = (AccelSort) subtree;
+        if (!sort.isBounded() || sort.inputs().size() != 1) {
+            return Optional.empty();
+        }
+        if (!(sort.inputs().get(0) instanceof org.apache.flink.table.accelerator.AccelScan)) {
+            return Optional.empty();
+        }
+        final org.apache.flink.table.accelerator.AccelScan scan =
+                (org.apache.flink.table.accelerator.AccelScan) sort.inputs().get(0);
+        if (!"parquet".equals(scan.format())) {
+            return Optional.empty();
+        }
+        final RowType row = scan.outputType();
+        if (!(row.getTypeAt(sort.sortField())
+                instanceof org.apache.flink.table.types.logical.IntType)) {
+            return Optional.empty();
+        }
+        for (int i = 0; i < row.getFieldCount(); i++) {
+            if (i == sort.sortField()) {
+                continue;
+            }
+            if (!(row.getTypeAt(i) instanceof org.apache.flink.table.types.logical.DoubleType)) {
+                return Optional.empty();
+            }
+        }
+        for (int i = 0; i < row.getFieldCount(); i++) {
+            if (row.getTypeAt(i).isNullable()) {
+                // The read refuses a null rather than reading it as dense; a nullable column is
+                // declined here so the refusal is a planning decision and not a runtime failure.
+                return Optional.empty();
+            }
+        }
+        if (!sort.ascending()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                new org.apache.flink.table.gpu.source.DeviceParquetTopNSource(
+                        scan.paths(), sort.sortField(), sort.limit(), row));
     }
 }
