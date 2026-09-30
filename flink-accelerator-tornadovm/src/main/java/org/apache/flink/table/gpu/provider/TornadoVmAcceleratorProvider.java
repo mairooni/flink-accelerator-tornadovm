@@ -1324,6 +1324,11 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         if (!uk.ac.manchester.tornado.cudf.Cudf.isParquetAvailable()) {
             return Optional.empty();
         }
+        // A local aggregate directly over a scan: read and group in one plan, no kernel involved.
+        if (subtree instanceof org.apache.flink.table.accelerator.AccelAggregate) {
+            return scanAggregateSource(
+                    (org.apache.flink.table.accelerator.AccelAggregate) subtree, outputType);
+        }
         if (!(subtree instanceof AccelSort)) {
             return Optional.empty();
         }
@@ -1365,5 +1370,53 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         return Optional.of(
                 new org.apache.flink.table.gpu.source.DeviceParquetTopNSource(
                         scan.paths(), sort.sortField(), sort.limit(), row));
+    }
+
+    /**
+     * The two-operator region: cuDF reads the file and cuDF groups it, in one execution plan.
+     *
+     * <p>Served without generating anything, which is why this shape is supported and a projection
+     * between the two is not: the grouping key and the summed column are read straight out of the
+     * file, so the region is two library calls and a drain of the group partials.
+     */
+    private Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>>
+            scanAggregateSource(
+                    org.apache.flink.table.accelerator.AccelAggregate aggregate,
+                    RowType outputType) {
+        if (!uk.ac.manchester.tornado.cudf.Cudf.isParquetAvailable()) {
+            return Optional.empty();
+        }
+        if (aggregate.inputs().size() != 1
+                || !(aggregate.inputs().get(0)
+                        instanceof org.apache.flink.table.accelerator.AccelScan)) {
+            return Optional.empty();
+        }
+        final org.apache.flink.table.accelerator.AccelScan scan =
+                (org.apache.flink.table.accelerator.AccelScan) aggregate.inputs().get(0);
+        if (!"parquet".equals(scan.format())) {
+            return Optional.empty();
+        }
+        final int[] grouping = aggregate.grouping();
+        if (grouping.length != 1 || aggregate.calls().size() != 1) {
+            return Optional.empty();
+        }
+        final org.apache.flink.table.accelerator.AccelAggCall call = aggregate.calls().get(0);
+        if (call.function() != org.apache.flink.table.accelerator.AccelAggFunction.SUM) {
+            return Optional.empty();
+        }
+        final RowType row = scan.outputType();
+        final int keyField = grouping[0];
+        final int valueField = call.inputField();
+        if (!(row.getTypeAt(keyField) instanceof org.apache.flink.table.types.logical.IntType)
+                || !(row.getTypeAt(valueField)
+                        instanceof org.apache.flink.table.types.logical.DoubleType)) {
+            return Optional.empty();
+        }
+        if (row.getTypeAt(keyField).isNullable() || row.getTypeAt(valueField).isNullable()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                new org.apache.flink.table.gpu.source.DeviceParquetGroupSumSource(
+                        scan.paths(), keyField, valueField, outputType));
     }
 }
