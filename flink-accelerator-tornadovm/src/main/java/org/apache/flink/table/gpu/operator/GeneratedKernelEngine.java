@@ -718,6 +718,53 @@ public final class GeneratedKernelEngine implements AutoCloseable {
         return generated.compile();
     }
 
+    /**
+     * Compiles a kernel for a caller that drives its own task graph, without an engine around it.
+     *
+     * <p>{@link GeneratedKernel} is package-private and stays that way: it owns a temporary
+     * directory and a class loader, and handing those out is how they get leaked. This returns the
+     * entry point paired with the lifetime it belongs to, so a caller closes one thing.
+     *
+     * <p>For a device source, which reads and computes in one plan and never stages a row on the
+     * host. Compile once per reader, not once per file — each compilation defines a class, and a
+     * class defined per file is a leak the profiler reports as growing metaspace.
+     */
+    public static Compiled compileStandalone(GpuKernelSource kernel) throws Exception {
+        final GeneratedKernel generated = new GeneratedKernel(kernel);
+        try {
+            return new Compiled(generated, generated.compile());
+        } catch (Throwable failed) {
+            generated.close();
+            throw failed;
+        }
+    }
+
+    /** A compiled kernel's entry point and the resources that keep it loadable. */
+    public static final class Compiled implements AutoCloseable {
+        private final GeneratedKernel generated;
+        private final Method entry;
+
+        private Compiled(GeneratedKernel generated, Method entry) {
+            this.generated = generated;
+            this.entry = entry;
+        }
+
+        /**
+         * The generated method, to be named in a {@code TaskGraph.task(id, entry, args)}.
+         *
+         * <p>By {@link Method} and not by a method reference, which is the only way a class that
+         * did not exist when this was written can become a task.
+         */
+        public Method entry() {
+            return entry;
+        }
+
+        @Override
+        public void close() {
+            generated.close();
+        }
+    }
+
     /** Write side of one staged input column. */
     /**
      * A newly allocated staging buffer of the given width.

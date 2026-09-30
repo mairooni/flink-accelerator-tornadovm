@@ -1324,10 +1324,23 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         if (!uk.ac.manchester.tornado.cudf.Cudf.isParquetAvailable()) {
             return Optional.empty();
         }
-        // A local aggregate directly over a scan: read and group in one plan, no kernel involved.
+        // A measurement control, not a query option. Declining every scan here leaves the rest of
+        // the accelerator untouched, which is the only way to time the same query with the device
+        // read and with Flink's, in one session, without rebuilding between the two arms. It is a
+        // property of the deployment and invisible to whoever wrote the SQL.
+        if ("off".equalsIgnoreCase(System.getProperty("flink.accelerator.device-scan", "on"))) {
+            return Optional.empty();
+        }
+        // A local aggregate over a scan, with or without a projection between them.
         if (subtree instanceof org.apache.flink.table.accelerator.AccelAggregate) {
-            return scanAggregateSource(
-                    (org.apache.flink.table.accelerator.AccelAggregate) subtree, outputType);
+            final org.apache.flink.table.accelerator.AccelAggregate aggregate =
+                    (org.apache.flink.table.accelerator.AccelAggregate) subtree;
+            if (aggregate.inputs().size() == 1
+                    && aggregate.inputs().get(0)
+                            instanceof org.apache.flink.table.accelerator.AccelProject) {
+                return scanProjectSumSource(aggregate, outputType);
+            }
+            return scanAggregateSource(aggregate, outputType);
         }
         if (!(subtree instanceof AccelSort)) {
             return Optional.empty();
@@ -1415,8 +1428,85 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         if (row.getTypeAt(keyField).isNullable() || row.getTypeAt(valueField).isNullable()) {
             return Optional.empty();
         }
+        // Through the scan's own column map, not straight to cuDF. Projection pushdown makes the
+        // produced row a subset of the file, so field i of the row is not column i of the file.
+        final int[] columns = scan.projectedFields();
+        if (keyField >= columns.length || valueField >= columns.length) {
+            return Optional.empty();
+        }
         return Optional.of(
                 new org.apache.flink.table.gpu.source.DeviceParquetGroupSumSource(
-                        scan.paths(), keyField, valueField, outputType));
+                        scan.paths(), columns[keyField], columns[valueField], outputType));
+    }
+
+    /**
+     * The three-operator region: cuDF reads, a generated kernel computes, cuDF reduces.
+     *
+     * <p>The shape the previous method's comment said was out of reach. What made it reachable is
+     * that the kernel generator never required its leaf to be an {@code AccelInput} — it requires
+     * only a leaf — so a projection rooted at a scan generates exactly as one rooted at arriving
+     * rows, and the scan beneath it says which file to read.
+     *
+     * <p>Global sums only. A grouped sum over a projection would need {@code cudf::groupby} keyed
+     * on a column the kernel either passes through or computes, which is a further shape and not
+     * this one.
+     */
+    private Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>>
+            scanProjectSumSource(
+                    org.apache.flink.table.accelerator.AccelAggregate aggregate,
+                    RowType outputType) {
+        if (!uk.ac.manchester.tornado.cudf.Cudf.isParquetAvailable()) {
+            return Optional.empty();
+        }
+        final org.apache.flink.table.accelerator.AccelProject project =
+                (org.apache.flink.table.accelerator.AccelProject) aggregate.inputs().get(0);
+        if (project.inputs().size() != 1
+                || !(project.inputs().get(0)
+                        instanceof org.apache.flink.table.accelerator.AccelScan)) {
+            return Optional.empty();
+        }
+        final org.apache.flink.table.accelerator.AccelScan scan =
+                (org.apache.flink.table.accelerator.AccelScan) project.inputs().get(0);
+        if (!"parquet".equals(scan.format())) {
+            return Optional.empty();
+        }
+        if (aggregate.grouping().length != 0 || aggregate.calls().size() != 1) {
+            return Optional.empty();
+        }
+        final org.apache.flink.table.accelerator.AccelAggCall call = aggregate.calls().get(0);
+        if (call.function() != org.apache.flink.table.accelerator.AccelAggFunction.SUM) {
+            return Optional.empty();
+        }
+        final int valueField = call.inputField();
+        final RowType projected = project.outputType();
+        if (valueField >= projected.getFieldCount()
+                || !(projected.getTypeAt(valueField)
+                        instanceof org.apache.flink.table.types.logical.DoubleType)) {
+            return Optional.empty();
+        }
+        // Every column the read produces is dense. The kernel generator can carry validity, but
+        // the read has no way to write it, so a nullable column would be computed over whatever
+        // the allocator left where the null was.
+        final RowType scanRow = scan.outputType();
+        for (int i = 0; i < scanRow.getFieldCount(); i++) {
+            if (scanRow.getTypeAt(i).isNullable()
+                    || !(scanRow.getTypeAt(i)
+                            instanceof org.apache.flink.table.types.logical.DoubleType)) {
+                return Optional.empty();
+            }
+        }
+        // Generated here only to decline early: a projection with no kernel must fail planning,
+        // not the job. The reader generates its own, because the stride is the row count.
+        if (!org.apache.flink.table.gpu.codegen.AccelKernelGenerator.generate(project, "probe", 0, 1)
+                .isPresent()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                new org.apache.flink.table.gpu.source.DeviceParquetProjectSumSource(
+                        scan.paths(),
+                        project,
+                        scan.projectedFields(),
+                        valueField,
+                        outputType));
     }
 }
