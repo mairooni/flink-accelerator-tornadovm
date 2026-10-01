@@ -229,6 +229,22 @@ public final class GpuKernelSource implements Serializable {
      * <p>Non-zero means the kernel takes one {@code DoubleArray in} rather than one array per
      * column, which is what keeps its parameter list from growing with the query's width.
      */
+    /**
+     * The element type of the packed input buffer, or null when the inputs are not packed.
+     *
+     * <p>Derived rather than stored: the generator already refuses a packed buffer whose columns
+     * disagree on a type, so the first staged column's type <em>is</em> the buffer's type, and a
+     * second field holding the same fact could only ever drift from it.
+     */
+    public @javax.annotation.Nullable GpuValueType packedInputType() {
+        return packedInputStride() > 0 && inputTypes().length > 0 ? inputTypes()[0] : null;
+    }
+
+    /** The element type of the packed output buffer, or null when the outputs are not packed. */
+    public @javax.annotation.Nullable GpuValueType packedOutputType() {
+        return packedStride() > 0 && outputTypes().length > 0 ? outputTypes()[0] : null;
+    }
+
     public int packedInputStride() {
         return packedInputStride;
     }

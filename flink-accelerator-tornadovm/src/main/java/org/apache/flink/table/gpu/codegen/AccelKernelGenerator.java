@@ -220,6 +220,10 @@ public final class AccelKernelGenerator {
             if (!isDoubleResult(expression.outputType())) {
                 return Optional.empty();
             }
+            if (expression.outputType().getTypeRoot() == LogicalTypeRoot.FLOAT
+                    && !rendersAsFloat(expression)) {
+                return Optional.empty();
+            }
             Rendered rendered = render(expression, inputs, inputTypes);
             if (rendered == null) {
                 return Optional.empty();
@@ -276,19 +280,17 @@ public final class AccelKernelGenerator {
         for (int i = 0; i < inputFields.length; i++) {
             stagedTypes[i] = inputTypes.get(inputFields[i]);
         }
-        if (packedStride > 0) {
-            for (GpuValueType type : outputTypes) {
-                if (type != GpuValueType.DOUBLE) {
-                    return Optional.empty();
-                }
-            }
+        // A packed buffer is one buffer, so it is one element type -- but that type may now be
+        // FLOAT as well as DOUBLE. Mixed widths are still refused: there is nowhere to put the
+        // narrower one that does not silently reinterpret the wider.
+        final GpuValueType packedOut = packedStride > 0 ? uniformType(outputTypes) : null;
+        if (packedStride > 0 && packedOut == null) {
+            return Optional.empty();
         }
-        if (packedInputStride > 0) {
-            for (GpuValueType type : stagedTypes) {
-                if (type != GpuValueType.DOUBLE) {
-                    return Optional.empty();
-                }
-            }
+        final GpuValueType packedIn =
+                packedInputStride > 0 ? uniformType(Arrays.asList(stagedTypes)) : null;
+        if (packedInputStride > 0 && packedIn == null) {
+            return Optional.empty();
         }
         boolean carriesValidity = carriesValidity(NULLABLE_INPUTS.get());
         String source =
@@ -304,6 +306,8 @@ public final class AccelKernelGenerator {
                         renderedCondition,
                         packedStride,
                         packedInputStride,
+                        packedOut,
+                        packedIn,
                         CSE.get().declarations());
         return Optional.of(
                 new GpuKernelSource(
@@ -332,6 +336,8 @@ public final class AccelKernelGenerator {
             @Nullable String condition,
             int packedStride,
             int packedInputStride,
+            @Nullable GpuValueType packedOutType,
+            @Nullable GpuValueType packedInType,
             List<String> subexpressions) {
 
         Set<String> arrayTypes = new TreeSet<>();
@@ -339,10 +345,10 @@ public final class AccelKernelGenerator {
             arrayTypes.add(type.arrayType());
         }
         if (packedInputStride > 0) {
-            arrayTypes.add(GpuValueType.DOUBLE.arrayType());
+            arrayTypes.add(packedInType.arrayType());
         }
         if (packedStride > 0) {
-            arrayTypes.add(GpuValueType.DOUBLE.arrayType());
+            arrayTypes.add(packedOutType.arrayType());
         } else {
             for (GpuValueType type : outputTypes) {
                 arrayTypes.add(type.arrayType());
@@ -365,7 +371,7 @@ public final class AccelKernelGenerator {
 
         List<String> params = new ArrayList<>();
         if (packedInputStride > 0) {
-            params.add("DoubleArray in");
+            params.add(packedInType.arrayType() + " in");
         } else {
             for (Map.Entry<Integer, String> input : inputs.entrySet()) {
                 params.add(
@@ -376,7 +382,7 @@ public final class AccelKernelGenerator {
             }
         }
         if (packedStride > 0) {
-            params.add("DoubleArray out");
+            params.add(packedOutType.arrayType() + " out");
         } else {
             for (int i = 0; i < computed.size(); i++) {
                 params.add(outputTypes.get(i).arrayType() + " out" + i);
@@ -435,8 +441,14 @@ public final class AccelKernelGenerator {
             }
         }
         int column = 0;
-        for (String var : inputs.values()) {
-            sb.append(INDENT).append("    double ").append(var).append(" = ");
+        for (Map.Entry<Integer, String> staged : inputs.entrySet()) {
+            final String var = staged.getValue();
+            // A FLOAT column is read into a float local so that an all-float chain stays float.
+            // Everything else -- DOUBLE, and INT, whose arithmetic the kernel does in double on
+            // purpose -- keeps the double local it has always had.
+            final boolean asFloat = inputTypes.get(staged.getKey()) == GpuValueType.FLOAT;
+            sb.append(INDENT).append(asFloat ? "    float " : "    double ").append(var)
+                    .append(" = ");
             if (packedInputStride > 0) {
                 sb.append("in.get(").append(column * packedInputStride).append(" + i);\n");
             } else {
@@ -837,6 +849,18 @@ public final class AccelKernelGenerator {
             }
             // Double.toString round-trips exactly, so the constant the kernel sees is the constant
             // the planner folded.
+            //
+            // A FLOAT literal is emitted with the f suffix and not merely narrowed. Without it the
+            // constant is a double in Java, which promotes the whole expression around it back to
+            // double -- the kernel would then compute in double and narrow once at the end, which
+            // is exactly the wrong answer this generator used to produce for FLOAT.
+            if (node.outputType().getTypeRoot() == LogicalTypeRoot.FLOAT) {
+                final float f = (float) d;
+                if (!Float.isFinite(f)) {
+                    return null;
+                }
+                return new Rendered(Float.toString(f) + "f", Rendered.ALWAYS);
+            }
             return new Rendered(Double.toString(d), Rendered.ALWAYS);
         }
         AccelCall call = (AccelCall) node;
@@ -880,15 +904,24 @@ public final class AccelKernelGenerator {
         for (Rendered r : operands) {
             values.add(r.value);
         }
+        // SQL widens a FLOAT operand to DOUBLE at the operator, then applies it. Java would
+        // multiply two floats in float and widen the product afterwards, which rounds once in the
+        // wrong place. Casting here puts the promotion where SQL puts it.
+        if (call.outputType().getTypeRoot() != LogicalTypeRoot.FLOAT
+                && !isBooleanResult(call.outputType())) {
+            for (int i = 0; i < call.operands().size() && i < values.size(); i++) {
+                if (call.operands().get(i).outputType().getTypeRoot() == LogicalTypeRoot.FLOAT) {
+                    values.set(i, "((double) " + values.get(i) + ")");
+                }
+            }
+        }
         String rendered = renderCall(call, values);
         if (rendered == null) {
             return null;
         }
         // Every other operator here is strict: absent in, absent out. AND and OR are not, and are
         // handled above, where three-valued logic computes value and validity together.
-        return named(
-                new Rendered(rendered, andValidity(operands)),
-                isBooleanResult(call.outputType()) ? "boolean" : "double");
+        return named(new Rendered(rendered, andValidity(operands)), javaTypeOf(call.outputType()));
     }
 
     /**
@@ -1046,7 +1079,7 @@ public final class AccelKernelGenerator {
             // triples the text on each operand: a twenty-argument LEAST reached 861 MB of source
             // before this, and 18.9 MB once the operands themselves were named but the fold was
             // not. Naming each step makes it one statement per operand. Measured 2026-09-17.
-            folded = CSE.get().name(step, "double");
+            folded = CSE.get().name(step, javaTypeOf(call.outputType()));
         }
         return folded;
     }
@@ -1340,22 +1373,6 @@ public final class AccelKernelGenerator {
     }
 
     /**
-     * Whether this generator will produce a value of this type.
-     *
-     * <p>{@code DOUBLE} only, and {@code FLOAT} deliberately not. This generator evaluates every
-     * expression in double and used to narrow a {@code FLOAT} result once at the end, which is not
-     * what Flink does: Flink evaluates float arithmetic in float and rounds at every step. The two
-     * agree for a single operation — double carries far more than the 2p+2 bits of mantissa that
-     * makes one rounding exact — and diverge for a chain, which is what any expression worth
-     * offloading is. Narrowing at the end was therefore a wrong answer that looked like a
-     * conversion.
-     *
-     * <p>Refusing is the honest position until the generator can emit float arithmetic throughout.
-     * Flink's estimator refuses a {@code FLOAT} result before it gets here (M2.3), so in practice
-     * this is a second line rather than the first; it is here because a provider should not claim a
-     * semantics it does not implement, whoever is asking.
-     */
-    /**
      * Result types a computed column may have.
      *
      * <p>{@code INTEGER} joins {@code DOUBLE} because a grouping key is usually one, and refusing
@@ -1366,9 +1383,82 @@ public final class AccelKernelGenerator {
      *
      * <p>{@code BIGINT} is deliberately absent. It is not exact above 2^53 and a kernel has no way
      * to say so.
+     *
+     * <p>{@code FLOAT} was refused until 2026-10-01, and the reason is worth keeping. This
+     * generator evaluated every expression in double and narrowed a {@code FLOAT} result once at
+     * the end, which is not what Flink does: Flink evaluates float arithmetic in float and rounds
+     * at <em>every</em> step. The two agree for a single operation — a double carries far more
+     * than the 2p+2 bits of mantissa that makes one rounding exact — and diverge for a chain,
+     * which is what any expression worth offloading is. Narrowing at the end was a wrong answer
+     * that looked like a conversion, and refusing was the honest position while it was the only
+     * alternative.
+     *
+     * <p>It is admitted now because the generator emits float arithmetic throughout instead:
+     * {@link #javaTypeOf} types every subexpression from its own declared type, so Java's
+     * promotion reproduces SQL's, and a {@code FLOAT} literal carries the {@code f} suffix rather
+     * than being merely narrowed — without it the constant is a double and promotes the whole
+     * expression around it straight back to where the bug was. {@link #rendersAsFloat} refuses a
+     * subtree that would mix the two.
      */
     private static boolean isDoubleResult(LogicalType type) {
         LogicalTypeRoot root = type.getTypeRoot();
-        return root == LogicalTypeRoot.DOUBLE || root == LogicalTypeRoot.INTEGER;
+        return root == LogicalTypeRoot.DOUBLE
+                || root == LogicalTypeRoot.INTEGER
+                || root == LogicalTypeRoot.FLOAT;
+    }
+
+    /**
+     * The Java type a subexpression of this declared type renders as.
+     *
+     * <p>The IR is already typed by Flink's own promotion rules -- {@code FLOAT * FLOAT} is
+     * {@code FLOAT}, {@code FLOAT * DOUBLE} is {@code DOUBLE} -- so honouring each node's declared
+     * type makes Java's promotion agree with SQL's by construction, rather than by a rule written
+     * here that would have to be kept in step with Calcite's.
+     */
+    /** The single element type of a packed buffer, or null if the columns do not agree on one. */
+    private static @Nullable GpuValueType uniformType(List<GpuValueType> types) {
+        if (types.isEmpty()) {
+            return null;
+        }
+        final GpuValueType first = types.get(0);
+        if (first != GpuValueType.DOUBLE && first != GpuValueType.FLOAT) {
+            return null;
+        }
+        for (GpuValueType type : types) {
+            if (type != first) {
+                return null;
+            }
+        }
+        return first;
+    }
+
+    private static String javaTypeOf(LogicalType type) {
+        if (isBooleanResult(type)) {
+            return "boolean";
+        }
+        return type.getTypeRoot() == LogicalTypeRoot.FLOAT ? "float" : "double";
+    }
+
+    /**
+     * Whether this subtree renders entirely in {@code float}.
+     *
+     * <p>Defence against an IR that is not well typed. A well-typed one cannot produce a
+     * {@code FLOAT} node over a {@code DOUBLE} subexpression, because SQL does not narrow
+     * implicitly -- but if one arrived, the generated source would assign a {@code double} to a
+     * {@code float} and fail to compile at execute time, which is the worst moment to find out.
+     * Declining here makes it a planning decision instead.
+     */
+    private static boolean rendersAsFloat(AccelExpression node) {
+        if (node.outputType().getTypeRoot() != LogicalTypeRoot.FLOAT) {
+            return false;
+        }
+        if (node instanceof AccelCall) {
+            for (AccelExpression operand : ((AccelCall) node).operands()) {
+                if (!rendersAsFloat(operand)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 }

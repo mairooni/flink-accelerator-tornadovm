@@ -552,15 +552,21 @@ class AccelKernelGeneratorTest {
         assertTrue(kernel.source().contains("IntArray c0_in"), kernel.source());
         assertTrue(kernel.source().contains("FloatArray c1_in"), kernel.source());
         assertTrue(kernel.source().contains("DoubleArray c2_in"), kernel.source());
-        // Only the buffers are typed: the arithmetic still happens in double, exactly as it did
-        // when every column was staged as one.
+        // The arithmetic still happens in double here, exactly as it did when every column was
+        // staged as one -- but it is now said explicitly rather than by reading every column into
+        // a double. An INT column keeps its double local, because the kernel does integer
+        // arithmetic in double on purpose. A FLOAT column is read as a float and cast at the
+        // operator, which is where SQL widens it; reading it into a double instead would widen it
+        // one step too early, and reading it as a float without the cast would multiply in float
+        // one step too late.
         assertTrue(kernel.source().contains("double c0 = c0_in.get(i);"), kernel.source());
-        assertTrue(kernel.source().contains("double c1 = c1_in.get(i);"), kernel.source());
+        assertTrue(kernel.source().contains("float c1 = c1_in.get(i);"), kernel.source());
+        assertTrue(kernel.source().contains("((double) c1)"), kernel.source());
     }
 
     @Test
-    @DisplayName("a FLOAT result is refused, not narrowed at the end")
-    void refusesAFloatResult() {
+    @DisplayName("a FLOAT result is computed in float, not computed in double and narrowed")
+    void floatResultIsNotNarrowedAtTheEnd() {
         AccelExpression sum =
                 call(
                         AccelFunction.PLUS,
@@ -568,11 +574,36 @@ class AccelKernelGeneratorTest {
                         col(0, new FloatType(false)),
                         col(1, new FloatType(false)));
 
-        // This used to generate, computing in double and writing `out0.set(i, (float) (...))`.
-        // That is not Flink's float arithmetic: Flink rounds at every step, the kernel rounded
-        // once. For one operation the two agree, which is why the old test passed and looked
-        // right; for a chain they do not. M2.3.
-        assertFalse(tryGenerate(Collections.singletonList(sum), null).isPresent());
+        // This used to be refused outright. Before that it generated, computing in double and
+        // writing `out0.set(i, (float) (...))` -- which is not Flink's float arithmetic: Flink
+        // rounds at every step and the kernel rounded once. For one operation the two agree,
+        // which is why the original test passed and looked right; for a chain they do not, and
+        // on two million inputs they disagree on about one in eight. M2.3.
+        //
+        // Both halves are now asserted: the column is read as a float, so the arithmetic that
+        // follows is float, and no double local appears to widen it back.
+        GpuKernelSource kernel =
+                AccelKernelGenerator.generate(
+                                floatPlan(Collections.singletonList(sum)), "NoNarrow")
+                        .orElseThrow(() -> new AssertionError("a FLOAT result is expressible"));
+        assertTrue(kernel.source().contains("float c0 = c0_in.get(i);"), kernel.source());
+        assertFalse(kernel.source().contains("double c0"), kernel.source());
+    }
+
+    @Test
+    @DisplayName("a FLOAT column inside a DOUBLE expression widens where SQL widens it")
+    void floatOperandOfADoubleCallIsWidenedAtTheOperator() {
+        // SQL casts the FLOAT operand to DOUBLE and then multiplies. Java would multiply two
+        // floats in float and widen the product, rounding once in the wrong place -- so the cast
+        // is emitted explicitly.
+        AccelExpression mixed =
+                call(AccelFunction.TIMES, DOUBLE, col(0, FLOAT32), col(1, FLOAT32));
+        GpuKernelSource kernel =
+                AccelKernelGenerator.generate(
+                                floatPlan(Collections.singletonList(mixed)), "Widen")
+                        .orElseThrow(() -> new AssertionError("expected this to generate"));
+        assertTrue(kernel.source().contains("((double) c0)"), kernel.source());
+        assertTrue(kernel.source().contains("final double t"), kernel.source());
     }
 
     @Test
@@ -597,5 +628,114 @@ class AccelKernelGeneratorTest {
         // IntArray is always used, mask or no mask: since M2.5 the live row count arrives in one.
         assertTrue(source.contains("import uk.ac.manchester.tornado.api.types.arrays.IntArray;"));
         assertFalse(source.contains("FloatArray;"), source);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // FP32. Admitted 2026-10-01; see AccelKernelGenerator#isDoubleResult for why it was not.
+    // ---------------------------------------------------------------------------------------
+
+    private static final LogicalType FLOAT32 = new FloatType(false);
+
+    /** A plan whose staged columns are FLOAT rather than DOUBLE. */
+    private static AccelNode floatPlan(List<AccelExpression> projections) {
+        List<LogicalType> inputFields = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            inputFields.add(FLOAT32);
+        }
+        RowType inputType = RowType.of(inputFields.toArray(new LogicalType[0]));
+        LogicalType[] outputFields = new LogicalType[projections.size()];
+        for (int i = 0; i < projections.size(); i++) {
+            outputFields[i] = projections.get(i).outputType();
+        }
+        return new AccelProject(
+                projections, new AccelInput(inputType), RowType.of(outputFields));
+    }
+
+    @Test
+    @DisplayName("a FLOAT projection generates, and computes in float at every step")
+    void floatArithmeticThroughout() {
+        // (c0 * c1) + 2.0 -- a chain, which is the case where narrowing once at the end diverges
+        // from Flink. Every node declared FLOAT, as Flink types float arithmetic over floats.
+        AccelExpression expr =
+                call(
+                        AccelFunction.PLUS,
+                        FLOAT32,
+                        call(AccelFunction.TIMES, FLOAT32, col(0, FLOAT32), col(1, FLOAT32)),
+                        new AccelLiteral(2.0, FLOAT32));
+
+        Optional<GpuKernelSource> generated =
+                AccelKernelGenerator.generate(
+                        floatPlan(Collections.singletonList(expr)), "F32");
+        assertTrue(generated.isPresent(), "a FLOAT projection is no longer refused");
+        GpuKernelSource kernel = generated.get();
+
+        // The named subexpressions are float, not double. This is the whole point: a double local
+        // would make the chain round once at the end rather than at every step.
+        assertTrue(kernel.source().contains("final float t"), kernel.source());
+        assertFalse(
+                kernel.source().contains("final double t"),
+                "no double may appear in an all-float chain:\n" + kernel.source());
+
+        // The literal carries the f suffix. Without it the constant is a double in Java and
+        // promotes the expression around it straight back to double.
+        assertTrue(kernel.source().contains("2.0f"), kernel.source());
+
+        assertEquals(GpuValueType.FLOAT, kernel.outputTypes()[0]);
+        assertTrue(kernel.source().contains("FloatArray"), kernel.source());
+    }
+
+    @Test
+    @DisplayName("a FLOAT result over a DOUBLE subexpression is refused, not narrowed")
+    void floatOverDoubleIsRefused() {
+        // Not well typed -- SQL does not narrow implicitly -- but if it arrived, generating it
+        // would assign a double to a float and fail to compile at execute time.
+        AccelExpression mixed =
+                call(
+                        AccelFunction.PLUS,
+                        FLOAT32,
+                        call(AccelFunction.TIMES, col(0), col(1)),
+                        new AccelLiteral(2.0, FLOAT32));
+
+        assertFalse(
+                AccelKernelGenerator.generate(
+                                floatPlan(Collections.singletonList(mixed)), "Mixed")
+                        .isPresent(),
+                "a mixed-precision subtree is a planning-time decline");
+    }
+
+    @Test
+    @DisplayName("packed buffers may be FLOAT, and may not mix widths")
+    void packedBuffersCarryTheirElementType() {
+        AccelExpression a = call(AccelFunction.TIMES, FLOAT32, col(0, FLOAT32), col(1, FLOAT32));
+        AccelExpression b = call(AccelFunction.PLUS, FLOAT32, col(0, FLOAT32), col(1, FLOAT32));
+
+        // Packing is what keeps a wide kernel under TornadoVM's argument ceiling, so an FP32
+        // pipeline that cannot pack cannot go wide at all.
+        GpuKernelSource packed =
+                AccelKernelGenerator.generate(floatPlan(Arrays.asList(a, b)), "P", 1024, 1024)
+                        .orElseThrow(() -> new AssertionError("packed FLOAT should generate"));
+        assertTrue(packed.source().contains("FloatArray in"), packed.source());
+        assertTrue(packed.source().contains("FloatArray out"), packed.source());
+        assertEquals(GpuValueType.FLOAT, packed.packedInputType());
+        assertEquals(GpuValueType.FLOAT, packed.packedOutputType());
+
+        // One buffer is one element type: a FLOAT beside a DOUBLE has nowhere to go that does not
+        // silently reinterpret the wider one.
+        AccelExpression wide = call(AccelFunction.TIMES, col(0), col(1));
+        assertFalse(
+                AccelKernelGenerator.generate(
+                                plan(Arrays.asList(a, wide), null), "Mix", 1024, 0)
+                        .isPresent(),
+                "mixed output widths cannot share a packed buffer");
+    }
+
+    @Test
+    @DisplayName("double projections are untouched by the float path")
+    void doubleStillRendersAsDouble() {
+        AccelExpression expr =
+                call(AccelFunction.PLUS, call(AccelFunction.TIMES, col(0), col(1)), lit(2.0));
+        GpuKernelSource kernel = generate(Collections.singletonList(expr), null);
+        assertTrue(kernel.source().contains("final double t"), kernel.source());
+        assertFalse(kernel.source().contains("2.0f"), kernel.source());
     }
 }

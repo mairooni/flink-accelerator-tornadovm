@@ -57,14 +57,32 @@ public final class GpuSortSpec implements Serializable {
      */
     public static final int MAX_FIELDS = 32;
 
+    /** What {@link #limit()} reports when the whole ordering is emitted. */
+    public static final long NO_LIMIT = Long.MAX_VALUE;
+
     private final int sortField;
     private final RowType rowType;
     private final long estimatedRows;
+    private final long limit;
 
+    /** An unbounded sort: every row it held, ordered. */
     public GpuSortSpec(int sortField, RowType rowType, long estimatedRows) {
+        this(sortField, rowType, estimatedRows, NO_LIMIT);
+    }
+
+    /**
+     * A top-N: the same ordering, emitting only the first {@code limit} rows.
+     *
+     * <p>The limit changes the operator's cost, not its kernel. cuDF orders the whole key column
+     * either way -- a partial sort is not what {@code sortedOrder} does -- so what is saved is the
+     * drain, which §T12 measured at 95% of what an offloaded sort costs. That is the whole reason a
+     * bounded sort is worth offering when an unbounded one is not.
+     */
+    public GpuSortSpec(int sortField, RowType rowType, long estimatedRows, long limit) {
         this.sortField = sortField;
         this.rowType = rowType;
         this.estimatedRows = estimatedRows;
+        this.limit = limit;
     }
 
     /** The field to order by. An {@code INT NOT NULL}; see {@link #canHold}. */
@@ -78,6 +96,16 @@ public final class GpuSortSpec implements Serializable {
     }
 
     /** What the planner expected this subtask to see. The operator sizes itself from it. */
+    /** How many ordered rows to emit, or {@link #NO_LIMIT}. */
+    public long limit() {
+        return limit;
+    }
+
+    /** How many rows this will actually emit, given what it expects to read. */
+    public long emittedRows() {
+        return Math.min(limit, estimatedRows <= 0 ? Long.MAX_VALUE : estimatedRows);
+    }
+
     public long estimatedRows() {
         return estimatedRows;
     }

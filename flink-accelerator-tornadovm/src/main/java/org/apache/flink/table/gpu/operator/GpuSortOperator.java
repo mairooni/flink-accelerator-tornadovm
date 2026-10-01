@@ -108,6 +108,20 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
     /** The rows held, key column included; {@link StagedColumns} is shared with the join. */
     private transient StagedColumns rows;
 
+    /**
+     * Whether to time the arrival path. {@code -Dflink.accelerator.tornadovm.timeStaging=true}.
+     *
+     * <p>M9.0: the figure that decides whether device-resident input is worth building. It had been
+     * inferred from the drain's measured cost a field and never measured directly.
+     */
+    private static final boolean STAGE_TIMING =
+            Boolean.getBoolean("flink.accelerator.tornadovm.timeStaging");
+
+    /**
+     * Nanoseconds spent converting arriving rows into staged columns, when {@link #STAGE_TIMING}.
+     */
+    private long stagingNanos;
+
     /** The permutation cuDF writes back. */
     private transient IntArray order;
 
@@ -179,7 +193,17 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
                     spec.estimatedRows(),
                     capacity);
         }
-        rows.stage(row, count++);
+        if (STAGE_TIMING) {
+            // M9.0. Off by default for the reason recordBatch gives -- a clock read a row is not
+            // free -- but at 32 fields a row the staging is about a microsecond and two reads are
+            // some 4% of it, which is worth paying when the question is whether staging is the
+            // whole cost of an offloaded sort.
+            long t0 = System.nanoTime();
+            rows.stage(row, count++);
+            stagingNanos += System.nanoTime() - t0;
+        } else {
+            rows.stage(row, count++);
+        }
     }
 
     @Override
@@ -204,15 +228,20 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
             }
             long executeNanos = System.nanoTime() - start;
             long drainStart = System.nanoTime();
+            // A top-N orders everything and emits the head of it. cuDF has no partial sort, so
+            // nothing about the device work changes -- what changes is the drain, which is most of
+            // what an offloaded sort costs, and which is why a bounded sort is worth taking when an
+            // unbounded one is not.
+            final int emit = (int) Math.min(n, spec.limit());
             if (BLOCK_DRAIN) {
                 // One transpose into a block of binary rows, then a pointer a row. See
                 // StagedColumns.writeBlock: building the rows one at a time is 97 ns each
                 // against 20 ns for the collect that has to happen either way.
                 final int rowBytes = StagedColumns.rowBytes(fields);
-                final MemorySegment block = blockFor(n, rowBytes);
-                rows.writeBlock(block, permutation, n, fields, rowBytes);
+                final MemorySegment block = blockFor(emit, rowBytes);
+                rows.writeBlock(block, permutation, emit, fields, rowBytes);
                 final MemorySegment[] one = new MemorySegment[] {block};
-                for (int i = 0; i < n; i++) {
+                for (int i = 0; i < emit; i++) {
                     // A view, not a copy. Safe because a batch operator's consumer may not hold a
                     // row past the call -- the same object-reuse contract every operator here
                     // already relies on, and the reason outRow is reused above.
@@ -220,7 +249,7 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
                     output.collect(outElement.replace(outRow));
                 }
             } else {
-                for (int i = 0; i < n; i++) {
+                for (int i = 0; i < emit; i++) {
                     outWriter.reset();
                     rows.writeInto(outWriter, 0, permutation[i]);
                     outWriter.complete();
@@ -232,7 +261,17 @@ public class GpuSortOperator extends AbstractStreamOperator<RowData>
             // field on the arrival path and timing it would cost a clock read a row, on the one
             // operator where the row count is the whole partition; the two figures that do get
             // measured -- ordering and draining -- are the two this operator can act on.
-            metrics.recordBatch(n, n, 0L, executeNanos, System.nanoTime() - drainStart, null);
+            metrics.recordBatch(
+                    n, emit, stagingNanos, executeNanos, System.nanoTime() - drainStart, null);
+            if (STAGE_TIMING) {
+                LOG.info(
+                        "M9.0 staging: {} rows x {} fields took {} ms on the arrival path, {} ns a field",
+                        n,
+                        fields,
+                        stagingNanos / 1_000_000,
+                        n == 0 || fields == 0 ? 0 : stagingNanos / ((long) n * fields));
+            }
+            stagingNanos = 0L;
             return;
         }
         sortOnHost();
