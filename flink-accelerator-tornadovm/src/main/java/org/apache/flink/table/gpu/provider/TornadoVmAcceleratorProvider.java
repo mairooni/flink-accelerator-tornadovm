@@ -755,14 +755,9 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                 new TornadoPlan(null, null, null, null, null, spec, gramCost(work, spec)));
     }
 
-    /** The {@code d} features as a projection, which is what the kernel generator takes. */
+    /** The {@code d} features as a projection over arriving rows, for the operator path. */
     private static AccelProject featureProjection(GpuGramSpec spec) {
-        LogicalType[] fields = new LogicalType[spec.featureCount()];
-        for (int i = 0; i < fields.length; i++) {
-            fields[i] = spec.features().get(i).outputType();
-        }
-        return new AccelProject(
-                spec.features(), new AccelInput(spec.inputType()), RowType.of(fields));
+        return spec.featureProjection(new AccelInput(spec.inputType()));
     }
 
     /**
@@ -1338,6 +1333,13 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             if (aggregate.inputs().size() == 1
                     && aggregate.inputs().get(0)
                             instanceof org.apache.flink.table.accelerator.AccelProject) {
+                // A Gram matrix first: it is also Aggregate(Project(Scan)), but with d(d+1)/2
+                // sums the single-sum path would decline it, and it is the shape worth having.
+                final Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>> gram =
+                        scanGramSource(aggregate, outputType);
+                if (gram.isPresent()) {
+                    return gram;
+                }
                 return scanProjectSumSource(aggregate, outputType);
             }
             return scanAggregateSource(aggregate, outputType);
@@ -1437,6 +1439,68 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         return Optional.of(
                 new org.apache.flink.table.gpu.source.DeviceParquetGroupSumSource(
                         scan.paths(), columns[keyField], columns[valueField], outputType));
+    }
+
+    /**
+     * The region whose advantage grows with the query: cuDF reads, a kernel computes {@code d}
+     * features, cuBLAS contracts them, in one plan.
+     *
+     * <p>Everything the operator path already knew how to recognise, handed a file instead of
+     * rows. {@link GpuGramSpec#recognise} inspects the aggregate and its projection and never asks
+     * what the projection reads from, so a scan-rooted region satisfies it unchanged.
+     */
+    private Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>>
+            scanGramSource(
+                    org.apache.flink.table.accelerator.AccelAggregate aggregate,
+                    RowType outputType) {
+        if (!CUBLAS_AVAILABLE) {
+            return Optional.empty();
+        }
+        final GpuGramSpec.Recognition recognised = GpuGramSpec.recognise(aggregate);
+        if (!recognised.recognised()) {
+            return Optional.empty();
+        }
+        final org.apache.flink.table.accelerator.AccelProject project =
+                (org.apache.flink.table.accelerator.AccelProject) aggregate.inputs().get(0);
+        if (project.inputs().size() != 1
+                || !(project.inputs().get(0)
+                        instanceof org.apache.flink.table.accelerator.AccelScan)) {
+            return Optional.empty();
+        }
+        final org.apache.flink.table.accelerator.AccelScan scan =
+                (org.apache.flink.table.accelerator.AccelScan) project.inputs().get(0);
+        if (!"parquet".equals(scan.format())) {
+            return Optional.empty();
+        }
+        final GpuGramSpec spec = recognised.spec();
+        // The read produces dense columns of one width, and that width is the one the contraction
+        // runs at: an FP32 Gram reads FP32 columns, an FP64 one reads FP64. A file whose columns
+        // are the other width is refused by the reader rather than cast, so refusing here makes it
+        // a planning decision instead of a failure inside a running job.
+        final RowType scanRow = scan.outputType();
+        for (int i = 0; i < scanRow.getFieldCount(); i++) {
+            final org.apache.flink.table.types.logical.LogicalTypeRoot root =
+                    scanRow.getTypeAt(i).getTypeRoot();
+            final boolean matches =
+                    spec.isFloat()
+                            ? root == org.apache.flink.table.types.logical.LogicalTypeRoot.FLOAT
+                            : root == org.apache.flink.table.types.logical.LogicalTypeRoot.DOUBLE;
+            if (scanRow.getTypeAt(i).isNullable() || !matches) {
+                return Optional.empty();
+            }
+        }
+        if (!AccelKernelGenerator.generate(spec.featureProjection(scan), "gramProbe", 1, 1)
+                .isPresent()) {
+            LOG.info("declining the Gram region: no kernel for its feature map");
+            return Optional.empty();
+        }
+        LOG.info(
+                "Accelerator reads the source and contracts it: {} features, {}",
+                spec.featureCount(),
+                spec.isFloat() ? "FP32" : "FP64");
+        return Optional.of(
+                new org.apache.flink.table.gpu.source.DeviceParquetGramSource(
+                        scan.paths(), spec, scan, outputType));
     }
 
     /**

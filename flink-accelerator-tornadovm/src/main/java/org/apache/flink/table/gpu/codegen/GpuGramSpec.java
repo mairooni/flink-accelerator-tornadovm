@@ -21,6 +21,7 @@ package org.apache.flink.table.gpu.codegen;
 import org.apache.flink.table.accelerator.AccelAggCall;
 import org.apache.flink.table.accelerator.AccelAggFunction;
 import org.apache.flink.table.accelerator.AccelAggregate;
+import org.apache.flink.table.accelerator.AccelInput;
 import org.apache.flink.table.accelerator.AccelCall;
 import org.apache.flink.table.accelerator.AccelExpression;
 import org.apache.flink.table.accelerator.AccelFunction;
@@ -105,6 +106,33 @@ public final class GpuGramSpec implements Serializable {
         return outputType;
     }
 
+    /**
+     * The {@code d} features as a projection rooted at {@code leaf}, which is what the kernel
+     * generator takes.
+     *
+     * <p>The leaf is a parameter because the same features are generated two ways: rooted at an
+     * {@link AccelInput} for the operator, which is handed rows, and at an {@link
+     * org.apache.flink.table.accelerator.AccelScan} for the source, which is handed a file. The
+     * features themselves are identical; only what they read from differs.
+     */
+    public AccelProject featureProjection(AccelNode leaf) {
+        final LogicalType[] fields = new LogicalType[features.size()];
+        for (int i = 0; i < fields.length; i++) {
+            fields[i] = features.get(i).outputType();
+        }
+        return new AccelProject(features, leaf, RowType.of(fields));
+    }
+
+    /**
+     * Whether this Gram contracts in single precision.
+     *
+     * <p>Read from the sums' declared type, which is the query's own choice, not a setting.
+     */
+    public boolean isFloat() {
+        return outputType.getFieldCount() > 0
+                && outputType.getTypeAt(0).getTypeRoot() == LogicalTypeRoot.FLOAT;
+    }
+
     /** Where entry {@code (i, j)} of the symmetric matrix lands in the output row. */
     public static int triangleIndex(int d, int i, int j) {
         // Rows above i contribute d-0, d-1, ... entries; within row i, column j is at j-i.
@@ -142,8 +170,17 @@ public final class GpuGramSpec implements Serializable {
                 // the operator reads back is not the triangle the query asked for.
                 return Recognition.no("sum " + i + " is not SUM over projected column " + i);
             }
-            if (call.outputType().getTypeRoot() != LogicalTypeRoot.DOUBLE) {
-                return Recognition.no("sum " + i + " is not a DOUBLE");
+            // FLOAT beside DOUBLE. A Gram matrix is the left-hand side of a normal equation and
+            // a narrowed contraction propagates there, so FP64 remains the default and the choice
+            // is the query's: Flink sums a FLOAT column in a FLOAT accumulator, so an FP32 query
+            // is FP32 on both arms and serving it in FP32 changes no arithmetic the query did not
+            // already ask for. Mixed widths across the sums are refused.
+            final LogicalTypeRoot root = call.outputType().getTypeRoot();
+            if (root != LogicalTypeRoot.DOUBLE && root != LogicalTypeRoot.FLOAT) {
+                return Recognition.no("sum " + i + " is neither a DOUBLE nor a FLOAT");
+            }
+            if (root != calls.get(0).outputType().getTypeRoot()) {
+                return Recognition.no("sum " + i + " does not have the width of sum 0");
             }
         }
 
