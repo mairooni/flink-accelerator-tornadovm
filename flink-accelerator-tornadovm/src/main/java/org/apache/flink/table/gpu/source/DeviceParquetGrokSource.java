@@ -290,7 +290,20 @@ public final class DeviceParquetGrokSource
             // not, so until the cause is found the shape that produced it cannot be allowed to
             // run. The region is correct and stable at parallelism 1 (twelve runs, §T56).
             final int parallelism = context.currentParallelism();
-            if (parallelism > 1) {
+            // Overridable only to investigate the fault, never to work around it. A path that
+            // returns a short count without erroring is not something to leave reachable by a
+            // configuration anyone would set on purpose, so the switch says what it is.
+            final boolean unsafe =
+                    Boolean.getBoolean("flink.accelerator.grok.unsafe-parallelism");
+            if (parallelism > 1 && unsafe) {
+                LOG.warn(
+                        "running the grok region at parallelism {} because"
+                                + " flink.accelerator.grok.unsafe-parallelism is set. This path has"
+                                + " been observed to return a short count with no error. Do not"
+                                + " trust the result.",
+                        parallelism);
+            }
+            if (parallelism > 1 && !unsafe) {
                 throw new IllegalStateException(
                         "the grok region is not correct above one subtask and this job has "
                                 + parallelism
