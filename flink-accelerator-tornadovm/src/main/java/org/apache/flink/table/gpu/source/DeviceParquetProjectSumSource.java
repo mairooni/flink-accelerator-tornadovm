@@ -462,6 +462,14 @@ public final class DeviceParquetProjectSumSource
                 kernel.close();
                 kernel = null;
             }
+            // Dropped so the collector can reclaim them. TornadoVM allocates its arrays from an
+            // Arena.ofAuto(), so the off-heap behind them is freed only when the array itself is
+            // collected -- there is no close() to call. Holding the fields past the reader's work
+            // keeps a few hundred megabytes of direct memory alive against the TaskManager's
+            // off-heap budget, which the next job in the same process then does not have.
+            packedIn = null;
+            outputs = null;
+            sum = null;
         }
     }
 }
