@@ -1494,13 +1494,21 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             LOG.info("declining the Gram region: no kernel for its feature map");
             return Optional.empty();
         }
+        // A measurement control, not a query option: the same region with the contraction done by
+        // a kernel instead of a GEMM, so what the library adds can be measured rather than argued
+        // about. Any device-side contraction removes the per-row drain; only a tuned one also
+        // moves less than O(n d^2).
+        final boolean kernelContraction =
+                "kernel".equalsIgnoreCase(
+                        System.getProperty("flink.accelerator.gram.contraction", "cublas"));
         LOG.info(
-                "Accelerator reads the source and contracts it: {} features, {}",
+                "Accelerator reads the source and contracts it: {} features, {}, contraction by {}",
                 spec.featureCount(),
-                spec.isFloat() ? "FP32" : "FP64");
+                spec.isFloat() ? "FP32" : "FP64",
+                kernelContraction ? "kernel" : "cuBLAS");
         return Optional.of(
                 new org.apache.flink.table.gpu.source.DeviceParquetGramSource(
-                        scan.paths(), spec, scan, outputType));
+                        scan.paths(), spec, scan, outputType, kernelContraction));
     }
 
     /**

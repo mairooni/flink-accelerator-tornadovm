@@ -34,6 +34,7 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gpu.codegen.AccelKernelGenerator;
 import org.apache.flink.table.gpu.codegen.GpuGramSpec;
 import org.apache.flink.table.gpu.codegen.GpuKernelSource;
+import org.apache.flink.table.gpu.operator.DeviceGram;
 import org.apache.flink.table.gpu.operator.GeneratedKernelEngine;
 import org.apache.flink.table.types.logical.RowType;
 
@@ -41,6 +42,7 @@ import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.WorkerGrid1D;
+import uk.ac.manchester.tornado.api.WorkerGrid2D;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
@@ -94,9 +96,16 @@ public final class DeviceParquetGramSource
     private final GpuGramSpec spec;
     private final AccelScan scan;
     private final RowType outputType;
+    /** Decided while planning, so it travels with the source instead of being read per subtask. */
+    private final boolean kernelContraction;
 
     public DeviceParquetGramSource(
-            List<String> paths, GpuGramSpec spec, AccelScan scan, RowType outputType) {
+            List<String> paths,
+            GpuGramSpec spec,
+            AccelScan scan,
+            RowType outputType,
+            boolean kernelContraction) {
+        this.kernelContraction = kernelContraction;
         this.paths = new ArrayList<>(paths);
         this.spec = spec;
         this.scan = scan;
@@ -125,7 +134,7 @@ public final class DeviceParquetGramSource
 
     @Override
     public SourceReader<RowData, FileSplit> createReader(SourceReaderContext context) {
-        return new GramReader(spec, scan, outputType, context);
+        return new GramReader(spec, scan, outputType, kernelContraction, context);
     }
 
     @Override
@@ -246,6 +255,7 @@ public final class DeviceParquetGramSource
         private final AccelScan scan;
         private final RowType outputType;
         private final SourceReaderContext context;
+        private final boolean kernelContraction;
         private final ArrayDeque<FileSplit> pending = new ArrayDeque<>();
         private final int d;
         private final boolean fp32;
@@ -259,6 +269,7 @@ public final class DeviceParquetGramSource
         private StringBuilder pathHolder;
         private IntArray unusedKeys;
         private IntArray rowCount;
+        private IntArray dims;
         private Object staged;
         private Object packed;
         private Object gram;
@@ -269,7 +280,9 @@ public final class DeviceParquetGramSource
                 GpuGramSpec spec,
                 AccelScan scan,
                 RowType outputType,
+                boolean kernelContraction,
                 SourceReaderContext context) {
+            this.kernelContraction = kernelContraction;
             this.spec = spec;
             this.scan = scan;
             this.outputType = outputType;
@@ -333,6 +346,7 @@ public final class DeviceParquetGramSource
             pathHolder.setLength(0);
             pathHolder.append(file);
             rowCount.set(0, rows);
+            dims.set(0, rows);
             plan.execute();
             // Accumulated at the width the query declared, not wider. Summing FP32 partials in a
             // double would make this arm more accurate than the CPU arm it is compared against,
@@ -365,6 +379,8 @@ public final class DeviceParquetGramSource
             pathHolder = new StringBuilder();
             unusedKeys = new IntArray(1);
             rowCount = new IntArray(1);
+            dims = new IntArray(2);
+            dims.set(1, d);
             if (fp32) {
                 staged = new FloatArray(rows * stagedFields.length);
                 packed = new FloatArray(rows * d);
@@ -382,6 +398,7 @@ public final class DeviceParquetGramSource
                                     DataTransferMode.EVERY_EXECUTION,
                                     unusedKeys,
                                     rowCount,
+                                    dims,
                                     staged,
                                     packed,
                                     gram);
@@ -412,6 +429,32 @@ public final class DeviceParquetGramSource
             region = region.task("features", kernel.entry(), kernelArgs);
             // C = A'A. A is rows x d held column-major, so its leading dimension is the row count
             // and the transpose costs nothing: cuBLAS reads the buffer the kernel just wrote.
+            // A measurement control, not a query option: the same region with the contraction
+            // done by a kernel instead of a GEMM, so what the library adds can be measured rather
+            // than argued about. Any device-side contraction removes the per-row drain; only a
+            // tuned one also moves less than O(n d^2).
+            if (kernelContraction) {
+                region =
+                        fp32
+                                ? region.task(
+                                        "contract",
+                                        DeviceGram::contractFloat,
+                                        (FloatArray) packed,
+                                        (FloatArray) gram,
+                                        dims)
+                                : region.task(
+                                        "contract",
+                                        DeviceGram::contractDouble,
+                                        (DoubleArray) packed,
+                                        (DoubleArray) gram,
+                                        dims);
+                region = region.transferToHost(DataTransferMode.EVERY_EXECUTION, gram);
+                final GridScheduler ks = new GridScheduler();
+                ks.addWorkerGrid("gram.features", new WorkerGrid1D(rows));
+                ks.addWorkerGrid("gram.contract", new WorkerGrid2D(d, d));
+                plan = new TornadoExecutionPlan(region.snapshot()).withGridScheduler(ks);
+                return;
+            }
             region =
                     fp32
                             ? region.libraryTask(
