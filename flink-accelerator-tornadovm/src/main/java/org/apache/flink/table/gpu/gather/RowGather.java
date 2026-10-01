@@ -106,20 +106,29 @@ public interface RowGather {
             StagingColumn target,
             @Nullable MemorySegment targetSegment) {
         if (sample instanceof ColumnarRowData) {
-            // The bulk path copies a HeapDoubleVector's backing array wholesale into a
-            // double-typed segment, so it has nothing to offer a narrower column; those fall back
-            // to the per-row columnar tier.
+            // The bulk path copies a heap vector's backing array wholesale into a segment of the
+            // same element type, so it serves DOUBLE and FLOAT and has nothing to offer INT, which
+            // the kernel stages as a double. That column falls back to the per-row columnar tier.
             //
             // Measured reachable on 2026-09-26, which this comment previously denied: an 8M-row
             // haversine GROUP BY over a Parquet source reported
             // `tier1-columnar-bulk(100.0% bulk)` for both DOUBLE columns. The INT grouping key
-            // reported `tier1-columnar(per-row; not a DOUBLE column)` in the same run, so the
-            // narrow-column gap is real rather than hypothetical -- it is just not yet shown to
-            // cost enough to justify a second bulk implementation.
-            boolean bulk = BULK_COLUMNAR && targetSegment != null && type == GpuValueType.DOUBLE;
-            return bulk
+            // reported `tier1-columnar(per-row; not a DOUBLE column)` in the same run.
+            //
+            // FLOAT joined DOUBLE on 2026-10-01 (M9.17). It was the same gap as INT's and judged
+            // not to cost enough -- until the generator learned to emit float arithmetic, after
+            // which an FP32 pipeline is FLOAT in every column and would have taken the slow tier
+            // for all of them.
+            boolean bulk =
+                    BULK_COLUMNAR
+                            && targetSegment != null
+                            && (type == GpuValueType.DOUBLE || type == GpuValueType.FLOAT);
+            if (!bulk) {
+                return new ColumnarGather(field, type, target);
+            }
+            return type == GpuValueType.DOUBLE
                     ? new BulkColumnarDoubleGather(field, target, targetSegment)
-                    : new ColumnarGather(field, type, target);
+                    : new BulkColumnarFloatGather(field, target, targetSegment);
         }
         if (sample instanceof BinaryRowData) {
             return new BinaryGather(field, type, target);

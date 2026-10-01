@@ -431,7 +431,15 @@ final class GeneratedKernel implements AutoCloseable {
     }
 
     static java.lang.foreign.MemorySegment segmentOf(Object buffer) {
-        return buffer instanceof DoubleArray doubles ? doubles.getSegment() : null;
+        // getSegment() slices the array header off on both, so a position maps to the same byte
+        // offset in either and the bulk gathers need no per-type adjustment.
+        if (buffer instanceof DoubleArray doubles) {
+            return doubles.getSegment();
+        }
+        if (buffer instanceof FloatArray floats) {
+            return floats.getSegment();
+        }
+        return null;
     }
 
     /**

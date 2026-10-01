@@ -20,7 +20,7 @@ package org.apache.flink.table.gpu.gather;
 
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.columnar.vector.ColumnVector;
-import org.apache.flink.table.data.columnar.vector.heap.HeapDoubleVector;
+import org.apache.flink.table.data.columnar.vector.heap.HeapFloatVector;
 
 import javax.annotation.Nullable;
 
@@ -28,19 +28,19 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /**
- * The bulk columnar gather for a {@code DOUBLE} column. See {@link AbstractBulkColumnarGather}
+ * The bulk columnar gather for a {@code FLOAT} column. See {@link AbstractBulkColumnarGather}
  * for the run tracking, which is where everything subtle lives.
  */
-public final class BulkColumnarDoubleGather extends AbstractBulkColumnarGather {
+public final class BulkColumnarFloatGather extends AbstractBulkColumnarGather {
 
-    public BulkColumnarDoubleGather(
+    public BulkColumnarFloatGather(
             int field, RowGather.StagingColumn target, MemorySegment targetSegment) {
         super(field, target, targetSegment);
     }
 
     @Override
     protected @Nullable ColumnVector copyableVector(ColumnVector column) {
-        return column instanceof HeapDoubleVector vector
+        return column instanceof HeapFloatVector vector
                         && !vector.hasDictionary()
                         && !vector.hasNulls()
                 ? vector
@@ -50,16 +50,16 @@ public final class BulkColumnarDoubleGather extends AbstractBulkColumnarGather {
     @Override
     protected void copyRun(ColumnVector vector, int fromRowId, int position, int length) {
         MemorySegment.copy(
-                ((HeapDoubleVector) vector).vector,
+                ((HeapFloatVector) vector).vector,
                 fromRowId,
                 targetSegment,
-                ValueLayout.JAVA_DOUBLE,
-                (long) position * Double.BYTES,
+                ValueLayout.JAVA_FLOAT,
+                (long) position * Float.BYTES,
                 length);
     }
 
     @Override
     protected double valueAt(RowData row, int field) {
-        return row.getDouble(field);
+        return row.getFloat(field);
     }
 }
