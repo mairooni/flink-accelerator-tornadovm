@@ -190,6 +190,24 @@ under the License.
 						</configuration>
 					</execution>
 					<execution>
+						<id>NearestNeighbourSQLExample</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>NearestNeighbourSQLExample</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.NearestNeighbourSQLExample</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/NearestNeighbourSQLExample*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
 						<id>HaversineBenchmark</id>
 						<phase>package</phase>
 						<goals>

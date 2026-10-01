@@ -1339,7 +1339,15 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             if (aggregate.inputs().size() == 1
                     && aggregate.inputs().get(0)
                             instanceof org.apache.flink.table.accelerator.AccelProject) {
-                // A Gram matrix first: it is also Aggregate(Project(Scan)), but with d(d+1)/2
+                // A nearest neighbour first, because it is the only one of these whose arithmetic
+                // grows faster than its input and therefore the only one where what the device
+                // does can outweigh what it reads.
+                final Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>>
+                        similarity = scanSimilaritySource(aggregate, outputType);
+                if (similarity.isPresent()) {
+                    return similarity;
+                }
+                // A Gram matrix next: it is also Aggregate(Project(Scan)), but with d(d+1)/2
                 // sums the single-sum path would decline it, and it is the shape worth having.
                 final Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>> gram =
                         scanGramSource(aggregate, outputType);
@@ -1391,6 +1399,65 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         return Optional.of(
                 new org.apache.flink.table.gpu.source.DeviceParquetTopNSource(
                         scan.paths(), sort.sortField(), sort.limit(), row));
+    }
+
+    /**
+     * A nearest-neighbour query as one region over two files.
+     *
+     * <p>{@code Aggregate(Project(Join(Scan, Scan)))}, where the projection is an inner product
+     * between a row of each side and the aggregate is a {@code MAX} of it. Recognised here rather
+     * than in the planner for the reason {@link
+     * org.apache.flink.table.gpu.codegen.GpuGramSpec} gives about the Gram matrix: that this shape
+     * is a GEMM is something cuBLAS knows and a device-neutral IR should not.
+     */
+    private Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>>
+            scanSimilaritySource(
+                    org.apache.flink.table.accelerator.AccelAggregate aggregate,
+                    RowType outputType) {
+        final org.apache.flink.table.gpu.codegen.GpuSimilarityJoinSpec.Recognition recognised =
+                org.apache.flink.table.gpu.codegen.GpuSimilarityJoinSpec.recognise(aggregate);
+        if (!recognised.recognised()) {
+            LOG.debug("not a nearest-neighbour region: {}", recognised.reason());
+            return Optional.empty();
+        }
+        final org.apache.flink.table.gpu.codegen.GpuSimilarityJoinSpec spec = recognised.spec();
+        if (spec.width() < org.apache.flink.table.gpu.codegen.GpuSimilarityJoinSpec.MIN_WIDTH) {
+            LOG.info(
+                    "declining the nearest-neighbour region: {} paired columns is below {}, where"
+                            + " a fused kernel matches the GEMM and the device context is not"
+                            + " repaid",
+                    spec.width(),
+                    org.apache.flink.table.gpu.codegen.GpuSimilarityJoinSpec.MIN_WIDTH);
+            return Optional.empty();
+        }
+        final java.util.List<String> corpusPaths =
+                org.apache.flink.table.gpu.source.DeviceParquetSimilaritySource.expand(
+                        recognised.buildScan().paths());
+        if (corpusPaths.size() != 1) {
+            LOG.info(
+                    "declining the nearest-neighbour region: the corpus is {} files and the read"
+                            + " fills one buffer a file",
+                    corpusPaths.size());
+            return Optional.empty();
+        }
+        final org.apache.flink.table.gpu.source.DeviceParquetSimilaritySource.Contraction
+                contraction =
+                        org.apache.flink.table.gpu.source.DeviceParquetSimilaritySource.Contraction
+                                .fromProperty();
+        LOG.info(
+                "Accelerator reads both sides and scores every pair: {} columns, FP32,"
+                        + " contraction by {}",
+                spec.width(),
+                contraction);
+        return Optional.of(
+                new org.apache.flink.table.gpu.source.DeviceParquetSimilaritySource(
+                        recognised.probeScan().paths(),
+                        corpusPaths.get(0),
+                        spec,
+                        recognised.probeScan(),
+                        recognised.buildScan(),
+                        outputType,
+                        contraction));
     }
 
     /**
