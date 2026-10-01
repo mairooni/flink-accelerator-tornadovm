@@ -347,6 +347,7 @@ public final class DeviceParquetGramSource
             pathHolder.append(file);
             rowCount.set(0, rows);
             dims.set(0, rows);
+            dims.set(2, rows);
             plan.execute();
             // Accumulated at the width the query declared, not wider. Summing FP32 partials in a
             // double would make this arm more accurate than the CPU arm it is compared against,
@@ -379,7 +380,7 @@ public final class DeviceParquetGramSource
             pathHolder = new StringBuilder();
             unusedKeys = new IntArray(1);
             rowCount = new IntArray(1);
-            dims = new IntArray(2);
+            dims = new IntArray(3);
             dims.set(1, d);
             if (fp32) {
                 staged = new FloatArray(rows * stagedFields.length);

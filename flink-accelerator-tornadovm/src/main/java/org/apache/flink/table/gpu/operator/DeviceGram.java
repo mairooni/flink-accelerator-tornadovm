@@ -59,11 +59,16 @@ public final class DeviceGram {
     public static void contractFloat(FloatArray packed, FloatArray gram, IntArray dims) {
         final int rows = dims.get(0);
         final int d = dims.get(1);
+        // The stride is the buffer's width, which is not the row count: the operator fills a
+        // batch-sized buffer and the last batch is short, so a partial batch read at a stride of
+        // its own row count reads the wrong column. That produced a different wrong answer per
+        // run, because which rows a short batch held varied.
+        final int stride = dims.get(2);
         for (@Parallel int i = 0; i < d; i++) {
             for (@Parallel int j = 0; j < d; j++) {
                 float acc = 0.0f;
                 for (int r = 0; r < rows; r++) {
-                    acc += packed.get(i * rows + r) * packed.get(j * rows + r);
+                    acc += packed.get(i * stride + r) * packed.get(j * stride + r);
                 }
                 // Column-major, matching what cublasGemm writes, so the drain reads the same way
                 // whichever produced it.
@@ -76,11 +81,16 @@ public final class DeviceGram {
     public static void contractDouble(DoubleArray packed, DoubleArray gram, IntArray dims) {
         final int rows = dims.get(0);
         final int d = dims.get(1);
+        // The stride is the buffer's width, which is not the row count: the operator fills a
+        // batch-sized buffer and the last batch is short, so a partial batch read at a stride of
+        // its own row count reads the wrong column. That produced a different wrong answer per
+        // run, because which rows a short batch held varied.
+        final int stride = dims.get(2);
         for (@Parallel int i = 0; i < d; i++) {
             for (@Parallel int j = 0; j < d; j++) {
                 double acc = 0.0;
                 for (int r = 0; r < rows; r++) {
-                    acc += packed.get(i * rows + r) * packed.get(j * rows + r);
+                    acc += packed.get(i * stride + r) * packed.get(j * stride + r);
                 }
                 gram.set(j * d + i, acc);
             }

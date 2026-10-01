@@ -71,7 +71,7 @@ public class GpuGramOperator extends AbstractStreamOperator<RowData>
     @Override
     public void open() throws Exception {
         super.open();
-        engine = new GpuGramEngine(kernel, spec.featureCount(), batchSize);
+        engine = new GpuGramEngine(kernel, spec.featureCount(), batchSize, spec.kernelContraction());
         engine.open();
         inputFields = kernel.inputFieldIndexes();
         inputTypes = kernel.inputTypes();

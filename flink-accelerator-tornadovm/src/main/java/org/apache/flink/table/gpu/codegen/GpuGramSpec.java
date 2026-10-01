@@ -80,11 +80,37 @@ public final class GpuGramSpec implements Serializable {
     private final List<AccelExpression> features;
     private final RowType inputType;
     private final RowType outputType;
+    private final boolean kernelContraction;
 
     private GpuGramSpec(List<AccelExpression> features, RowType inputType, RowType outputType) {
+        this(features, inputType, outputType, false);
+    }
+
+    private GpuGramSpec(
+            List<AccelExpression> features,
+            RowType inputType,
+            RowType outputType,
+            boolean kernelContraction) {
         this.features = features;
         this.inputType = inputType;
         this.outputType = outputType;
+        this.kernelContraction = kernelContraction;
+    }
+
+    /**
+     * The same Gram, contracted by a kernel rather than by cuBLAS.
+     *
+     * <p>A measurement control and not a query option: it exists so that what the library adds can
+     * be measured instead of assumed. Decided while planning so it travels with the spec, rather
+     * than read per subtask where one cluster could not serve both arms.
+     */
+    public GpuGramSpec withKernelContraction(boolean kernel) {
+        return new GpuGramSpec(features, inputType, outputType, kernel);
+    }
+
+    /** Whether the contraction is a kernel rather than a GEMM. */
+    public boolean kernelContraction() {
+        return kernelContraction;
     }
 
     /** The {@code d} expressions whose Gram matrix this is, in column order. */

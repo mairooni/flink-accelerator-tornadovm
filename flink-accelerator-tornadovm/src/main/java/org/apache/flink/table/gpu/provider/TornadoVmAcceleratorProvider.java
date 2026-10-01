@@ -743,7 +743,13 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             LOG.info("declining the ungrouped aggregate: {}", recognised.reason());
             return Optional.empty();
         }
-        GpuGramSpec spec = recognised.spec();
+        GpuGramSpec spec =
+                recognised
+                        .spec()
+                        .withKernelContraction(
+                                "kernel".equalsIgnoreCase(
+                                        System.getProperty(
+                                                "flink.accelerator.gram.contraction", "cublas")));
         // Generated once here purely to find out whether the feature map is expressible at all;
         // the stride the real kernel is packed at is the batch size, which only the TaskManager's
         // context knows, so the source that actually runs is generated again in createOperator.

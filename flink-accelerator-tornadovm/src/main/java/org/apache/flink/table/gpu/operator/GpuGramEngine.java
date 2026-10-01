@@ -24,6 +24,7 @@ import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.WorkerGrid1D;
+import uk.ac.manchester.tornado.api.WorkerGrid2D;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
@@ -70,6 +71,10 @@ import java.lang.reflect.Method;
  */
 public final class GpuGramEngine implements AutoCloseable {
 
+    private static final org.slf4j.Logger LOG =
+            org.slf4j.LoggerFactory.getLogger(GpuGramEngine.class);
+
+
     private final GpuKernelSource kernel;
     private final int features;
     private final int batchSize;
@@ -110,10 +115,19 @@ public final class GpuGramEngine implements AutoCloseable {
     private long batches;
     private long rowCount;
 
+    private final boolean kernelContraction;
+    private IntArray dims;
+
     public GpuGramEngine(GpuKernelSource kernel, int features, int batchSize) {
+        this(kernel, features, batchSize, false);
+    }
+
+    public GpuGramEngine(
+            GpuKernelSource kernel, int features, int batchSize, boolean kernelContraction) {
         this.kernel = kernel;
         this.features = features;
         this.batchSize = batchSize;
+        this.kernelContraction = kernelContraction;
         this.total = new double[features * features];
     }
 
@@ -126,6 +140,9 @@ public final class GpuGramEngine implements AutoCloseable {
         gram.init(0.0);
         rows = new IntArray(1);
         rows.set(0, batchSize);
+        dims = new IntArray(3);
+        dims.set(1, features);
+        dims.set(2, batchSize);
 
         generated = new GeneratedKernel(kernel);
         entry = generated.compile();
@@ -140,6 +157,21 @@ public final class GpuGramEngine implements AutoCloseable {
     }
 
     private TornadoExecutionPlan buildPlan(int contraction, String name) {
+        if (kernelContraction) {
+            LOG.info(
+                    "Gram contraction by kernel over {} features, {} rows -- no cuBLAS in this plan",
+                    features,
+                    contraction);
+            TaskGraph kernelGraph =
+                    new TaskGraph(name)
+                            .transferToDevice(DataTransferMode.EVERY_EXECUTION, staged, rows, dims)
+                            .task("features", entry, kernelArgs)
+                            .task("contract", DeviceGram::contractDouble, packed, gram, dims)
+                            .transferToHost(DataTransferMode.EVERY_EXECUTION, gram);
+            // No scheduler here: gridOf() installs one over the top of whatever this sets.
+            return new TornadoExecutionPlan(kernelGraph.snapshot());
+        }
+        LOG.info("Gram contraction by cuBLAS over {} features, {} rows", features, contraction);
         TaskGraph graph =
                 new TaskGraph(name)
                         .transferToDevice(DataTransferMode.EVERY_EXECUTION, staged, rows)
@@ -174,6 +206,14 @@ public final class GpuGramEngine implements AutoCloseable {
         WorkerGrid1D worker = new WorkerGrid1D(batchSize);
         GridScheduler scheduler = new GridScheduler();
         scheduler.addWorkerGrid(name + ".features", worker);
+        if (kernelContraction) {
+            // The contraction needs its space stated for the same reason the features do, and it
+            // has to be stated *here*: this builds a fresh scheduler and installs it, so one set
+            // inside buildPlan is overwritten and the task silently loses its grid. That cost a
+            // measurement -- the contraction compiled sequentially and ran 35x slower than the
+            // GEMM, which reads exactly like a slow kernel rather than a missing one.
+            scheduler.addWorkerGrid(name + ".contract", new WorkerGrid2D(features, features));
+        }
         target.withGridScheduler(scheduler);
         return worker;
     }
@@ -186,6 +226,9 @@ public final class GpuGramEngine implements AutoCloseable {
     /** Runs one batch of {@code count} rows and folds its Gram matrix into the total. */
     public void execute(int count) throws Exception {
         rows.set(0, count);
+        if (dims != null) {
+            dims.set(0, count);
+        }
         if (count == batchSize) {
             grid.setGlobalWork(count, 1, 1);
             withKernelLoader(plan);
