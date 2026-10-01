@@ -1339,7 +1339,14 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
             if (aggregate.inputs().size() == 1
                     && aggregate.inputs().get(0)
                             instanceof org.apache.flink.table.accelerator.AccelProject) {
-                // A nearest neighbour first, because it is the only one of these whose arithmetic
+                // A grok region first: it is the only one of these whose input is a string, so no
+                // other recogniser can match it and trying it first costs one type check.
+                final Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>> grok =
+                        scanGrokSource(aggregate, outputType);
+                if (grok.isPresent()) {
+                    return grok;
+                }
+                // A nearest neighbour next, because it is the only one of these whose arithmetic
                 // grows faster than its input and therefore the only one where what the device
                 // does can outweigh what it reads.
                 final Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>>
@@ -1399,6 +1406,44 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         return Optional.of(
                 new org.apache.flink.table.gpu.source.DeviceParquetTopNSource(
                         scan.paths(), sort.sortField(), sort.limit(), row));
+    }
+
+    /**
+     * A multi-pattern regex filter over a string column, counted, as one region.
+     *
+     * <p>Declined below {@link org.apache.flink.table.gpu.codegen.GpuGrokSpec#MIN_PATTERNS}: one
+     * pattern is a few milliseconds of matching under a much larger read, and the end-to-end ratio
+     * there belongs to the reader rather than to the library. The marginal pattern is where the
+     * gap is.
+     */
+    private Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>> scanGrokSource(
+            org.apache.flink.table.accelerator.AccelAggregate aggregate, RowType outputType) {
+        if (!uk.ac.manchester.tornado.cudf.provider.CudfNativeLib.isStringsAvailable()) {
+            return Optional.empty();
+        }
+        final org.apache.flink.table.gpu.codegen.GpuGrokSpec.Recognition recognised =
+                org.apache.flink.table.gpu.codegen.GpuGrokSpec.recognise(aggregate);
+        if (!recognised.recognised()) {
+            LOG.debug("not a grok region: {}", recognised.reason());
+            return Optional.empty();
+        }
+        final org.apache.flink.table.gpu.codegen.GpuGrokSpec spec = recognised.spec();
+        final int patterns = spec.patterns().size();
+        if (patterns < org.apache.flink.table.gpu.codegen.GpuGrokSpec.MIN_PATTERNS
+                || patterns > org.apache.flink.table.gpu.operator.DeviceGrok.MAX_PATTERNS) {
+            LOG.info(
+                    "declining the grok region: {} patterns is outside [{}, {}]",
+                    patterns,
+                    org.apache.flink.table.gpu.codegen.GpuGrokSpec.MIN_PATTERNS,
+                    org.apache.flink.table.gpu.operator.DeviceGrok.MAX_PATTERNS);
+            return Optional.empty();
+        }
+        LOG.info(
+                "Accelerator reads the strings and matches them: {} patterns over one column",
+                patterns);
+        return Optional.of(
+                new org.apache.flink.table.gpu.source.DeviceParquetGrokSource(
+                        recognised.scan().paths(), spec, recognised.scan(), outputType));
     }
 
     /**
