@@ -10,6 +10,13 @@
 : "${DEMO_ROOT:=$HOME/flink-tornadovm-demos}"     # checkouts and datasets live here
 : "${TORNADOVM_SRC:=$DEMO_ROOT/TornadoVM}"
 : "${FLINK_SRC:=$DEMO_ROOT/flink}"
+# These scripts ship inside the provider repository, so when they are run from a
+# clone they already know where it is -- resolve from their own location rather
+# than assuming setup.sh put it under DEMO_ROOT.
+_demos_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "${PROVIDER_SRC:-}" && -d "$(dirname "$_demos_dir")/flink-accelerator-tornadovm/scripts" ]]; then
+    PROVIDER_SRC="$(dirname "$_demos_dir")"
+fi
 : "${PROVIDER_SRC:=$DEMO_ROOT/flink-accelerator-tornadovm}"
 : "${DATA_ROOT:=$DEMO_ROOT/data}"
 : "${RAPIDS_HOME:=$HOME/.local/share/rapids-libcudf}"
