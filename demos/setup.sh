@@ -103,6 +103,16 @@ if [[ $SKIP_TORNADO == 0 ]]; then
         [[ -n "$so" ]] && cp "$so" "$TORNADOVM_HOME/lib/" || true
     done
     "$TORNADOVM_HOME/bin/tornado" --devices | sed -n '1,8p'
+    # A missing cuDF shim is the most expensive silent failure here: the SDK
+    # loads, reports CUDADriver, lists tornado.cudf in --add-modules, and every
+    # cuDF region then declines and returns the right answer on the CPU. The
+    # only symptom is that demo 2 takes 35 s instead of 5 s.
+    if [[ -z "$(find "$TORNADOVM_HOME" -name 'libtornado-cudf.so' -print -quit)" ]]; then
+        demo_die "TornadoVM built without the cuDF shim (no libtornado-cudf.so).
+  CUDF_HOME=${CUDF_HOME:-<unset>} RMM_HOME=${RMM_HOME:-<unset>}
+  Both must be set when bin/compile runs; its cmake step produces nothing
+  without them and still reports success."
+    fi
 fi
 export TORNADOVM_HOME="${TORNADOVM_HOME:-$(ls -d "$TORNADOVM_SRC"/dist/*/*/ | head -1)}"
 TORNADOVM_HOME="${TORNADOVM_HOME%/}"
