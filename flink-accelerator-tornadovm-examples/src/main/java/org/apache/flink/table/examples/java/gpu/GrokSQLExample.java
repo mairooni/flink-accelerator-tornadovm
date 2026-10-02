@@ -107,10 +107,9 @@ public final class GrokSQLExample {
                 .setString(
                         "table.exec.resource.default-parallelism",
                         Integer.toString(parallelism));
-        env.getConfig().getConfiguration().setString("table.exec.disabled-operators", "SortAgg");
-        env.getConfig()
-                .getConfiguration()
-                .setString("table.optimizer.agg-phase-strategy", "TWO_PHASE");
+        // Nothing else. An ungrouped COUNT(*) already plans as a two-phase hash aggregate, so
+        // this shape needs none of the planner hints the nearest-neighbour join example sets --
+        // checked rather than assumed, by running it both ways.
 
         env.executeSql(
                 "CREATE TABLE Logs (\n  line STRING NOT NULL\n) WITH (\n"

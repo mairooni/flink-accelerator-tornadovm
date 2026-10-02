@@ -300,6 +300,14 @@ public final class FeatureGramBenchmark {
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         if (args.offload) {
             tEnv.getConfig().getConfiguration().setString("table.exec.accelerator.enabled", "true");
+            // Without this the Calc is refused -- SIN is a function a device may round
+            // differently from Flink -- and refusing the Calc costs the whole arm: the Gram
+            // matrix is only recognised in a Calc fused into the aggregate, so an unoffloaded
+            // feature map means no GEMM either. The arms disagree in the last bits by
+            // construction and the run already prints the largest disagreement.
+            tEnv.getConfig()
+                    .getConfiguration()
+                    .setString("table.exec.accelerator.approximate-projections", "true");
             // Set either way, which it was not until M5.6. The flag only ever wrote "false" and
             // relied on the default for "true" -- and M4.5 flipped that default to false, so
             // --fuse-aggregate true had silently meant nothing since. The arm it was supposed to

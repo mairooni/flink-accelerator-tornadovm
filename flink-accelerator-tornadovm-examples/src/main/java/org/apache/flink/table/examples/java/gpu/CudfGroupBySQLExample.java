@@ -96,13 +96,16 @@ public final class CudfGroupBySQLExample {
     private static final String DIAMETER = "12742.0";
 
     /** Distinct regions, and so the number of rows the device sends back. */
-    private static final int REGIONS = 1_000;
+    private static final int REGIONS = Integer.getInteger("demo.regions", 1_000);
 
     public static void main(String[] args) throws Exception {
 
         final long rows = args.length > 0 ? Long.parseLong(args[0]) : 4_000_000L;
         final Path data =
-                Paths.get(args.length > 1 ? args[1] : "/tmp/flink-gpu-demo-regions-" + rows);
+                Paths.get(
+                        args.length > 1
+                                ? args[1]
+                                : "/tmp/flink-gpu-demo-regions-" + rows + "-" + REGIONS);
         writePoints(data, rows);
 
         final EnvironmentSettings settings =
@@ -143,9 +146,15 @@ public final class CudfGroupBySQLExample {
         tableEnv.getConfig()
                 .getConfiguration()
                 .setString("table.exec.accelerator.approximate-projections", "true");
+        // FUSE=off is the other half of the same idea: the accelerator stays on, so the
+        // projection still compiles to a kernel and runs on the device, but the GROUP BY is
+        // left to Flink's own hash aggregate. That is the all-JIT arm -- every distance is
+        // computed on the card and then every row is carried back to the host to be grouped,
+        // which is what the library is saving. Not a demo flag either.
+        final boolean fuse = !"off".equals(System.getenv("FUSE"));
         tableEnv.getConfig()
                 .getConfiguration()
-                .setString("table.exec.accelerator.fuse-aggregate", "true");
+                .setString("table.exec.accelerator.fuse-aggregate", Boolean.toString(fuse));
         tableEnv.getConfig()
                 .getConfiguration()
                 .setString("table.exec.resource.default-parallelism", "1");

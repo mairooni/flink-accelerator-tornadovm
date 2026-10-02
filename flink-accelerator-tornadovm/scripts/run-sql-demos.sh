@@ -86,7 +86,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <haversine|cudf-sort|cudf-groupby> [--printKernel] [--printBytecodes]" \
+    echo "usage: $0 <haversine|cudf-sort|cudf-groupby|gram> [--printKernel] [--printBytecodes]" \
          "[--rows N] [--data DIR]" >&2
     exit 1
 }
@@ -97,6 +97,7 @@ case "${DEMO}" in
     haversine)  MAIN=org.apache.flink.table.examples.java.gpu.HaversineSQLExample ;;
     cudf-sort)  MAIN=org.apache.flink.table.examples.java.gpu.CudfSortSQLExample ;;
     cudf-groupby) MAIN=org.apache.flink.table.examples.java.gpu.CudfGroupBySQLExample ;;
+    gram)       MAIN=org.apache.flink.table.examples.java.gpu.GramMatrixSQLExample ;;
     *)          usage ;;
 esac
 
@@ -140,6 +141,13 @@ fi
 # worth catching here rather than in the middle of a demo.
 if ! grep -q 'tornado.drivers.cuda' "${TORNADO_SDK}/tornado-argfile"; then
     echo "${TORNADO_SDK} is not a CUDA build (no tornado.drivers.cuda in its argfile)" >&2
+    exit 1
+fi
+if [[ "${DEMO}" == gram ]] && ! ls "${TORNADO_SDK}"/share/java/tornado/tornado-cublas-*.jar >/dev/null 2>&1; then
+    # Same trap as the cuDF one below: without the binding the provider declines the Gram
+    # matrix, the query runs on the host, and it still prints the right matrix.
+    echo "no tornado-cublas jar in ${TORNADO_SDK}, so ${DEMO} would run on the host and still" \
+         "print the right answer. Rebuild TornadoVM with the cuBLAS module." >&2
     exit 1
 fi
 if [[ "${DEMO}" == cudf-* && ! -f "${TORNADO_SDK}/lib/libtornado-cudf.so" ]]; then
