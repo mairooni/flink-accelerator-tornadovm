@@ -46,10 +46,26 @@ if [[ -z "${CUDA_PATH:-}" ]]; then
     done
 fi
 [[ -n "${CUDA_PATH:-}" ]] || demo_die "no CUDA toolkit found. Set CUDA_PATH."
-HAVE_CUDNN=0
-[[ -f "$CUDA_PATH/include/cudnn.h" || -f "$CUDA_PATH/targets/x86_64-linux/include/cudnn.h" ]] && HAVE_CUDNN=1
-echo "CUDA     $CUDA_PATH  (cudnn: $([[ $HAVE_CUDNN == 1 ]] && echo yes || echo 'no -- LLM prefill will use the JIT path'))"
+echo "CUDA     $CUDA_PATH"
 export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:--allow-unsupported-compiler}"
+
+# The precondition that actually matters is that nvcc accepts this host's C++
+# standard library -- not that any library is installed. cudnn-jni and
+# cutlass-jni compile C++ through nvcc, and a toolkit older than the host GCC
+# fails at cmake's compiler-identification step with errors inside
+# <type_traits> ("identifier \"char8_t\" is undefined" and similar). That reads
+# like a missing dependency and is not one: CUTLASS is fetched by cutlass-jni
+# itself, as a sparse checkout of NVIDIA/cutlass.
+_probe="$(mktemp -d)"; printf '#include <type_traits>\nint main(){return 0;}\n' > "$_probe/p.cu"
+if ! "$CUDA_PATH/bin/nvcc" -std=c++17 -c "$_probe/p.cu" -o "$_probe/p.o" >"$_probe/err" 2>&1; then
+    rm -rf "$_probe"
+    demo_die "nvcc at $CUDA_PATH cannot compile against this host's libstdc++ ($(g++ -dumpversion 2>/dev/null)).
+  cudnn-jni and cutlass-jni will fail at cmake compiler identification, which
+  looks like a missing library and is not one.
+  Use a newer CUDA toolkit, or put a wrapper nvcc that passes
+  -allow-unsupported-compiler first on PATH, and set CUDA_PATH to it."
+fi
+rm -rf "$_probe"
 mkdir -p "$DEMO_ROOT" "$DATA_ROOT"
 
 # ---------------------------------------------------------------------------
@@ -88,20 +104,13 @@ if [[ $SKIP_TORNADO == 0 ]]; then
       # share/java/graalJars and the argfile, none of which a plain `mvn
       # install` produces -- without the argfile every demo reports "no
       # TornadoVM CUDA SDK".
+      # cuda-backend already builds cuda, cudnn-jni, cudf-jni and cutlass-jni,
+      # and cutlass-jni fetches CUTLASS itself (a sparse checkout of
+      # NVIDIA/cutlass); none of the three needs a separate step or a library
+      # installed up front.
       python3 bin/compile --jdk jdk21 --backend cuda
-      # The cuDNN and CUTLASS bindings are their own profile, so that a host
-      # without them still gets the core backend. Build them when we can.
-      if [[ $HAVE_CUDNN == 1 ]]; then
-          ./mvnw -q -Pjdk21,cuda-backend,cuda-libs -Dtornado.backend=cuda -DskipTests \
-                 -pl tornado-drivers/cudnn-jni,tornado-drivers/cutlass-jni install || true
-      fi
     )
     export TORNADOVM_HOME="$(ls -d "$TORNADOVM_SRC"/dist/*/*/ | head -1)"; TORNADOVM_HOME="${TORNADOVM_HOME%/}"
-    # Place the optional native libraries beside the core ones.
-    for m in cudnn cutlass; do
-        so="$(find "$TORNADOVM_SRC/tornado-drivers/$m-jni/target" -name "libtornado-$m.so" 2>/dev/null | head -1)"
-        [[ -n "$so" ]] && cp "$so" "$TORNADOVM_HOME/lib/" || true
-    done
     "$TORNADOVM_HOME/bin/tornado" --devices | sed -n '1,8p'
     # A missing cuDF shim is the most expensive silent failure here: the SDK
     # loads, reports CUDADriver, lists tornado.cudf in --add-modules, and every
