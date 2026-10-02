@@ -121,8 +121,10 @@ public final class HaversineSQLExample {
         }
         final long rows = !positional.isEmpty() ? Long.parseLong(positional.get(0)) : 2_000_000L;
         final Path data =
-                Paths.get(positional.size() > 1 ? positional.get(1)
-                                                : "/tmp/flink-gpu-demo-points-" + rows);
+                Paths.get(
+                        positional.size() > 1
+                                ? positional.get(1)
+                                : "/tmp/flink-gpu-demo-points-" + rows);
         writePoints(data, rows);
 
         // set up the Table API
@@ -150,14 +152,16 @@ public final class HaversineSQLExample {
         //                         offload is declined above it. That default is a live workaround
         //                         for an intermittent CUDA launch failure at higher parallelism on
         //                         one card, not a statement about what accelerators can do.
-        tableEnv.getConfig().getConfiguration()
+        tableEnv.getConfig()
+                .getConfiguration()
                 .setString("table.exec.accelerator.enabled", Boolean.toString(accelerate));
         tableEnv.getConfig()
                 .getConfiguration()
                 .setString("table.exec.accelerator.approximate-projections", "true");
         tableEnv.getConfig()
                 .getConfiguration()
-                .setString("table.exec.resource.default-parallelism", Integer.toString(parallelism));
+                .setString(
+                        "table.exec.resource.default-parallelism", Integer.toString(parallelism));
         // ----------------------------------------------------------------------------------
 
         // NOT NULL is the one thing the query author has to write; see the class comment.
@@ -251,20 +255,31 @@ public final class HaversineSQLExample {
         Files.createDirectories(directory);
         // Seeded, so every run of this example is over exactly the same coordinates.
         final Random random = new Random(20260925L);
-        try (BufferedWriter out = Files.newBufferedWriter(directory.resolve("points.csv"))) {
-            final StringBuilder line = new StringBuilder(48);
-            for (long id = 0; id < rows; id++) {
-                line.setLength(0);
-                line.append(id)
-                        .append(',')
-                        .append(random.nextDouble() * 180.0 - 90.0)
-                        .append(',')
-                        .append(random.nextDouble() * 360.0 - 180.0)
-                        .append('\n');
-                out.write(line.toString());
+        // Sharded, because Flink's filesystem CSV source assigns a whole file to a subtask: a
+        // single points.csv pins the scan to one slot however the job's parallelism is set, and
+        // the CPU arm then measures one core no matter what it is asked for.
+        final StringBuilder line = new StringBuilder(48);
+        for (long written = 0, file = 0; written < rows; file++) {
+            final long upto = Math.min(rows, written + ROWS_PER_FILE);
+            try (BufferedWriter out =
+                    Files.newBufferedWriter(directory.resolve("points-" + file + ".csv"))) {
+                for (long id = written; id < upto; id++) {
+                    line.setLength(0);
+                    line.append(id)
+                            .append(',')
+                            .append(random.nextDouble() * 180.0 - 90.0)
+                            .append(',')
+                            .append(random.nextDouble() * 360.0 - 180.0)
+                            .append('\n');
+                    out.write(line.toString());
+                }
             }
+            written = upto;
         }
     }
+
+    /** One shard per two million points: four files at 8M, sixteen at 32M. */
+    private static final long ROWS_PER_FILE = 2_000_000L;
 
     private HaversineSQLExample() {}
 }

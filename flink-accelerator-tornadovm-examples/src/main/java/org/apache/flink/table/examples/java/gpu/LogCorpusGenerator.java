@@ -41,8 +41,8 @@ import java.util.stream.Stream;
  *        org.apache.flink.table.examples.java.gpu.LogCorpusGenerator /path/to/data 16000000 64000000
  * </pre>
  *
- * <p>One directory per row count — {@code logs16}, {@code logs64} — each holding files of
- * {@value #ROWS_PER_FILE} lines.
+ * <p>One directory per row count — {@code logs16}, {@code logs64} — each holding files of {@value
+ * #ROWS_PER_FILE} lines.
  *
  * <h2>Why fixed-size files rather than one big one</h2>
  *
@@ -52,12 +52,12 @@ import java.util.stream.Stream;
  *
  * <h2>Why CSV first and Parquet by conversion</h2>
  *
- * <p>Flink's own writer is the only Parquet writer on this classpath, and it writes through a
- * table sink. Generating the text in plain Java and converting is both faster and fewer
- * dependencies than the {@code datagen} connector, which costs about 100 microseconds a row.
+ * <p>Flink's own writer is the only Parquet writer on this classpath, and it writes through a table
+ * sink. Generating the text in plain Java and converting is both faster and fewer dependencies than
+ * the {@code datagen} connector, which costs about 100 microseconds a row.
  *
- * <p>Each chunk converts at parallelism 1 so it lands as exactly one file, which is then moved
- * into place under a name the reader sorts predictably.
+ * <p>Each chunk converts at parallelism 1 so it lands as exactly one file, which is then moved into
+ * place under a name the reader sorts predictably.
  */
 public final class LogCorpusGenerator {
 
@@ -90,7 +90,9 @@ public final class LogCorpusGenerator {
         final EnvironmentSettings settings =
                 EnvironmentSettings.newInstance().inBatchMode().build();
         final TableEnvironment env = TableEnvironment.create(settings);
-        env.getConfig().getConfiguration().setString("table.exec.resource.default-parallelism", "1");
+        env.getConfig()
+                .getConfiguration()
+                .setString("table.exec.resource.default-parallelism", "1");
 
         for (int a = 1; a < args.length; a++) {
             final long rows = Long.parseLong(args[a]);
@@ -122,15 +124,25 @@ public final class LogCorpusGenerator {
             final StringBuilder line = new StringBuilder(200);
             for (int i = 0; i < rows; i++) {
                 line.setLength(0);
-                line.append("10.0.").append(random.nextInt(512) / 256).append('.')
-                    .append(random.nextInt(256))
-                    .append(" - - [01/Oct/2026:16:0").append(i % 10).append(":00 +0000] \"")
-                    .append(VERBS[random.nextInt(VERBS.length)]).append(' ')
-                    .append(PATHS[random.nextInt(PATHS.length)]).append(" HTTP/1.1\" ")
-                    .append(STATUSES[random.nextInt(STATUSES.length)]).append(' ')
-                    .append(120 + random.nextInt(89_880)).append(' ')
-                    .append(1 + random.nextInt(4000)).append(" \"-\" \"")
-                    .append(AGENTS[random.nextInt(AGENTS.length)]).append('"');
+                line.append("10.0.")
+                        .append(random.nextInt(512) / 256)
+                        .append('.')
+                        .append(random.nextInt(256))
+                        .append(" - - [01/Oct/2026:16:0")
+                        .append(i % 10)
+                        .append(":00 +0000] \"")
+                        .append(VERBS[random.nextInt(VERBS.length)])
+                        .append(' ')
+                        .append(PATHS[random.nextInt(PATHS.length)])
+                        .append(" HTTP/1.1\" ")
+                        .append(STATUSES[random.nextInt(STATUSES.length)])
+                        .append(' ')
+                        .append(120 + random.nextInt(89_880))
+                        .append(' ')
+                        .append(1 + random.nextInt(4000))
+                        .append(" \"-\" \"")
+                        .append(AGENTS[random.nextInt(AGENTS.length)])
+                        .append('"');
                 w.write(line.toString());
                 w.newLine();
             }
@@ -148,25 +160,35 @@ public final class LogCorpusGenerator {
             files.filter(p -> !p.getFileName().toString().startsWith(".")).forEach(written::add);
             if (written.size() != 1) {
                 throw new IllegalStateException(
-                        "expected one Parquet file from a parallelism-1 insert, got " + written.size());
+                        "expected one Parquet file from a parallelism-1 insert, got "
+                                + written.size());
             }
-            Files.move(written.get(0), into.resolve(String.format("part-%05d.parquet", index)),
+            Files.move(
+                    written.get(0),
+                    into.resolve(String.format("part-%05d.parquet", index)),
                     StandardCopyOption.REPLACE_EXISTING);
         }
         deleteTree(staging);
     }
 
     private static String ddl(String name, Path path, String format) {
-        final StringBuilder ddl = new StringBuilder("CREATE TABLE ").append(name)
-                .append(" (\n  line STRING NOT NULL\n) WITH (\n  'connector' = 'filesystem',\n")
-                .append("  'path' = '").append(path.toAbsolutePath()).append("',\n")
-                .append("  'format' = '").append(format).append("'");
+        final StringBuilder ddl =
+                new StringBuilder("CREATE TABLE ")
+                        .append(name)
+                        .append(
+                                " (\n  line STRING NOT NULL\n) WITH (\n  'connector' = 'filesystem',\n")
+                        .append("  'path' = '")
+                        .append(path.toAbsolutePath())
+                        .append("',\n")
+                        .append("  'format' = '")
+                        .append(format)
+                        .append("'");
         if ("csv".equals(format)) {
             // A log line contains commas and double quotes, so the defaults would split it and
             // then try to unescape it. One column, a delimiter that cannot occur, and no quote
             // character at all: the line survives the round trip exactly as written.
             ddl.append(",\n  'csv.field-delimiter' = U&'\\0001',\n")
-               .append("  'csv.disable-quote-character' = 'true'");
+                    .append("  'csv.disable-quote-character' = 'true'");
         }
         return ddl.append("\n)").toString();
     }
@@ -176,13 +198,15 @@ public final class LogCorpusGenerator {
             return;
         }
         try (Stream<Path> walk = Files.walk(path)) {
-            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
-                try {
-                    Files.delete(p);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-            });
+            walk.sorted(Comparator.reverseOrder())
+                    .forEach(
+                            p -> {
+                                try {
+                                    Files.delete(p);
+                                } catch (IOException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            });
         }
     }
 }

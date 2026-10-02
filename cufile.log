@@ -1,0 +1,24 @@
+ 30-09-2026 17:59:00:186 [pid=2253545 tid=2253862] NOTICE  cufio-drv:727 running in compatible mode
+ 30-09-2026 17:59:01:507 [pid=2253545 tid=2253862] ERROR  cufio-fs:322 error creating udev_device for block device dev_no: 0:50
+ 30-09-2026 17:59:01:508 [pid=2253545 tid=2253862] ERROR  cufio-fs:742 error getting volume attributes error for device: dev_no: 0:50
+ 30-09-2026 17:59:01:508 [pid=2253545 tid=2253862] ERROR  cufio-obj:215 unable to get volume attributes for fd 360
+ 30-09-2026 17:59:01:508 [pid=2253545 tid=2253862] ERROR  cufio:311 cuFileHandleRegister error, failed to allocate file object
+ 30-09-2026 17:59:01:508 [pid=2253545 tid=2253862] ERROR  cufio:339 cuFileHandleRegister error: internal error
+ 01-10-2026 14:25:26:969 [pid=12729 tid=20752] NOTICE  cufio-drv:727 running in compatible mode
+ 01-10-2026 14:25:27:354 [pid=12729 tid=20752] ERROR  cufio-fs:322 error creating udev_device for block device dev_no: 0:50
+ 01-10-2026 14:25:27:354 [pid=12729 tid=20752] ERROR  cufio-fs:742 error getting volume attributes error for device: dev_no: 0:50
+ 01-10-2026 14:25:27:354 [pid=12729 tid=20752] ERROR  cufio-obj:215 unable to get volume attributes for fd 361
+ 01-10-2026 14:25:27:354 [pid=12729 tid=20752] ERROR  cufio:311 cuFileHandleRegister error, failed to allocate file object
+ 01-10-2026 14:25:27:354 [pid=12729 tid=20752] ERROR  cufio:339 cuFileHandleRegister error: internal error
+ 01-10-2026 16:09:24:11 [pid=131899 tid=132490] NOTICE  cufio-drv:727 running in compatible mode
+ 01-10-2026 16:09:24:743 [pid=131899 tid=132490] ERROR  cufio-fs:322 error creating udev_device for block device dev_no: 0:50
+ 01-10-2026 16:09:24:743 [pid=131899 tid=132490] ERROR  cufio-fs:742 error getting volume attributes error for device: dev_no: 0:50
+ 01-10-2026 16:09:24:743 [pid=131899 tid=132490] ERROR  cufio-obj:215 unable to get volume attributes for fd 360
+ 01-10-2026 16:09:24:743 [pid=131899 tid=132490] ERROR  cufio:311 cuFileHandleRegister error, failed to allocate file object
+ 01-10-2026 16:09:24:743 [pid=131899 tid=132490] ERROR  cufio:339 cuFileHandleRegister error: internal error
+ 01-10-2026 21:01:46:772 [pid=281436 tid=281917] NOTICE  cufio-drv:727 running in compatible mode
+ 01-10-2026 21:01:47:153 [pid=281436 tid=281917] ERROR  cufio-fs:322 error creating udev_device for block device dev_no: 0:50
+ 01-10-2026 21:01:47:153 [pid=281436 tid=281917] ERROR  cufio-fs:742 error getting volume attributes error for device: dev_no: 0:50
+ 01-10-2026 21:01:47:153 [pid=281436 tid=281917] ERROR  cufio-obj:215 unable to get volume attributes for fd 360
+ 01-10-2026 21:01:47:153 [pid=281436 tid=281917] ERROR  cufio:311 cuFileHandleRegister error, failed to allocate file object
+ 01-10-2026 21:01:47:153 [pid=281436 tid=281917] ERROR  cufio:339 cuFileHandleRegister error: internal error

@@ -70,9 +70,9 @@ import java.util.stream.Stream;
  * almost entirely a function of it: measured on this card, {@code cublasSgemm} is 1.57x a tiled
  * kernel at {@code d = 32} and 4.15x at {@code d = 512}, and 0.96x — losing — against a fused
  * kernel at 32 against 67.8x at 512. A dot product is <em>one</em> SQL expression of {@code d}
- * products, so {@code d} can be 256 without Calcite noticing; a Gram matrix needs
- * {@code d(d+1)/2} aggregate calls and planning passes two minutes at {@code d = 64}. That is why
- * the shape that can reach the regime is this one and not that one.
+ * products, so {@code d} can be 256 without Calcite noticing; a Gram matrix needs {@code d(d+1)/2}
+ * aggregate calls and planning passes two minutes at {@code d = 64}. That is why the shape that can
+ * reach the regime is this one and not that one.
  *
  * <h2>What the query author writes</h2>
  *
@@ -137,11 +137,7 @@ public final class NearestNeighbourSQLExample {
 
         System.out.printf(
                 "nearest neighbour: dim=%d probe=%,d in %d files, corpus=%,d, parallelism=%d%n",
-                parsed.dim,
-                parsed.probeRows,
-                parsed.files,
-                parsed.corpusRows,
-                parsed.parallelism);
+                parsed.dim, parsed.probeRows, parsed.files, parsed.corpusRows, parsed.parallelism);
         System.out.printf(
                 "pairs=%,d  multiply-adds=%,d%n",
                 (long) parsed.probeRows * parsed.corpusRows,
@@ -243,7 +239,9 @@ public final class NearestNeighbourSQLExample {
                 args.probeRows, args.files, perFile, args.corpusRows, args.dim, root);
     }
 
-    /** @return the next unused identifier, or the one it was given when there is no key column */
+    /**
+     * @return the next unused identifier, or the one it was given when there is no key column
+     */
     private static int writeCsv(Path dir, int rows, int d, int firstId, Random random)
             throws IOException {
         Files.createDirectories(dir);
@@ -271,7 +269,13 @@ public final class NearestNeighbourSQLExample {
     }
 
     private static void convert(
-            TableEnvironment env, String tag, Path csv, Path into, int d, boolean withKey, int index)
+            TableEnvironment env,
+            String tag,
+            Path csv,
+            Path into,
+            int d,
+            boolean withKey,
+            int index)
             throws Exception {
         final Path staging = csv.resolveSibling(csv.getFileName() + "-parquet");
         env.executeSql(ddlFor(tag + "Csv", d, csv, withKey, "csv"));

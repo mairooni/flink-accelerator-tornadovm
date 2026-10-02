@@ -129,8 +129,7 @@ public final class GrokSQLExample {
         env.getConfig()
                 .getConfiguration()
                 .setString(
-                        "table.exec.resource.default-parallelism",
-                        Integer.toString(parallelism));
+                        "table.exec.resource.default-parallelism", Integer.toString(parallelism));
         // Nothing else. An ungrouped COUNT(*) already plans as a two-phase hash aggregate, so
         // this shape needs none of the planner hints the nearest-neighbour join example sets --
         // checked rather than assumed, by running it both ways.
@@ -146,14 +145,18 @@ public final class GrokSQLExample {
             if (i > 0) {
                 where.append("\n  AND ");
             }
-            where.append("REGEXP(line, '").append((selective ? SELECTIVE : PATTERNS)[i % PATTERNS.length]).append("')");
+            where.append("REGEXP(line, '")
+                    .append((selective ? SELECTIVE : PATTERNS)[i % PATTERNS.length])
+                    .append("')");
         }
         final String sql = "SELECT COUNT(*) AS matched FROM Logs WHERE " + where;
 
         if (explain) {
             System.out.println(env.explainSql(sql));
         }
-        System.out.printf("grok: patterns=%d parallelism=%d selective=%s data=%s%n", patterns, parallelism, selective, data);
+        System.out.printf(
+                "grok: patterns=%d parallelism=%d selective=%s data=%s%n",
+                patterns, parallelism, selective, data);
 
         final long started = System.nanoTime();
         final TableResult result = env.executeSql(sql);
@@ -164,7 +167,7 @@ public final class GrokSQLExample {
             }
         }
         System.out.printf(
-                "matched=%s  query=%.2f s%n", row == null ? "none" : row.getField(0),
-                (System.nanoTime() - started) / 1e9);
+                "matched=%s  query=%.2f s%n",
+                row == null ? "none" : row.getField(0), (System.nanoTime() - started) / 1e9);
     }
 }
