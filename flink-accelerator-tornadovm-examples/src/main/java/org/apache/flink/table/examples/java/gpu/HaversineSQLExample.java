@@ -103,9 +103,26 @@ public final class HaversineSQLExample {
 
     public static void main(String[] args) throws Exception {
 
-        final long rows = args.length > 0 ? Long.parseLong(args[0]) : 2_000_000L;
+        // `--cpu` anywhere in the arguments runs the identical query with the accelerator
+        // switched off, which is how the demo shows the same answer from the other plan. It is a
+        // demo affordance and not a query option: the switch it flips is the session setting a
+        // cluster operator owns, and the SQL below does not change.
+        boolean accelerate = true;
+        int parallelism = 1;
+        final java.util.List<String> positional = new java.util.ArrayList<>();
+        for (int i = 0; i < args.length; i++) {
+            if ("--cpu".equals(args[i])) {
+                accelerate = false;
+            } else if ("--parallelism".equals(args[i])) {
+                parallelism = Integer.parseInt(args[++i]);
+            } else {
+                positional.add(args[i]);
+            }
+        }
+        final long rows = !positional.isEmpty() ? Long.parseLong(positional.get(0)) : 2_000_000L;
         final Path data =
-                Paths.get(args.length > 1 ? args[1] : "/tmp/flink-gpu-demo-points-" + rows);
+                Paths.get(positional.size() > 1 ? positional.get(1)
+                                                : "/tmp/flink-gpu-demo-points-" + rows);
         writePoints(data, rows);
 
         // set up the Table API
@@ -133,13 +150,14 @@ public final class HaversineSQLExample {
         //                         offload is declined above it. That default is a live workaround
         //                         for an intermittent CUDA launch failure at higher parallelism on
         //                         one card, not a statement about what accelerators can do.
-        tableEnv.getConfig().getConfiguration().setString("table.exec.accelerator.enabled", "true");
+        tableEnv.getConfig().getConfiguration()
+                .setString("table.exec.accelerator.enabled", Boolean.toString(accelerate));
         tableEnv.getConfig()
                 .getConfiguration()
                 .setString("table.exec.accelerator.approximate-projections", "true");
         tableEnv.getConfig()
                 .getConfiguration()
-                .setString("table.exec.resource.default-parallelism", "1");
+                .setString("table.exec.resource.default-parallelism", Integer.toString(parallelism));
         // ----------------------------------------------------------------------------------
 
         // NOT NULL is the one thing the query author has to write; see the class comment.

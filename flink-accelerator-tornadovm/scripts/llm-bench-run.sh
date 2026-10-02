@@ -78,7 +78,9 @@ printf '  model %s\n  data  %s\n  modes %s\n\n' \
 echo "==> starting the cluster"
 cleanup; sleep 2
 "$FLINK_HOME/bin/start-cluster.sh" >/dev/null
-until curl -s localhost:8081/overview 2>/dev/null | grep -q '"slots-available":1'; do sleep 2; done
+# Any free slot will do. Matching "slots-available":1 exactly meant a cluster configured with
+# more than one slot never satisfied this and the script waited forever with an idle GPU.
+until curl -s localhost:8081/overview 2>/dev/null | grep -qE '"slots-available":[1-9]'; do sleep 2; done
 
 run_once() {
     "$FLINK_HOME/bin/flink" run -c "$CLASS" "$JAR" \

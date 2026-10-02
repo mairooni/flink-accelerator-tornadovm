@@ -208,6 +208,24 @@ under the License.
 						</configuration>
 					</execution>
 					<execution>
+						<id>LogCorpusGenerator</id>
+						<phase>package</phase>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+						<configuration>
+							<classifier>LogCorpusGenerator</classifier>
+							<archive>
+								<manifestEntries>
+									<program-class>org.apache.flink.table.examples.java.gpu.LogCorpusGenerator</program-class>
+								</manifestEntries>
+							</archive>
+							<includes>
+								<include>org/apache/flink/table/examples/java/gpu/LogCorpusGenerator*</include>
+							</includes>
+						</configuration>
+					</execution>
+					<execution>
 						<id>GrokSQLExample</id>
 						<phase>package</phase>
 						<goals>
