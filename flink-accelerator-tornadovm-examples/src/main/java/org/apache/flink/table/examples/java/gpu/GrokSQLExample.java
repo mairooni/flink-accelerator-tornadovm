@@ -61,6 +61,26 @@ public final class GrokSQLExample {
      * that rejects most rows lets the CPU skip the rest of the conjunction, and the device has no
      * equivalent. Measuring against an arm that skips most of its work would flatter this one.
      */
+    /**
+     * Patterns that most lines fail, most-selective first.
+     *
+     * <p>The opposite measurement to {@link #PATTERNS}, and the one that tests whether the result
+     * survives a predicate anybody would actually write. SQL's {@code AND} short-circuits, so a
+     * first pattern that rejects three rows in four lets the CPU skip the other seven on those
+     * rows; the device has no equivalent and evaluates all of them on all rows. This is therefore
+     * the device's worst case and the CPU's best.
+     */
+    private static final String[] SELECTIVE = {
+        "(GET|POST) /api/v[0-9]+/[a-z]+",
+        "Firefox/1[0-9]+",
+        "/api/v[0-9]+/(users|orders)",
+        "\" (500|404) ",
+        "curl/8",
+        "python-requests",
+        "\"DELETE /",
+        "/static/app\\.js",
+    };
+
     private static final String[] PATTERNS = {
         "10\\.0\\.[0-9]+\\.[0-9]+ -",
         "\\[[0-9]{2}/[A-Z][a-z]{2}/[0-9]{4}",
@@ -79,6 +99,7 @@ public final class GrokSQLExample {
         int patterns = 8;
         int parallelism = 1;
         boolean explain = false;
+        boolean selective = false;
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--data":
@@ -89,6 +110,9 @@ public final class GrokSQLExample {
                     break;
                 case "--parallelism":
                     parallelism = Integer.parseInt(args[++i]);
+                    break;
+                case "--selective":
+                    selective = true;
                     break;
                 case "--explain":
                     explain = true;
@@ -122,14 +146,14 @@ public final class GrokSQLExample {
             if (i > 0) {
                 where.append("\n  AND ");
             }
-            where.append("REGEXP(line, '").append(PATTERNS[i % PATTERNS.length]).append("')");
+            where.append("REGEXP(line, '").append((selective ? SELECTIVE : PATTERNS)[i % PATTERNS.length]).append("')");
         }
         final String sql = "SELECT COUNT(*) AS matched FROM Logs WHERE " + where;
 
         if (explain) {
             System.out.println(env.explainSql(sql));
         }
-        System.out.printf("grok: patterns=%d parallelism=%d data=%s%n", patterns, parallelism, data);
+        System.out.printf("grok: patterns=%d parallelism=%d selective=%s data=%s%n", patterns, parallelism, selective, data);
 
         final long started = System.nanoTime();
         final TableResult result = env.executeSql(sql);
