@@ -25,7 +25,7 @@ TORNADOVM_BRANCH="${TORNADOVM_BRANCH:-demo-integration}"
 FLINK_REPO="${FLINK_REPO:-https://github.com/mairooni/flink.git}"
 FLINK_BRANCH="${FLINK_BRANCH:-gpu-offload}"
 PROVIDER_REPO="${PROVIDER_REPO:-https://github.com/mairooni/flink-accelerator-tornadovm.git}"
-PROVIDER_BRANCH="${PROVIDER_BRANCH:-feat/llm-pipeline-benchmark}"
+PROVIDER_BRANCH="${PROVIDER_BRANCH:-master}"
 
 # ---------------------------------------------------------------------------
 demo_banner "1/7  preflight"
