@@ -20,6 +20,7 @@ package org.apache.flink.table.examples.java.gpu.llm;
 
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.examples.java.gpu.BenchData;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 
@@ -398,12 +399,25 @@ public final class TelemetryTriage {
 
     /** Everything both arms take, parsed the same way, so a flag cannot mean two things. */
     public static final class Args {
-        public String data = "/home/mary/gpu-bench-data/flink-llm/readings";
-        public String model =
-                "/home/mary/Projects/GPULlama3-Beehive/GPULlama3.java/Qwen3-0.6B-f16.gguf";
-        public String binary = "/home/mary/Projects/llama.cpp/build/bin/llama-server";
-        public String libraryPath =
-                "/home/mary/gpu-bench-data/flink-llm/cuda13/targets/x86_64-linux/lib";
+        /**
+         * Where a path comes from, in order: the flag, then the environment, then a default that is
+         * portable or nothing at all. There are no absolute defaults -- a path baked into the jar
+         * is one machine's path, and on any other machine it fails late and confusingly rather than
+         * at startup with a name to fix.
+         */
+        public String data =
+                BenchData.env(
+                        "LLM_BENCH_DATA", BenchData.resolve("flink-llm", "readings").toString());
+
+        /** No portable default exists for a GGUF file, so this one has to be supplied. */
+        public String model = BenchData.env("LLM_BENCH_MODEL", null);
+
+        /** Resolved on {@code PATH} unless given; only the llama.cpp arm starts a binary. */
+        public String binary = BenchData.env("LLM_BENCH_BINARY", "llama-server");
+
+        /** Prepended to {@code LD_LIBRARY_PATH} for that binary; empty means leave it alone. */
+        public String libraryPath = BenchData.env("LLM_BENCH_LIBRARY_PATH", "");
+
         public long rows = 8_000_000L;
         public int machines = 48;
         public int modes = 8;
@@ -455,7 +469,19 @@ public final class TelemetryTriage {
                     default -> throw new IllegalArgumentException("unknown flag " + argv[i]);
                 }
             }
+            require(a.data, "--data", "LLM_BENCH_DATA", "the telemetry directory");
+            if (!a.generate) {
+                require(a.model, "--model", "LLM_BENCH_MODEL", "the GGUF model file");
+            }
             return a;
+        }
+
+        /** Fail at startup, naming both ways to supply the thing that is missing. */
+        private static void require(String value, String flag, String env, String what) {
+            if (value == null || value.isBlank()) {
+                throw new IllegalArgumentException(
+                        "no path for " + what + ": pass " + flag + " or set " + env);
+            }
         }
 
         /** What was asked for, printed before anything is timed. */

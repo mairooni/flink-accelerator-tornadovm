@@ -94,10 +94,9 @@ public final class GramMatrixSQLExample {
         final long rows = args.length > 0 ? Long.parseLong(args[0]) : 1_000_000L;
         final int cols = args.length > 1 ? Integer.parseInt(args[1]) : 64;
         final Path data =
-                Paths.get(
-                        args.length > 2
-                                ? args[2]
-                                : "/home/mary/gpu-bench-data/features-" + rows + "-" + cols);
+                args.length > 2
+                        ? Paths.get(args[2])
+                        : BenchData.resolve("features-" + rows + "-" + cols);
         writeFeatures(data, rows, cols);
 
         final EnvironmentSettings settings =

@@ -335,7 +335,7 @@ public final class NearestNeighbourSQLExample {
     private static final class Args {
         private boolean generate;
         private boolean explain;
-        private String data = "/home/mary/gpu-bench-data/nn";
+        private String data = BenchData.resolve("nn").toString();
         private int dim = 256;
         private int probeRows = 65_536;
         private int files = 32;

@@ -95,7 +95,7 @@ public final class GrokSQLExample {
     private GrokSQLExample() {}
 
     public static void main(String[] args) throws Exception {
-        String data = "/home/mary/gpu-bench-data/logs";
+        String data = BenchData.resolve("logs").toString();
         int patterns = 8;
         int parallelism = 1;
         boolean explain = false;
