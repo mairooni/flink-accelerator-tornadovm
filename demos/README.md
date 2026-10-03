@@ -64,6 +64,18 @@ any order, so `--print-kernel --keep-cluster` does both. With `--keep-cluster`
 the cluster stays up afterwards — the job is then visible at
 <http://localhost:8081> — and `./stop.sh` shuts it down.
 
+### Demo 3 needs three more things
+
+`./1-fetch.sh --with-llm` clones jitllm (`beehive-lab/GPULlama3.java`) and
+llama.cpp beside the other repositories. It cannot fetch the model: `*.gguf` is
+gitignored in the jitllm repository, so a clone brings no weights. Put a
+`Qwen3-0.6B` GGUF at `$JITLLM_SRC/Qwen3-0.6B-f16.gguf`, or set `MODEL` to one
+you already have, or pass `MODEL_URL=<direct link>` and it will be downloaded.
+
+Then run the repository's own `llm-bench-setup.sh`, which builds both engines
+and the dataset; `1-fetch.sh` prints the exact command with the paths filled in.
+Demos 1 and 2 do not need any of this.
+
 ## Things that will bite on a new machine
 
 **The JDK must be the one TornadoVM was built with.** TornadoVM's off-heap

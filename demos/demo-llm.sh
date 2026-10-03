@@ -56,9 +56,7 @@ cat <<'TXT'
   accelerated one spends its preprocessing advantage loading 1.4 GiB of
   weights. The result this demo is about is the warm one.
 TXT
+# llm-bench-run.sh starts and stops its own cluster and kills the llama-server,
+# so --keep-cluster and --reuse-cluster do not apply here: anything after this
+# line would be unreachable anyway, because exec replaces the process.
 exec "$RUNNER" "$ARM" "${EXTRA[@]}"
-
-if [[ ${KEEP:-0} == 1 ]]; then
-    echo
-    echo "  cluster left running: http://localhost:8081  (stop it with $FLINK_HOME/bin/stop-cluster.sh)"
-fi

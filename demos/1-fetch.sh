@@ -6,6 +6,7 @@
 #   ./1-fetch.sh                    everything
 #   ./1-fetch.sh --skip-flink       when Flink is already built
 #   ./1-fetch.sh --skip-tornadovm   when the TornadoVM SDK is already built
+#   ./1-fetch.sh --with-llm         also fetch jitllm and llama.cpp for demo 3
 #
 # Idempotent: re-running skips what is already done, so a failed step can be
 # fixed and the script re-run. Budget 40-70 minutes on a cold machine; Flink's
@@ -19,10 +20,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 source ./common.sh
 
-SKIP_FLINK=0; SKIP_TORNADO=0
+SKIP_FLINK=0; SKIP_TORNADO=0; WITH_LLM=0
 for a in "$@"; do case "$a" in
     --skip-flink) SKIP_FLINK=1 ;;
     --skip-tornadovm) SKIP_TORNADO=1 ;;
+    --with-llm) WITH_LLM=1 ;;
     *) demo_die "unknown argument $a" ;;
 esac; done
 
@@ -216,6 +218,41 @@ open(p, "w").write(s)
 print("  config.yaml: 4 task slots, 4g task off-heap, leaked-classloader check off")
 PY
 
+
+# ---------------------------------------------------------------------------
+# Demo 3 only. Separate because it is the one demo with prerequisites outside
+# these three repositories, and because the model is a 1.4 GiB download.
+# ---------------------------------------------------------------------------
+if [[ $WITH_LLM == 1 ]]; then
+    demo_banner "jitllm, llama.cpp and the model"
+    : "${JITLLM_SRC:=$DEMO_ROOT/GPULlama3.java}"
+    : "${LLAMACPP_SRC:=$DEMO_ROOT/llama.cpp}"
+    : "${MODEL:=$JITLLM_SRC/Qwen3-0.6B-f16.gguf}"
+
+    ensure_repo "$JITLLM_SRC"   "https://github.com/beehive-lab/GPULlama3.java.git" main   jitllm
+    ensure_repo "$LLAMACPP_SRC" "https://github.com/ggml-org/llama.cpp.git"         master llamacpp
+
+    # *.gguf is gitignored in the jitllm repository, so cloning it gets no model.
+    if [[ -f "$MODEL" ]]; then
+        echo "  model: $MODEL"
+    elif [[ -n "${MODEL_URL:-}" ]]; then
+        echo "  downloading $(basename "$MODEL") from $MODEL_URL"
+        mkdir -p "$(dirname "$MODEL")"
+        curl -fL --progress-bar -o "$MODEL" "$MODEL_URL"
+    else
+        echo "  no model at $MODEL"
+        echo "  The GGUF is not in the jitllm checkout -- *.gguf is gitignored there."
+        echo "  Fetch Qwen3-0.6B in GGUF form and put it at that path, or point MODEL"
+        echo "  at one you already have, or re-run with MODEL_URL set to a direct link:"
+        echo "    MODEL_URL=<url> ./1-fetch.sh --with-llm --skip-flink --skip-tornadovm"
+        echo "  Demo 3 will not run until it is there; demos 1 and 2 are unaffected."
+    fi
+
+    echo "  then finish the LLM setup with:"
+    echo "    JITLLM_SRC=$JITLLM_SRC LLAMACPP_SRC=$LLAMACPP_SRC MODEL=$MODEL \\"
+    echo "      $PROVIDER_SRC/flink-accelerator-tornadovm/scripts/llm-bench-setup.sh"
+fi
+
 # ---------------------------------------------------------------------------
 cat > "$DEMO_ROOT/env.sh" <<ENV
 # Written by 1-fetch.sh on $(date -Is). Read by 3-env.sh.
@@ -229,6 +266,9 @@ export DATA_ROOT="$DATA_ROOT"
 export RAPIDS_HOME="$RAPIDS_HOME"
 export JAVA_HOME="$JAVA_HOME"
 export CUDA_PATH="$CUDA_PATH"
+${JITLLM_SRC:+export JITLLM_SRC="$JITLLM_SRC"}
+${LLAMACPP_SRC:+export LLAMACPP_SRC="$LLAMACPP_SRC"}
+${MODEL:+export MODEL="$MODEL"}
 ENV
 demo_banner "built"
 echo "  env written to $DEMO_ROOT/env.sh"
