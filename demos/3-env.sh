@@ -18,6 +18,18 @@ fi
 
 _demos_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --- which tree is this? ---------------------------------------------------
+# 1-fetch.sh writes $DEMO_ROOT/env.sh, and these scripts live two levels below
+# it ($DEMO_ROOT/flink-accelerator-tornadovm/demos). Finding that file is the
+# only thing that tells us which install we are in. Without this step DEMO_ROOT
+# falls back to the default location, a tree fetched anywhere else never reads
+# its own env.sh, and the demos look for data in a directory that was never
+# written -- which is exactly the error you get, one line of it, at demo time.
+_demos_tree="$(cd "$_demos_dir/../.." 2>/dev/null && pwd)"
+if [[ -z "${DEMO_ROOT:-}" && -n "$_demos_tree" && -f "$_demos_tree/env.sh" ]]; then
+    DEMO_ROOT="$_demos_tree"
+fi
+
 # --- the four roots everything else is derived from ------------------------
 : "${DEMO_ROOT:=$HOME/flink-tornadovm-demos}"
 : "${TORNADOVM_SRC:=$DEMO_ROOT/TornadoVM}"
