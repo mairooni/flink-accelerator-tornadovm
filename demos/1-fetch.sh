@@ -32,8 +32,11 @@ for a in "$@"; do case "$a" in
     *) demo_die "unknown argument $a" ;;
 esac; done
 
-TORNADOVM_REPO="${TORNADOVM_REPO:-https://github.com/mairooni/TornadoVM.git}"
-TORNADOVM_BRANCH="${TORNADOVM_BRANCH:-demo-integration}"
+TORNADOVM_REPO="${TORNADOVM_REPO:-https://github.com/beehive-lab/TornadoVM.git}"
+# Everything these demos need is upstream as of 2026-10-03: PRs #1167 (RMM pool),
+# #1168 (Parquet reader), #1169 (STRING columns and contains_re), #1170 (per-plan
+# device reset) and #1171 (compiler flags, strict floating point).
+TORNADOVM_BRANCH="${TORNADOVM_BRANCH:-develop}"
 FLINK_REPO="${FLINK_REPO:-https://github.com/mairooni/flink.git}"
 FLINK_BRANCH="${FLINK_BRANCH:-gpu-offload}"
 

@@ -14,7 +14,7 @@ author writes that they would not otherwise write is `NOT NULL` in the DDL.
 
 | | | when |
 |---|---|---|
-| `./1-fetch.sh` | clones TornadoVM, Flink, jitllm and llama.cpp at the right branches, builds them and this repository, deploys the provider into the Flink distribution | once, on a new machine |
+| `./1-fetch.sh` | clones TornadoVM (`beehive-lab`, `develop`), Flink, jitllm and llama.cpp, builds them and this repository, deploys the provider into the Flink distribution | once, on a new machine |
 | `./2-generate-data.sh` | the log corpora (~2.4 GB), demo 3's model (1.44 GiB), and demo 3's own setup | once, on a new machine |
 | `source ./3-env.sh` | sets every path the demos need, and says what is missing | every shell |
 
