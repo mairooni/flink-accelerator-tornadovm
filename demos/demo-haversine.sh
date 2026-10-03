@@ -15,13 +15,14 @@ cd "$(dirname "$0")"
 source ./common.sh
 [[ -f "$DEMO_ROOT/env.sh" ]] && source "$DEMO_ROOT/env.sh" && source ./common.sh
 
-ROWS=8000000; PRINT_KERNEL=0; PRINT_BYTECODES=0; ARM=device; KEEP=0
+ROWS=8000000; PRINT_KERNEL=0; PRINT_BYTECODES=0; ARM=device; KEEP=0; REUSE=0
 while [[ $# -gt 0 ]]; do case "$1" in
     --rows) ROWS="$2"; shift 2 ;;
     --print-kernel) PRINT_KERNEL=1; shift ;;
     --print-bytecodes) PRINT_BYTECODES=1; shift ;;
     --cpu) ARM=cpu; shift ;;
     --keep-cluster) KEEP=1; shift ;;
+    --reuse-cluster) REUSE=1; KEEP=1; shift ;;
     *) demo_die "unknown argument $1" ;;
 esac; done
 
@@ -35,6 +36,11 @@ OPTS=""
 TM_FLAGS=""
 [[ $PRINT_KERNEL == 1 ]]    && TM_FLAGS="$TM_FLAGS -Dtornado.printKernel=true"
 [[ $PRINT_BYTECODES == 1 ]] && TM_FLAGS="$TM_FLAGS -Dtornado.print.bytecodes=true"
+if [[ -n "$TM_FLAGS" && "$REUSE" == 1 ]] && cluster_running; then
+    demo_die "--reuse-cluster cannot be combined with the print flags: those are
+  TaskManager JVM options, read only when the JVM starts. Drop --reuse-cluster,
+  or run ./stop.sh first so a fresh cluster picks them up."
+fi
 tm_opts_add "$TM_FLAGS"
 
 demo_banner "Haversine -- $ROWS points, ${ARM}"

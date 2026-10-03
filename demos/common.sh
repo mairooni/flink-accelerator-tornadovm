@@ -82,7 +82,17 @@ tm_out() { ls -t "$FLINK_HOME"/log/*taskexecutor*.out 2>/dev/null | head -1; }
 demo_banner() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 demo_die()    { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
+cluster_running() { curl -s -m 2 "http://localhost:8081/overview" >/dev/null 2>&1; }
+
+# REUSE=1 keeps a cluster that is already up, so successive demos land in the
+# same web UI and the earlier jobs stay visible. A restart is still required
+# whenever the TaskManager JVM options change -- the print flags -- because
+# those are only read at JVM start.
 cluster_up() {
+    if [[ "${REUSE:-0}" == 1 ]] && cluster_running; then
+        echo "  reusing the cluster already running at http://localhost:8081"
+        return 0
+    fi
     "$FLINK_HOME/bin/stop-cluster.sh" >/dev/null 2>&1 || true
     "$FLINK_HOME/bin/start-cluster.sh" >/dev/null 2>&1
     sleep 6

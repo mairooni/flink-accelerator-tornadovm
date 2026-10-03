@@ -46,6 +46,8 @@ Then, in a shell where `3-env.sh` has been sourced:
 ```bash
 ./demo-haversine.sh --print-kernel     # 8M rows; the CUDA lands in the TaskManager .out
 ./demo-haversine.sh --keep-cluster     # leave the cluster up for the web UI
+./demo-regex.sh --reuse-cluster        # run into the cluster that is already up,
+                                       # so the UI keeps the earlier jobs too
 ./stop.sh                              # stop a cluster left up that way
 
 ./demo-regex.sh --rows 1 --patterns 8 --print-bytecodes   # library tasks and the

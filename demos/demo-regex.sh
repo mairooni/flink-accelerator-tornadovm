@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 source ./common.sh
 [[ -f "$DEMO_ROOT/env.sh" ]] && source "$DEMO_ROOT/env.sh" && source ./common.sh
 
-ROWS=16; PATTERNS=8; ARM=device; PAR=1; KEEP=0; PRINT_KERNEL=0; PRINT_BYTECODES=0
+ROWS=16; PATTERNS=8; ARM=device; PAR=1; KEEP=0; REUSE=0; PRINT_KERNEL=0; PRINT_BYTECODES=0
 while [[ $# -gt 0 ]]; do case "$1" in
     --rows) ROWS="$2"; shift 2 ;;
     --patterns) PATTERNS="$2"; shift 2 ;;
@@ -19,6 +19,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
     --selective) SELECTIVE=--selective; shift ;;
     --cpu) ARM=cpu; shift ;;
     --keep-cluster) KEEP=1; shift ;;
+    --reuse-cluster) REUSE=1; KEEP=1; shift ;;
     --print-kernel) PRINT_KERNEL=1; shift ;;
     --print-bytecodes) PRINT_BYTECODES=1; shift ;;
     *) demo_die "unknown argument $1" ;;
@@ -48,6 +49,11 @@ TXT
 TM_FLAGS=""
 [[ $PRINT_KERNEL == 1 ]]    && TM_FLAGS="$TM_FLAGS -Dtornado.printKernel=true"
 [[ $PRINT_BYTECODES == 1 ]] && TM_FLAGS="$TM_FLAGS -Dtornado.print.bytecodes=true"
+if [[ -n "$TM_FLAGS" && "$REUSE" == 1 ]] && cluster_running; then
+    demo_die "--reuse-cluster cannot be combined with the print flags: those are
+  TaskManager JVM options, read only when the JVM starts. Drop --reuse-cluster,
+  or run ./stop.sh first so a fresh cluster picks them up."
+fi
 tm_opts_add "$TM_FLAGS"
 
 cluster_up
