@@ -241,9 +241,7 @@ if [[ $WITH_LLM == 1 ]]; then
     # 2-generate-data.sh fetches it. Nothing here needs it.
     echo "  model: 2-generate-data.sh fetches it (1.44 GiB)"
 
-    echo "  then finish the LLM setup with:"
-    echo "    JITLLM_SRC=$JITLLM_SRC LLAMACPP_SRC=$LLAMACPP_SRC MODEL=$MODEL \\"
-    echo "      $PROVIDER_SRC/flink-accelerator-tornadovm/scripts/llm-bench-setup.sh"
+    echo "  2-generate-data.sh fetches the model and finishes the setup from there"
 fi
 
 # ---------------------------------------------------------------------------

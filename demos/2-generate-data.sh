@@ -4,7 +4,11 @@
 #
 #   ./2-generate-data.sh                 the log corpora (1M, 16M and 64M lines)
 #   ./2-generate-data.sh --with-haversine  also materialise the 8M and 32M point CSVs
-#   ./2-generate-data.sh --skip-model      do not fetch demo 3's GGUF
+#   ./2-generate-data.sh --skip-model      do not fetch demo 3's GGUF or set it up
+#
+# Demo 3's setup runs from here too, because llm-bench-setup.sh refuses to start
+# without the model and the model is fetched here. It builds jitllm and
+# llama.cpp, so the first run adds roughly fifteen minutes.
 #   ./2-generate-data.sh --rows 16000000,64000000   pick the log sizes
 #
 # The 1M corpus is two Parquet files rather than 32, so --print-bytecodes on the
@@ -94,6 +98,30 @@ if [[ $WITH_MODEL == 1 ]]; then
             || demo_die "$MODEL does not start with the GGUF magic -- delete it and re-run"
     else
         echo "  no model at $MODEL -- demo 3 will not run; demos 1 and 2 are unaffected"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Finish demo 3. llm-bench-setup.sh checks for the model before it does
+# anything, so it cannot run from 1-fetch.sh -- the model only exists once the
+# step above has run. TornadoVM and Flink are already built, so those phases are
+# skipped and what is left is the two engines, the deploy and the triage data.
+# ---------------------------------------------------------------------------
+if [[ $WITH_MODEL == 1 && -f "$MODEL" ]]; then
+    LLM_SETUP="$PROVIDER_SRC/flink-accelerator-tornadovm/scripts/llm-bench-setup.sh"
+    if [[ -x "$LLM_SETUP" ]]; then
+        demo_banner "demo 3: jitllm, llama.cpp and the triage dataset"
+        echo "  building the two engines -- about fifteen minutes the first time"
+        if JITLLM_SRC="$JITLLM_SRC" LLAMACPP_SRC="$LLAMACPP_SRC" MODEL="$MODEL" \
+           TORNADO_SDK="$TORNADOVM_HOME" FLINK_HOME="$FLINK_HOME" \
+           "$LLM_SETUP" --skip-tornadovm --skip-flink; then
+            echo "  demo 3 ready"
+        else
+            echo
+            echo "  demo 3 setup did not finish. Demos 1 and 2 are unaffected; retry with:"
+            echo "    JITLLM_SRC=$JITLLM_SRC LLAMACPP_SRC=$LLAMACPP_SRC MODEL=$MODEL \\"
+            echo "      $LLM_SETUP --skip-tornadovm --skip-flink"
+        fi
     fi
 fi
 
