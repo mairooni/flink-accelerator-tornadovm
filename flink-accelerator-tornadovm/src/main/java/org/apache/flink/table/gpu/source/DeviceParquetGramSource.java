@@ -78,10 +78,10 @@ import java.util.concurrent.CompletableFuture;
  * work and one GEMM. That is also what keeps the kernel under TornadoVM's argument ceiling: packed
  * input and output are two buffers whatever {@code d} is.
  *
- * <p>FP32 or FP64 by the query's own declaration — Flink sums a {@code FLOAT} column in a
- * {@code FLOAT} accumulator, so an FP32 query is FP32 on both arms. FP64 remains what a
- * {@code DOUBLE} query gets, and for the reason {@code GpuGramEngine} records: a Gram matrix is the
- * left-hand side of a normal equation, which is where a narrowed contraction propagates.
+ * <p>FP32 or FP64 by the query's own declaration — Flink sums a {@code FLOAT} column in a {@code
+ * FLOAT} accumulator, so an FP32 query is FP32 on both arms. FP64 remains what a {@code DOUBLE}
+ * query gets, and for the reason {@code GpuGramEngine} records: a Gram matrix is the left-hand side
+ * of a normal equation, which is where a narrowed contraction propagates.
  */
 public final class DeviceParquetGramSource
         implements Source<
@@ -96,6 +96,7 @@ public final class DeviceParquetGramSource
     private final GpuGramSpec spec;
     private final AccelScan scan;
     private final RowType outputType;
+
     /** Decided while planning, so it travels with the source instead of being read per subtask. */
     private final boolean kernelContraction;
 

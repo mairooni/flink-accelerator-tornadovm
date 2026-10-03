@@ -74,7 +74,6 @@ public final class GpuGramEngine implements AutoCloseable {
     private static final org.slf4j.Logger LOG =
             org.slf4j.LoggerFactory.getLogger(GpuGramEngine.class);
 
-
     private final GpuKernelSource kernel;
     private final int features;
     private final int batchSize;

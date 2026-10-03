@@ -28,8 +28,8 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /**
- * The bulk columnar gather for a {@code DOUBLE} column. See {@link AbstractBulkColumnarGather}
- * for the run tracking, which is where everything subtle lives.
+ * The bulk columnar gather for a {@code DOUBLE} column. See {@link AbstractBulkColumnarGather} for
+ * the run tracking, which is where everything subtle lives.
  */
 public final class BulkColumnarDoubleGather extends AbstractBulkColumnarGather {
 

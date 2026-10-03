@@ -58,7 +58,6 @@ import org.apache.flink.table.runtime.accelerator.AcceleratorContext;
 import org.apache.flink.table.runtime.accelerator.AcceleratorCost;
 import org.apache.flink.table.runtime.accelerator.AcceleratorPlan;
 import org.apache.flink.table.runtime.accelerator.AcceleratorProvider;
-import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 
 import org.slf4j.Logger;
@@ -747,9 +746,11 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
                 recognised
                         .spec()
                         .withKernelContraction(
-                                "kernel".equalsIgnoreCase(
-                                        System.getProperty(
-                                                "flink.accelerator.gram.contraction", "cublas")));
+                                "kernel"
+                                        .equalsIgnoreCase(
+                                                System.getProperty(
+                                                        "flink.accelerator.gram.contraction",
+                                                        "cublas")));
         // Generated once here purely to find out whether the feature map is expressible at all;
         // the stride the real kernel is packed at is the batch size, which only the TaskManager's
         // context knows, so the source that actually runs is generated again in createOperator.
@@ -1413,8 +1414,8 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      *
      * <p>Declined below {@link org.apache.flink.table.gpu.codegen.GpuGrokSpec#MIN_PATTERNS}: one
      * pattern is a few milliseconds of matching under a much larger read, and the end-to-end ratio
-     * there belongs to the reader rather than to the library. The marginal pattern is where the
-     * gap is.
+     * there belongs to the reader rather than to the library. The marginal pattern is where the gap
+     * is.
      */
     private Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>> scanGrokSource(
             org.apache.flink.table.accelerator.AccelAggregate aggregate, RowType outputType) {
@@ -1451,9 +1452,9 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      *
      * <p>{@code Aggregate(Project(Join(Scan, Scan)))}, where the projection is an inner product
      * between a row of each side and the aggregate is a {@code MAX} of it. Recognised here rather
-     * than in the planner for the reason {@link
-     * org.apache.flink.table.gpu.codegen.GpuGramSpec} gives about the Gram matrix: that this shape
-     * is a GEMM is something cuBLAS knows and a device-neutral IR should not.
+     * than in the planner for the reason {@link org.apache.flink.table.gpu.codegen.GpuGramSpec}
+     * gives about the Gram matrix: that this shape is a GEMM is something cuBLAS knows and a
+     * device-neutral IR should not.
      */
     private Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>>
             scanSimilaritySource(
@@ -1563,14 +1564,12 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
      * The region whose advantage grows with the query: cuDF reads, a kernel computes {@code d}
      * features, cuBLAS contracts them, in one plan.
      *
-     * <p>Everything the operator path already knew how to recognise, handed a file instead of
-     * rows. {@link GpuGramSpec#recognise} inspects the aggregate and its projection and never asks
-     * what the projection reads from, so a scan-rooted region satisfies it unchanged.
+     * <p>Everything the operator path already knew how to recognise, handed a file instead of rows.
+     * {@link GpuGramSpec#recognise} inspects the aggregate and its projection and never asks what
+     * the projection reads from, so a scan-rooted region satisfies it unchanged.
      */
-    private Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>>
-            scanGramSource(
-                    org.apache.flink.table.accelerator.AccelAggregate aggregate,
-                    RowType outputType) {
+    private Optional<org.apache.flink.api.connector.source.Source<RowData, ?, ?>> scanGramSource(
+            org.apache.flink.table.accelerator.AccelAggregate aggregate, RowType outputType) {
         if (!CUBLAS_AVAILABLE) {
             return Optional.empty();
         }
@@ -1617,8 +1616,9 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         // about. Any device-side contraction removes the per-row drain; only a tuned one also
         // moves less than O(n d^2).
         final boolean kernelContraction =
-                "kernel".equalsIgnoreCase(
-                        System.getProperty("flink.accelerator.gram.contraction", "cublas"));
+                "kernel"
+                        .equalsIgnoreCase(
+                                System.getProperty("flink.accelerator.gram.contraction", "cublas"));
         LOG.info(
                 "Accelerator reads the source and contracts it: {} features, {}, contraction by {}",
                 spec.featureCount(),
@@ -1687,16 +1687,13 @@ public class TornadoVmAcceleratorProvider implements AcceleratorProvider {
         }
         // Generated here only to decline early: a projection with no kernel must fail planning,
         // not the job. The reader generates its own, because the stride is the row count.
-        if (!org.apache.flink.table.gpu.codegen.AccelKernelGenerator.generate(project, "probe", 0, 1)
+        if (!org.apache.flink.table.gpu.codegen.AccelKernelGenerator.generate(
+                        project, "probe", 0, 1)
                 .isPresent()) {
             return Optional.empty();
         }
         return Optional.of(
                 new org.apache.flink.table.gpu.source.DeviceParquetProjectSumSource(
-                        scan.paths(),
-                        project,
-                        scan.projectedFields(),
-                        valueField,
-                        outputType));
+                        scan.paths(), project, scan.projectedFields(), valueField, outputType));
     }
 }

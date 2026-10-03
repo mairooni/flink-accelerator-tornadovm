@@ -583,8 +583,7 @@ class AccelKernelGeneratorTest {
         // Both halves are now asserted: the column is read as a float, so the arithmetic that
         // follows is float, and no double local appears to widen it back.
         GpuKernelSource kernel =
-                AccelKernelGenerator.generate(
-                                floatPlan(Collections.singletonList(sum)), "NoNarrow")
+                AccelKernelGenerator.generate(floatPlan(Collections.singletonList(sum)), "NoNarrow")
                         .orElseThrow(() -> new AssertionError("a FLOAT result is expressible"));
         assertTrue(kernel.source().contains("float c0 = c0_in.get(i);"), kernel.source());
         assertFalse(kernel.source().contains("double c0"), kernel.source());
@@ -596,11 +595,9 @@ class AccelKernelGeneratorTest {
         // SQL casts the FLOAT operand to DOUBLE and then multiplies. Java would multiply two
         // floats in float and widen the product, rounding once in the wrong place -- so the cast
         // is emitted explicitly.
-        AccelExpression mixed =
-                call(AccelFunction.TIMES, DOUBLE, col(0, FLOAT32), col(1, FLOAT32));
+        AccelExpression mixed = call(AccelFunction.TIMES, DOUBLE, col(0, FLOAT32), col(1, FLOAT32));
         GpuKernelSource kernel =
-                AccelKernelGenerator.generate(
-                                floatPlan(Collections.singletonList(mixed)), "Widen")
+                AccelKernelGenerator.generate(floatPlan(Collections.singletonList(mixed)), "Widen")
                         .orElseThrow(() -> new AssertionError("expected this to generate"));
         assertTrue(kernel.source().contains("((double) c0)"), kernel.source());
         assertTrue(kernel.source().contains("final double t"), kernel.source());
@@ -647,8 +644,7 @@ class AccelKernelGeneratorTest {
         for (int i = 0; i < projections.size(); i++) {
             outputFields[i] = projections.get(i).outputType();
         }
-        return new AccelProject(
-                projections, new AccelInput(inputType), RowType.of(outputFields));
+        return new AccelProject(projections, new AccelInput(inputType), RowType.of(outputFields));
     }
 
     @Test
@@ -664,8 +660,7 @@ class AccelKernelGeneratorTest {
                         new AccelLiteral(2.0, FLOAT32));
 
         Optional<GpuKernelSource> generated =
-                AccelKernelGenerator.generate(
-                        floatPlan(Collections.singletonList(expr)), "F32");
+                AccelKernelGenerator.generate(floatPlan(Collections.singletonList(expr)), "F32");
         assertTrue(generated.isPresent(), "a FLOAT projection is no longer refused");
         GpuKernelSource kernel = generated.get();
 
@@ -697,8 +692,7 @@ class AccelKernelGeneratorTest {
                         new AccelLiteral(2.0, FLOAT32));
 
         assertFalse(
-                AccelKernelGenerator.generate(
-                                floatPlan(Collections.singletonList(mixed)), "Mixed")
+                AccelKernelGenerator.generate(floatPlan(Collections.singletonList(mixed)), "Mixed")
                         .isPresent(),
                 "a mixed-precision subtree is a planning-time decline");
     }
@@ -723,8 +717,7 @@ class AccelKernelGeneratorTest {
         // silently reinterpret the wider one.
         AccelExpression wide = call(AccelFunction.TIMES, col(0), col(1));
         assertFalse(
-                AccelKernelGenerator.generate(
-                                plan(Arrays.asList(a, wide), null), "Mix", 1024, 0)
+                AccelKernelGenerator.generate(plan(Arrays.asList(a, wide), null), "Mix", 1024, 0)
                         .isPresent(),
                 "mixed output widths cannot share a packed buffer");
     }

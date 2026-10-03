@@ -26,7 +26,6 @@ import org.apache.flink.table.accelerator.AccelExpression;
 import org.apache.flink.table.accelerator.AccelFunction;
 import org.apache.flink.table.accelerator.AccelInputRef;
 import org.apache.flink.table.accelerator.AccelJoin;
-import org.apache.flink.table.accelerator.AccelNode;
 import org.apache.flink.table.accelerator.AccelProject;
 import org.apache.flink.table.accelerator.AccelScan;
 import org.apache.flink.table.types.logical.FloatType;
@@ -52,14 +51,14 @@ import java.util.List;
  * <h2>Why this shape and not the Gram matrix</h2>
  *
  * <p>Both end in a contraction a linear-algebra library serves, and only one of them can ever show
- * what the library is worth. A Gram matrix over {@code n} rows of {@code d} columns is
- * {@code 2·n·d²} of arithmetic over {@code 4·n·d} bytes, so the GEMM is {@code d/2} operations a
- * byte read — about 16 at the widest {@code d} the Gram's SQL spelling can reach, because that
- * spelling needs {@code d(d+1)/2} aggregate calls and Calcite's planning cost passes two minutes at
- * {@code d = 64}. A device does floating point some three thousand times faster than a source
- * delivers bytes, so at 16 operations a byte the GEMM is a fraction of a percent of the job, and
- * swapping it for a hand-written kernel changes nothing anyone can measure. That is the whole of
- * why every library this project has measured came out near 1.00x.
+ * what the library is worth. A Gram matrix over {@code n} rows of {@code d} columns is {@code
+ * 2·n·d²} of arithmetic over {@code 4·n·d} bytes, so the GEMM is {@code d/2} operations a byte read
+ * — about 16 at the widest {@code d} the Gram's SQL spelling can reach, because that spelling needs
+ * {@code d(d+1)/2} aggregate calls and Calcite's planning cost passes two minutes at {@code d =
+ * 64}. A device does floating point some three thousand times faster than a source delivers bytes,
+ * so at 16 operations a byte the GEMM is a fraction of a percent of the job, and swapping it for a
+ * hand-written kernel changes nothing anyone can measure. That is the whole of why every library
+ * this project has measured came out near 1.00x.
  *
  * <p>This shape breaks that for one reason: its arithmetic is quadratic in the rows and its input
  * is linear in them. Every probe row meets every build row, so the work is {@code 2·nQ·nP·d} over
@@ -101,9 +100,9 @@ public final class GpuSimilarityJoinSpec implements Serializable {
      *
      * <p>Measured on this shape rather than assumed. At {@code d = 32} a fused kernel that never
      * materialises the score matrix matches {@code cublasSgemm} to within 4% — it reads both
-     * operands straight from global memory and at that width there is little enough traffic that
-     * it does not matter. At 128 the GEMM is 3.1x the best tiled kernel and 36x the fused one, and
-     * at 512 it is 4.2x and 68x. The gap is the GEMM's reduction dimension and nothing else, so a
+     * operands straight from global memory and at that width there is little enough traffic that it
+     * does not matter. At 128 the GEMM is 3.1x the best tiled kernel and 36x the fused one, and at
+     * 512 it is 4.2x and 68x. The gap is the GEMM's reduction dimension and nothing else, so a
      * floor stated in {@code d} is the right shape of floor. 64 is where it is worth the device
      * context; below it the region is still correct and still offered, and the cost model decides.
      */
@@ -146,7 +145,9 @@ public final class GpuSimilarityJoinSpec implements Serializable {
         return buildColumns.clone();
     }
 
-    /** The probe column the query groups by, which is the identifier each answer is labelled with. */
+    /**
+     * The probe column the query groups by, which is the identifier each answer is labelled with.
+     */
     public int groupKeyField() {
         return groupKeyField;
     }
@@ -227,7 +228,8 @@ public final class GpuSimilarityJoinSpec implements Serializable {
         if (calls.size() != 1 || calls.get(0).function() != AccelAggFunction.MAX) {
             return Recognition.no("the aggregate is not a single MAX");
         }
-        if (aggregate.inputs().size() != 1 || !(aggregate.inputs().get(0) instanceof AccelProject)) {
+        if (aggregate.inputs().size() != 1
+                || !(aggregate.inputs().get(0) instanceof AccelProject)) {
             return Recognition.no("no projection beneath the aggregate");
         }
         final AccelProject project = (AccelProject) aggregate.inputs().get(0);
@@ -240,8 +242,7 @@ public final class GpuSimilarityJoinSpec implements Serializable {
         // on the identifier the query groups by; an equality would need a second for the band on
         // each side. A banded join is the same region with a mask in the epilogue -- the GEMM
         // computes every pair either way -- and is worth having when the binding carries two keys.
-        if (join.probeKeyField() != AccelJoin.NO_KEY
-                || join.buildKeyField() != AccelJoin.NO_KEY) {
+        if (join.probeKeyField() != AccelJoin.NO_KEY || join.buildKeyField() != AccelJoin.NO_KEY) {
             return Recognition.no(
                     "the join has an equality, and this region serves every pair or none");
         }
@@ -254,10 +255,8 @@ public final class GpuSimilarityJoinSpec implements Serializable {
         // to be resident and says nothing about which side this query labels its answers with.
         // The projection, though, reads the joined row in query order -- left side's columns, then
         // right side's -- so that order is what the column indexes below mean.
-        final AccelScan leftScan =
-                (AccelScan) join.inputs().get(join.buildIsLeft() ? 0 : 1);
-        final AccelScan rightScan =
-                (AccelScan) join.inputs().get(join.buildIsLeft() ? 1 : 0);
+        final AccelScan leftScan = (AccelScan) join.inputs().get(join.buildIsLeft() ? 0 : 1);
+        final AccelScan rightScan = (AccelScan) join.inputs().get(join.buildIsLeft() ? 1 : 0);
         if (!"parquet".equals(leftScan.format()) || !"parquet".equals(rightScan.format())) {
             return Recognition.no("the region reads parquet, and these are not both parquet");
         }
@@ -298,7 +297,8 @@ public final class GpuSimilarityJoinSpec implements Serializable {
             return Recognition.no("the score is not a sum of products");
         }
         if (terms.size() < 2) {
-            return Recognition.no("the score has " + terms.size() + " terms; an inner product has d");
+            return Recognition.no(
+                    "the score has " + terms.size() + " terms; an inner product has d");
         }
         final int[] leftColumns = new int[terms.size()];
         final int[] rightColumns = new int[terms.size()];

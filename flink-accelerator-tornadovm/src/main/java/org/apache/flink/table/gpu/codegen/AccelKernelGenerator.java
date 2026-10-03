@@ -447,7 +447,9 @@ public final class AccelKernelGenerator {
             // Everything else -- DOUBLE, and INT, whose arithmetic the kernel does in double on
             // purpose -- keeps the double local it has always had.
             final boolean asFloat = inputTypes.get(staged.getKey()) == GpuValueType.FLOAT;
-            sb.append(INDENT).append(asFloat ? "    float " : "    double ").append(var)
+            sb.append(INDENT)
+                    .append(asFloat ? "    float " : "    double ")
+                    .append(var)
                     .append(" = ");
             if (packedInputStride > 0) {
                 sb.append("in.get(").append(column * packedInputStride).append(" + i);\n");
@@ -1387,18 +1389,17 @@ public final class AccelKernelGenerator {
      * <p>{@code FLOAT} was refused until 2026-10-01, and the reason is worth keeping. This
      * generator evaluated every expression in double and narrowed a {@code FLOAT} result once at
      * the end, which is not what Flink does: Flink evaluates float arithmetic in float and rounds
-     * at <em>every</em> step. The two agree for a single operation — a double carries far more
-     * than the 2p+2 bits of mantissa that makes one rounding exact — and diverge for a chain,
-     * which is what any expression worth offloading is. Narrowing at the end was a wrong answer
-     * that looked like a conversion, and refusing was the honest position while it was the only
-     * alternative.
+     * at <em>every</em> step. The two agree for a single operation — a double carries far more than
+     * the 2p+2 bits of mantissa that makes one rounding exact — and diverge for a chain, which is
+     * what any expression worth offloading is. Narrowing at the end was a wrong answer that looked
+     * like a conversion, and refusing was the honest position while it was the only alternative.
      *
-     * <p>It is admitted now because the generator emits float arithmetic throughout instead:
-     * {@link #javaTypeOf} types every subexpression from its own declared type, so Java's
-     * promotion reproduces SQL's, and a {@code FLOAT} literal carries the {@code f} suffix rather
-     * than being merely narrowed — without it the constant is a double and promotes the whole
-     * expression around it straight back to where the bug was. {@link #rendersAsFloat} refuses a
-     * subtree that would mix the two.
+     * <p>It is admitted now because the generator emits float arithmetic throughout instead: {@link
+     * #javaTypeOf} types every subexpression from its own declared type, so Java's promotion
+     * reproduces SQL's, and a {@code FLOAT} literal carries the {@code f} suffix rather than being
+     * merely narrowed — without it the constant is a double and promotes the whole expression
+     * around it straight back to where the bug was. {@link #rendersAsFloat} refuses a subtree that
+     * would mix the two.
      */
     private static boolean isDoubleResult(LogicalType type) {
         LogicalTypeRoot root = type.getTypeRoot();
@@ -1410,10 +1411,10 @@ public final class AccelKernelGenerator {
     /**
      * The Java type a subexpression of this declared type renders as.
      *
-     * <p>The IR is already typed by Flink's own promotion rules -- {@code FLOAT * FLOAT} is
-     * {@code FLOAT}, {@code FLOAT * DOUBLE} is {@code DOUBLE} -- so honouring each node's declared
-     * type makes Java's promotion agree with SQL's by construction, rather than by a rule written
-     * here that would have to be kept in step with Calcite's.
+     * <p>The IR is already typed by Flink's own promotion rules -- {@code FLOAT * FLOAT} is {@code
+     * FLOAT}, {@code FLOAT * DOUBLE} is {@code DOUBLE} -- so honouring each node's declared type
+     * makes Java's promotion agree with SQL's by construction, rather than by a rule written here
+     * that would have to be kept in step with Calcite's.
      */
     /** The single element type of a packed buffer, or null if the columns do not agree on one. */
     private static @Nullable GpuValueType uniformType(List<GpuValueType> types) {
@@ -1442,11 +1443,11 @@ public final class AccelKernelGenerator {
     /**
      * Whether this subtree renders entirely in {@code float}.
      *
-     * <p>Defence against an IR that is not well typed. A well-typed one cannot produce a
-     * {@code FLOAT} node over a {@code DOUBLE} subexpression, because SQL does not narrow
-     * implicitly -- but if one arrived, the generated source would assign a {@code double} to a
-     * {@code float} and fail to compile at execute time, which is the worst moment to find out.
-     * Declining here makes it a planning decision instead.
+     * <p>Defence against an IR that is not well typed. A well-typed one cannot produce a {@code
+     * FLOAT} node over a {@code DOUBLE} subexpression, because SQL does not narrow implicitly --
+     * but if one arrived, the generated source would assign a {@code double} to a {@code float} and
+     * fail to compile at execute time, which is the worst moment to find out. Declining here makes
+     * it a planning decision instead.
      */
     private static boolean rendersAsFloat(AccelExpression node) {
         if (node.outputType().getTypeRoot() != LogicalTypeRoot.FLOAT) {

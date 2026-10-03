@@ -85,8 +85,13 @@ public final class DeviceSimilarity {
      * within a factor of two of the library, and the gap only opens as {@code d} grows.
      */
     public static void scoreTiled(
-            KernelContext ctx, FloatArray probe, FloatArray build, FloatArray scores,
-            int nQ, int nB, int d) {
+            KernelContext ctx,
+            FloatArray probe,
+            FloatArray build,
+            FloatArray scores,
+            int nQ,
+            int nB,
+            int d) {
         final int ts = 16;
         final int localQ = ctx.localIdx;
         final int localB = ctx.localIdy;
@@ -118,9 +123,9 @@ public final class DeviceSimilarity {
      * for this query that result is {@code nQ x nB} values nothing ever reads — so a kernel that
      * fuses the reduction into the product avoids a write the library cannot. At {@code d = 32}
      * that saving is worth more than the library's tuning and this wins. It stops being worth it
-     * quickly: the kernel reloads both operands from global memory for every pair, moving
-     * {@code O(nQ · nB · d)} where a blocked GEMM moves closer to {@code O(nQ · nB)}, and that
-     * gap grows with {@code d} while the saved write does not.
+     * quickly: the kernel reloads both operands from global memory for every pair, moving {@code
+     * O(nQ · nB · d)} where a blocked GEMM moves closer to {@code O(nQ · nB)}, and that gap grows
+     * with {@code d} while the saved write does not.
      */
     public static void scoreFused(
             FloatArray probe, FloatArray build, FloatArray best, IntArray dims) {

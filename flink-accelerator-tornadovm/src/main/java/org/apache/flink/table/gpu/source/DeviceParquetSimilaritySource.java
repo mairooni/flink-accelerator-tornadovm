@@ -342,6 +342,7 @@ public final class DeviceParquetSimilaritySource
 
         /** The corpus, read once and kept on the device for the life of the plan. */
         private FloatArray corpus;
+
         private int corpusRows = -1;
         private StringBuilder corpusPathHolder;
         private IntArray corpusKeys;
@@ -470,15 +471,18 @@ public final class DeviceParquetSimilaritySource
             dims.set(2, d);
 
             final boolean materialise = source.contraction != Contraction.FUSED;
-            scores = new FloatArray(materialise ? (long) rows * corpusRows > Integer.MAX_VALUE
-                            ? 1
-                            : rows * corpusRows : 1);
+            scores =
+                    new FloatArray(
+                            materialise
+                                    ? (long) rows * corpusRows > Integer.MAX_VALUE
+                                            ? 1
+                                            : rows * corpusRows
+                                    : 1);
 
             // Graph 0: the corpus, read once and left where it lands.
             final TaskGraph corpusGraph =
                     new TaskGraph("corpus")
-                            .transferToDevice(
-                                    DataTransferMode.EVERY_EXECUTION, corpusKeys, corpus)
+                            .transferToDevice(DataTransferMode.EVERY_EXECUTION, corpusKeys, corpus)
                             .libraryTask(
                                     "read",
                                     Cudf::readParquet,
@@ -496,11 +500,7 @@ public final class DeviceParquetSimilaritySource
                     new TaskGraph("region")
                             .consumeFromDevice("corpus", corpus)
                             .transferToDevice(
-                                    DataTransferMode.EVERY_EXECUTION,
-                                    probeKeys,
-                                    probe,
-                                    best,
-                                    dims)
+                                    DataTransferMode.EVERY_EXECUTION, probeKeys, probe, best, dims)
                             .libraryTask(
                                     "read",
                                     Cudf::readParquet,
@@ -572,8 +572,7 @@ public final class DeviceParquetSimilaritySource
                     scheduler.addWorkerGrid("region.gemm", new WorkerGrid1D(rows));
                     break;
             }
-            region =
-                    region.transferToHost(DataTransferMode.EVERY_EXECUTION, best, probeKeys);
+            region = region.transferToHost(DataTransferMode.EVERY_EXECUTION, best, probeKeys);
 
             grid = scheduler;
             plan =

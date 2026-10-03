@@ -42,8 +42,8 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
  *
  * <p>Each entry accumulates sequentially in one thread, which is the same shape as the host's
  * accumulator and therefore carries the same hazard §T46 found: in FP32 a running total that grows
- * far past the size of its increments stops accumulating. cuBLAS blocks its reduction and keeps
- * the partials small. Expect this kernel to be less accurate than the GEMM, and measurably so.
+ * far past the size of its increments stops accumulating. cuBLAS blocks its reduction and keeps the
+ * partials small. Expect this kernel to be less accurate than the GEMM, and measurably so.
  */
 public final class DeviceGram {
 

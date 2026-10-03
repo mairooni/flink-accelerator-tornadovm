@@ -27,7 +27,6 @@ import org.apache.flink.table.accelerator.AccelFilter;
 import org.apache.flink.table.accelerator.AccelFunction;
 import org.apache.flink.table.accelerator.AccelInputRef;
 import org.apache.flink.table.accelerator.AccelLiteral;
-import org.apache.flink.table.accelerator.AccelNode;
 import org.apache.flink.table.accelerator.AccelProject;
 import org.apache.flink.table.accelerator.AccelScan;
 import org.apache.flink.table.types.logical.CharType;
@@ -59,8 +58,8 @@ import java.util.List;
  *
  * <p>What changes that is the pattern count. Each extra pattern costs the device ~6.6 ms and four
  * CPU cores ~271 ms, so the read is paid once on both sides while the matching diverges by ~41x a
- * pattern. The region is therefore worth selecting in proportion to {@code k}, which is why
- * {@link #MIN_PATTERNS} exists and is not 1.
+ * pattern. The region is therefore worth selecting in proportion to {@code k}, which is why {@link
+ * #MIN_PATTERNS} exists and is not 1.
  *
  * <h2>What the shape has to be</h2>
  *
@@ -91,14 +90,16 @@ public final class GpuGrokSpec implements Serializable {
      */
     public static final int MIN_PATTERNS = 2;
 
-    /** Constructs where cuDF's regex and {@code java.util.regex} are known to diverge or to fail. */
+    /**
+     * Constructs where cuDF's regex and {@code java.util.regex} are known to diverge or to fail.
+     */
     private static final String[] REFUSED = {
-        "(?=", "(?!", "(?<=", "(?<!",   // lookaround: cuDF has none
-        "\\b", "\\B",                     // word boundaries differ on Unicode
-        "(?i", "(?m", "(?s", "(?x",      // inline flags: cuDF takes flags per call, not inline
-        "\\p{", "\\P{",                  // Unicode property classes differ
-        "++", "*+", "?+",                 // possessive quantifiers: Java only
-        "\\G", "\\A", "\\Z", "\\z",    // anchors Java has and cuDF does not
+        "(?=", "(?!", "(?<=", "(?<!", // lookaround: cuDF has none
+        "\\b", "\\B", // word boundaries differ on Unicode
+        "(?i", "(?m", "(?s", "(?x", // inline flags: cuDF takes flags per call, not inline
+        "\\p{", "\\P{", // Unicode property classes differ
+        "++", "*+", "?+", // possessive quantifiers: Java only
+        "\\G", "\\A", "\\Z", "\\z", // anchors Java has and cuDF does not
     };
 
     private final int stringField;
@@ -169,7 +170,8 @@ public final class GpuGrokSpec implements Serializable {
         if (calls.size() != 1 || calls.get(0).function() != AccelAggFunction.COUNT_STAR) {
             return Recognition.no("the aggregate is not a single COUNT(*)");
         }
-        if (aggregate.inputs().size() != 1 || !(aggregate.inputs().get(0) instanceof AccelProject)) {
+        if (aggregate.inputs().size() != 1
+                || !(aggregate.inputs().get(0) instanceof AccelProject)) {
             return Recognition.no("no projection beneath the aggregate");
         }
         final AccelProject project = (AccelProject) aggregate.inputs().get(0);
@@ -211,7 +213,9 @@ public final class GpuGrokSpec implements Serializable {
             }
             if (!(call.operands().get(1) instanceof AccelLiteral)) {
                 return Recognition.no(
-                        "conjunct " + i + " has a computed pattern; a regex is compiled, and one"
+                        "conjunct "
+                                + i
+                                + " has a computed pattern; a regex is compiled, and one"
                                 + " compiled per row is not a thing any engine does");
             }
             final Object value = ((AccelLiteral) call.operands().get(1)).value();
@@ -222,7 +226,10 @@ public final class GpuGrokSpec implements Serializable {
             final String refused = unsupported(pattern);
             if (refused != null) {
                 return Recognition.no(
-                        "pattern " + i + " uses " + refused
+                        "pattern "
+                                + i
+                                + " uses "
+                                + refused
                                 + ", which this binding's regex and java.util.regex do not agree on");
             }
             patterns.add(pattern);
@@ -232,14 +239,14 @@ public final class GpuGrokSpec implements Serializable {
         }
         final LogicalType matched = scan.outputType().getTypeAt(field);
         if (!(matched instanceof VarCharType) && !(matched instanceof CharType)) {
-            return Recognition.no("the matched column is " + matched + ", and REGEXP reads a string");
+            return Recognition.no(
+                    "the matched column is " + matched + ", and REGEXP reads a string");
         }
         if (matched.isNullable()) {
             return Recognition.no(
                     "a nullable string has no validity mask in this binding; declare it NOT NULL");
         }
-        return Recognition.yes(
-                new GpuGrokSpec(field, patterns, aggregate.outputType()), scan);
+        return Recognition.yes(new GpuGrokSpec(field, patterns, aggregate.outputType()), scan);
     }
 
     /** Which refused construct a pattern uses, or null when it uses none of them. */

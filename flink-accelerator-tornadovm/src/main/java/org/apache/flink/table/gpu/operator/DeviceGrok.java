@@ -25,10 +25,10 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
 /**
  * The kernel between the regexes and the count: the JIT half of a grok region.
  *
- * <p>cuDF writes one byte a row per pattern; this folds them into one survivor flag. It is the
- * half a library has nothing to offer for — a per-row boolean combination is exactly what a
- * generated kernel is good at, and exactly what cuDF would need a separate pass and a separate
- * allocation for.
+ * <p>cuDF writes one byte a row per pattern; this folds them into one survivor flag. It is the half
+ * a library has nothing to offer for — a per-row boolean combination is exactly what a generated
+ * kernel is good at, and exactly what cuDF would need a separate pass and a separate allocation
+ * for.
  *
  * <p>Eight mask parameters rather than an array of them because TornadoVM marshals each task
  * argument separately and has no array-of-arrays; {@code used} says how many carry a pattern, and
@@ -41,20 +41,45 @@ public final class DeviceGrok {
 
     private DeviceGrok() {}
 
-    public static void combine(ByteArray m0, ByteArray m1, ByteArray m2, ByteArray m3,
-            ByteArray m4, ByteArray m5, ByteArray m6, ByteArray m7, IntArray hits, IntArray dims) {
+    public static void combine(
+            ByteArray m0,
+            ByteArray m1,
+            ByteArray m2,
+            ByteArray m3,
+            ByteArray m4,
+            ByteArray m5,
+            ByteArray m6,
+            ByteArray m7,
+            IntArray hits,
+            IntArray dims) {
         final int rows = dims.get(0);
         final int used = dims.get(1);
         for (@Parallel int i = 0; i < rows; i++) {
             int all = 1;
-            if (used > 0 && m0.get(i) == 0) { all = 0; }
-            if (used > 1 && m1.get(i) == 0) { all = 0; }
-            if (used > 2 && m2.get(i) == 0) { all = 0; }
-            if (used > 3 && m3.get(i) == 0) { all = 0; }
-            if (used > 4 && m4.get(i) == 0) { all = 0; }
-            if (used > 5 && m5.get(i) == 0) { all = 0; }
-            if (used > 6 && m6.get(i) == 0) { all = 0; }
-            if (used > 7 && m7.get(i) == 0) { all = 0; }
+            if (used > 0 && m0.get(i) == 0) {
+                all = 0;
+            }
+            if (used > 1 && m1.get(i) == 0) {
+                all = 0;
+            }
+            if (used > 2 && m2.get(i) == 0) {
+                all = 0;
+            }
+            if (used > 3 && m3.get(i) == 0) {
+                all = 0;
+            }
+            if (used > 4 && m4.get(i) == 0) {
+                all = 0;
+            }
+            if (used > 5 && m5.get(i) == 0) {
+                all = 0;
+            }
+            if (used > 6 && m6.get(i) == 0) {
+                all = 0;
+            }
+            if (used > 7 && m7.get(i) == 0) {
+                all = 0;
+            }
             hits.set(i, all);
         }
     }

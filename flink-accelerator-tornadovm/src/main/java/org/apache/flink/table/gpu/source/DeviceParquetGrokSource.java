@@ -293,8 +293,7 @@ public final class DeviceParquetGrokSource
             // Overridable only to investigate the fault, never to work around it. A path that
             // returns a short count without erroring is not something to leave reachable by a
             // configuration anyone would set on purpose, so the switch says what it is.
-            final boolean unsafe =
-                    Boolean.getBoolean("flink.accelerator.grok.unsafe-parallelism");
+            final boolean unsafe = Boolean.getBoolean("flink.accelerator.grok.unsafe-parallelism");
             if (parallelism > 1 && unsafe) {
                 LOG.warn(
                         "running the grok region at parallelism {} because"
@@ -426,9 +425,16 @@ public final class DeviceParquetGrokSource
                     region.task(
                                     "combine",
                                     DeviceGrok::combine,
-                                    masks[0], masks[1], masks[2], masks[3],
-                                    masks[4], masks[5], masks[6], masks[7],
-                                    hits, dims)
+                                    masks[0],
+                                    masks[1],
+                                    masks[2],
+                                    masks[3],
+                                    masks[4],
+                                    masks[5],
+                                    masks[6],
+                                    masks[7],
+                                    hits,
+                                    dims)
                             .transferToHost(DataTransferMode.EVERY_EXECUTION, hits);
 
             final GridScheduler grid = new GridScheduler();
