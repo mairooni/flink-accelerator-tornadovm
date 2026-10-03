@@ -39,6 +39,7 @@ ENVFILE="${LLM_BENCH_ENV:-$HOME/gpu-bench-data/flink-llm/llm-bench.env}"
 source "$ENVFILE"
 
 ARM="" WARM=0 MODES=8 EXPLAIN=""
+JOB_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gpu|gpu) ARM=Gpu ;;
@@ -47,7 +48,9 @@ while [[ $# -gt 0 ]]; do
         --modes)   MODES="$2"; shift ;;
         --explain) EXPLAIN="--explain" ;;
         -h|--help) sed -n '18,32p' "$HERE/$(basename "${BASH_SOURCE[0]}")"; exit 0 ;;
-        *) echo "unknown flag $1" >&2; exit 2 ;;
+        # Anything else is handed to the pipeline, so --max-new-tokens and the
+        # rest of TelemetryTriage's flags are reachable without editing this.
+        *) JOB_ARGS+=("$1") ;;
     esac
     shift
 done
@@ -94,7 +97,7 @@ until curl -s localhost:8081/overview 2>/dev/null | grep -qE '"slots-available":
 run_once() {
     "$FLINK_HOME/bin/flink" run -c "$CLASS" "$JAR" \
         --data "$LLM_BENCH_DATA" --model "$LLM_BENCH_MODEL" \
-        --binary "$LLM_BENCH_BINARY" --modes "$MODES" $EXPLAIN 2>&1
+        --binary "$LLM_BENCH_BINARY" --modes "$MODES" $EXPLAIN "${JOB_ARGS[@]}" 2>&1
 }
 
 if (( WARM )); then
