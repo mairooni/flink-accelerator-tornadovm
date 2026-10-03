@@ -6,9 +6,18 @@
 # sources by hand to get a shell the demos run in.
 
 _common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The report is noise inside a script, but swallowing it outright turns any
+# failure in there into a script that exits silently, which is how a bug in it
+# cost an afternoon. Keep it quiet when it works, show everything when it does
+# not.
+_env_out="$(source "$_common_dir/3-env.sh" 2>&1)" || {
+    printf '%s\n' "$_env_out" >&2
+    printf '\n\033[1;31mERROR: 3-env.sh failed -- see above\033[0m\n' >&2
+    exit 1
+}
 # shellcheck source=/dev/null
 source "$_common_dir/3-env.sh" > /dev/null
-unset _common_dir
+unset _common_dir _env_out
 
 # --- Hadoop ----------------------------------------------------------------
 # flink-sql-parquet bundles org.apache.parquet.* and none of org.apache.hadoop.*,

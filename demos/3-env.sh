@@ -36,8 +36,24 @@ fi
 # $DEMO_ROOT/env.sh is written by 1-fetch.sh; env.local.sh is hand-written on a
 # machine whose checkouts live elsewhere. Both may reset any root above.
 for _envf in "$DEMO_ROOT/env.sh" "$_demos_dir/env.local.sh"; do
-    [[ -f "$_envf" ]] && source "$_envf"
+    if [[ -f "$_envf" ]]; then source "$_envf"; fi
 done
+
+# --- the roots must be absolute -------------------------------------------
+# A relative DEMO_ROOT (a missing leading slash is the usual way) resolves
+# against whatever directory a script happens to cd into, so the repositories
+# and the data end up somewhere nobody intended.
+for _v in DEMO_ROOT TORNADOVM_SRC FLINK_SRC PROVIDER_SRC DATA_ROOT RAPIDS_HOME; do
+    _p="${!_v}"
+    if [[ -n "$_p" && "$_p" != /* ]]; then
+        printf '\n\033[1;31mERROR: %s is a relative path: %s\033[0m\n' "$_v" "$_p" >&2
+        printf '  Paths must be absolute -- a missing leading slash is the usual cause.\n' >&2
+        printf '  Try:  export %s=%s/%s\n\n' "$_v" "$PWD" "$_p" >&2
+        unset _v _p
+        return 1 2>/dev/null || exit 1
+    fi
+done
+unset _v _p
 
 # --- JDK 21 ---------------------------------------------------------------
 # TornadoVM's off-heap arrays are java.lang.foreign, preview on 21, so the
@@ -56,8 +72,14 @@ fi
 # Resolved from TORNADOVM_SRC rather than inherited: a machine with SDKMAN on
 # the PATH already exports TORNADOVM_HOME, and that install loads, reports no
 # CUDA device, and sends every demo quietly down the CPU path.
-_sdk="$(ls -d "$TORNADOVM_SRC"/dist/*/*/ 2>/dev/null | head -1)"
-[[ -n "$_sdk" ]] && export TORNADOVM_HOME="${_sdk%/}"
+# A plain `ls ... | head` here is fatal to a caller running set -euo pipefail
+# when dist/ does not exist yet, which is exactly the state before 1-fetch.sh
+# has built anything. Glob instead, and never return non-zero.
+_sdk=""
+for _d in "$TORNADOVM_SRC"/dist/*/*/; do
+    if [[ -d "$_d" ]]; then _sdk="${_d%/}"; break; fi
+done
+if [[ -n "$_sdk" ]]; then export TORNADOVM_HOME="$_sdk"; fi
 
 export FLINK_HOME="${FLINK_HOME:-$FLINK_SRC/flink-dist/target/flink-2.3.0-bin/flink-2.3.0}"
 export DEMO_ROOT TORNADOVM_SRC FLINK_SRC PROVIDER_SRC DATA_ROOT RAPIDS_HOME
@@ -95,3 +117,7 @@ else
     printf '  on a machine with the repos elsewhere, set them in demos/env.local.sh\n\n'
 fi
 unset _demos_dir _envf _c _sdk _env_ok
+
+# Never hand a non-zero status back: this file is sourced by scripts that run
+# under set -e, and the last test above may legitimately be false.
+return 0 2>/dev/null || true
