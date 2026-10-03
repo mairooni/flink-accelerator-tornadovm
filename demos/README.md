@@ -46,13 +46,17 @@ Then, in a shell where `3-env.sh` has been sourced:
 ```bash
 ./demo-haversine.sh --print-kernel     # 8M rows; the CUDA lands in the TaskManager .out
 ./demo-haversine.sh --keep-cluster     # leave the cluster up for the web UI
+./stop.sh                              # stop a cluster left up that way
 ./demo-regex.sh --patterns 8
 ./demo-regex.sh --patterns 1           # below the floor: the region declines
 ./demo-llm.sh
 ```
 
 Each script starts a cluster, runs one job, prints what the planner and the
-accelerator decided, and stops the cluster on every exit path.
+accelerator decided, and stops the cluster on every exit path. Flags combine in
+any order, so `--print-kernel --keep-cluster` does both. With `--keep-cluster`
+the cluster stays up afterwards — the job is then visible at
+<http://localhost:8081> — and `./stop.sh` shuts it down.
 
 ## Things that will bite on a new machine
 
