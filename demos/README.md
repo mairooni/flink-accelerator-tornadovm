@@ -14,7 +14,7 @@ author writes that they would not otherwise write is `NOT NULL` in the DDL.
 
 | | | when |
 |---|---|---|
-| `./1-fetch.sh` | clones TornadoVM, Flink and this repository at the right branches, builds all three, deploys the provider into the Flink distribution | once, on a new machine |
+| `./1-fetch.sh` | clones TornadoVM and Flink at the right branches, builds them and this repository, deploys the provider into the Flink distribution | once, on a new machine |
 | `./2-generate-data.sh` | generates the log corpus (16M and 64M lines, ~2.4 GB of Parquet) | once, on a new machine |
 | `source ./3-env.sh` | sets every path the demos need, and says what is missing | every shell |
 
@@ -28,6 +28,11 @@ git clone <this repo> && cd flink-accelerator-tornadovm/demos
 ./2-generate-data.sh    # a few minutes
 source ./3-env.sh
 ```
+
+This repository is not fetched by `1-fetch.sh` — the script ships inside it, so
+it is already the clone you are standing in, and it is only built. The other two
+are left alone if they are already checked out on a different branch or have
+local changes: a setup script has no business switching your branch.
 
 `1-fetch.sh` needs, and checks for: an NVIDIA GPU, a CUDA toolkit whose nvcc
 accepts the host compiler, **JDK 21**, Maven, CMake, Python 3, git and a C++20

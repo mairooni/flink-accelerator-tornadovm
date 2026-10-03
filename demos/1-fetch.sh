@@ -30,8 +30,37 @@ TORNADOVM_REPO="${TORNADOVM_REPO:-https://github.com/mairooni/TornadoVM.git}"
 TORNADOVM_BRANCH="${TORNADOVM_BRANCH:-demo-integration}"
 FLINK_REPO="${FLINK_REPO:-https://github.com/mairooni/flink.git}"
 FLINK_BRANCH="${FLINK_BRANCH:-gpu-offload}"
-PROVIDER_REPO="${PROVIDER_REPO:-https://github.com/mairooni/flink-accelerator-tornadovm.git}"
-PROVIDER_BRANCH="${PROVIDER_BRANCH:-master}"
+
+
+# Clone a repository if it is not there; if it is, leave it alone unless it is
+# already on the branch we want and clean. A demo setup script has no business
+# switching someone's branch or discarding their work, and a tree that is
+# deliberately on something else is usually deliberate.
+ensure_repo() {
+    local dir="$1" url="$2" branch="$3" name="$4"
+    # -d "$dir/.git" is not enough: in a git worktree .git is a file.
+    if ! git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "  cloning $name -> $dir ($branch)"
+        git clone --branch "$branch" "$url" "$dir"
+        return
+    fi
+    local cur; cur="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+    if [[ -n "$(git -C "$dir" status --porcelain)" ]]; then
+        echo "  $name: $dir is on '$cur' with local changes -- left untouched"
+    elif [[ "$cur" != "$branch" ]]; then
+        echo "  $name: $dir is on '$cur', not '$branch' -- left untouched"
+        echo "         (check it out yourself, or point ${name^^}_SRC elsewhere)"
+    else
+        if git -C "$dir" fetch --quiet origin "$branch" 2>/dev/null \
+           && git -C "$dir" merge --quiet --ff-only "origin/$branch" 2>/dev/null; then
+            echo "  $name: $dir on '$branch' -- up to date with origin"
+        else
+            # A fork checked out under a different remote name, or a branch that
+            # exists only locally. Nothing to do, and nothing worth failing over.
+            echo "  $name: $dir on '$branch' -- kept as is (no fast-forward from origin)"
+        fi
+    fi
+}
 
 # ---------------------------------------------------------------------------
 demo_banner "1/6  preflight"
@@ -102,8 +131,7 @@ source ./common.sh   # re-resolve now that RAPIDS exists
 demo_banner "3/6  TornadoVM"
 # ---------------------------------------------------------------------------
 if [[ $SKIP_TORNADO == 0 ]]; then
-    [[ -d "$TORNADOVM_SRC/.git" ]] || git clone --branch "$TORNADOVM_BRANCH" "$TORNADOVM_REPO" "$TORNADOVM_SRC"
-    (cd "$TORNADOVM_SRC" && git fetch --quiet origin "$TORNADOVM_BRANCH" && git checkout --quiet "$TORNADOVM_BRANCH" && git pull --quiet --ff-only)
+    ensure_repo "$TORNADOVM_SRC" "$TORNADOVM_REPO" "$TORNADOVM_BRANCH" tornadovm
     (
       cd "$TORNADOVM_SRC"
       # bin/compile is the canonical build: it also writes etc/tornado.backend,
@@ -136,8 +164,7 @@ TORNADOVM_HOME="${TORNADOVM_HOME%/}"
 demo_banner "4/6  Flink (the long one -- 20-40 minutes the first time)"
 # ---------------------------------------------------------------------------
 if [[ $SKIP_FLINK == 0 ]]; then
-    [[ -d "$FLINK_SRC/.git" ]] || git clone --branch "$FLINK_BRANCH" "$FLINK_REPO" "$FLINK_SRC"
-    (cd "$FLINK_SRC" && git fetch --quiet origin "$FLINK_BRANCH" && git checkout --quiet "$FLINK_BRANCH" && git pull --quiet --ff-only)
+    ensure_repo "$FLINK_SRC" "$FLINK_REPO" "$FLINK_BRANCH" flink
     (cd "$FLINK_SRC" && mvn -q -T1C install -DskipTests -Dcheckstyle.skip -Dspotless.check.skip=true \
                             -Drat.skip=true -Dmaven.javadoc.skip=true -Denforcer.skip=true)
 fi
@@ -146,8 +173,11 @@ fi
 # ---------------------------------------------------------------------------
 demo_banner "5/6  the accelerator provider and the example jars"
 # ---------------------------------------------------------------------------
-[[ -d "$PROVIDER_SRC/.git" ]] || git clone --branch "$PROVIDER_BRANCH" "$PROVIDER_REPO" "$PROVIDER_SRC"
-(cd "$PROVIDER_SRC" && git fetch --quiet origin "$PROVIDER_BRANCH" && git checkout --quiet "$PROVIDER_BRANCH" && git pull --quiet --ff-only)
+# This script ships inside the provider repository, so the provider is already
+# here -- it is the clone the person is standing in. Nothing is fetched or
+# checked out for it: doing so would switch the branch under someone who is
+# working on one, or fail outright on a dirty tree. It is only built.
+echo "provider: $PROVIDER_SRC ($(git -C "$PROVIDER_SRC" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'not a git checkout'))"
 TVM_VERSION="$(basename "$(dirname "$TORNADOVM_HOME")" | sed -E 's/^tornadovm-(.*)-cuda-linux-amd64$/\1/')"
 echo "building against TornadoVM $TVM_VERSION"
 (cd "$PROVIDER_SRC" && mvn -q -DskipTests -Dcheckstyle.skip -Dspotless.check.skip=true -Drat.skip=true \
