@@ -251,6 +251,11 @@ fi
 # 6. The environment file the run script sources
 # ---------------------------------------------------------------------------------------
 ENVFILE="$WORK/llm-bench.env"
+# The shim is RPATH'd into llama-server, so this is normally redundant -- but a binary rebuilt
+# elsewhere, or an RPATH stripped by a packager, fails with a missing libcublas and no hint.
+# Recording it costs nothing and the Java side ignores it when it is empty.
+SHIM_LIB="$WORK/cuda-shim/targets/x86_64-linux/lib"
+[[ -d "$SHIM_LIB" ]] || SHIM_LIB=""
 cat > "$ENVFILE" <<ENV
 # Written by llm-bench-setup.sh on $(date -Is). Sourced by llm-bench-run.sh.
 export JAVA_HOME="$JDK21"
@@ -261,6 +266,7 @@ export LLM_BENCH_JAR_PREFIX="$JAR_PREFIX"
 export LLM_BENCH_MODEL="$MODEL"
 export LLM_BENCH_BINARY="$LLAMA_SERVER"
 export LLM_BENCH_DATA="$WORK/readings"
+export LLM_BENCH_LIBRARY_PATH="$SHIM_LIB"
 export LLM_BENCH_WORK="$WORK"
 ENV
 say "wrote $ENVFILE"
