@@ -27,8 +27,12 @@ mkdir -p "$DATA_ROOT"
 demo_banner "log corpus -> $DATA_ROOT"
 export HADOOP_CLASSPATH="$(hadoop_classpath)"
 EX="$PROVIDER_SRC/flink-accelerator-tornadovm-examples/target"
-JAR="$EX/flink-accelerator-tornadovm-examples-0.1.0-SNAPSHOT-GrokSQLExample.jar"
-[[ -f "$JAR" ]] || demo_die "missing $JAR -- run ./1-fetch.sh first"
+# The examples module shades one jar per main class, so the generator is in its
+# own, not in GrokSQLExample's.
+JAR="$EX/flink-accelerator-tornadovm-examples-0.1.0-SNAPSHOT-LogCorpusGenerator.jar"
+[[ -f "$JAR" ]] || demo_die "missing $(basename "$JAR") in $EX -- run ./1-fetch.sh first"
+unzip -l "$JAR" 2>/dev/null | grep -q 'LogCorpusGenerator\.class' \
+    || demo_die "$(basename "$JAR") does not contain LogCorpusGenerator -- rebuild with ./1-fetch.sh"
 CP="$(ls "$FLINK_HOME"/lib/*.jar | tr '\n' ':')"
 
 TODO=()
