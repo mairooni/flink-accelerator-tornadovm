@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
 #
-# Sets a clean laptop up to run the three demos. Idempotent: re-running skips
-# what is already done, so a failed step can be fixed and the script re-run.
+# Step 1 of 3 -- fetch the three repositories at the right branches and build
+# them, then deploy the provider into the Flink distribution.
 #
-#   ./setup.sh              everything
-#   ./setup.sh --skip-flink only the parts that are quick to redo
+#   ./1-fetch.sh                    everything
+#   ./1-fetch.sh --skip-flink       when Flink is already built
+#   ./1-fetch.sh --skip-tornadovm   when the TornadoVM SDK is already built
+#
+# Idempotent: re-running skips what is already done, so a failed step can be
+# fixed and the script re-run. Budget 40-70 minutes on a cold machine; Flink's
+# own build is most of it.
 #
 # Requires: an NVIDIA GPU with a CUDA toolkit, JDK 21, Maven, CMake, Python 3,
 # git, and a C++20 compiler. Everything else it fetches or builds.
+#
+# Then:  ./2-generate-data.sh   and   source ./3-env.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./common.sh
 
-SKIP_FLINK=0; SKIP_TORNADO=0; SKIP_DATA=0
+SKIP_FLINK=0; SKIP_TORNADO=0
 for a in "$@"; do case "$a" in
     --skip-flink) SKIP_FLINK=1 ;;
     --skip-tornadovm) SKIP_TORNADO=1 ;;
-    --skip-data) SKIP_DATA=1 ;;
     *) demo_die "unknown argument $a" ;;
 esac; done
 
@@ -28,7 +34,7 @@ PROVIDER_REPO="${PROVIDER_REPO:-https://github.com/mairooni/flink-accelerator-to
 PROVIDER_BRANCH="${PROVIDER_BRANCH:-master}"
 
 # ---------------------------------------------------------------------------
-demo_banner "1/7  preflight"
+demo_banner "1/6  preflight"
 # ---------------------------------------------------------------------------
 command -v nvidia-smi >/dev/null || demo_die "no nvidia-smi: this needs an NVIDIA GPU"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
@@ -69,7 +75,7 @@ rm -rf "$_probe"
 mkdir -p "$DEMO_ROOT" "$DATA_ROOT"
 
 # ---------------------------------------------------------------------------
-demo_banner "2/7  RAPIDS libcudf"
+demo_banner "2/6  RAPIDS libcudf"
 # ---------------------------------------------------------------------------
 # The cuDF shim links against RAPIDS. It is a binary distribution, so it is
 # fetched rather than built; the pip wheels are the only packaging that does
@@ -93,7 +99,7 @@ done
 source ./common.sh   # re-resolve now that RAPIDS exists
 
 # ---------------------------------------------------------------------------
-demo_banner "3/7  TornadoVM"
+demo_banner "3/6  TornadoVM"
 # ---------------------------------------------------------------------------
 if [[ $SKIP_TORNADO == 0 ]]; then
     [[ -d "$TORNADOVM_SRC/.git" ]] || git clone --branch "$TORNADOVM_BRANCH" "$TORNADOVM_REPO" "$TORNADOVM_SRC"
@@ -127,7 +133,7 @@ export TORNADOVM_HOME="${TORNADOVM_HOME:-$(ls -d "$TORNADOVM_SRC"/dist/*/*/ | he
 TORNADOVM_HOME="${TORNADOVM_HOME%/}"
 
 # ---------------------------------------------------------------------------
-demo_banner "4/7  Flink (the long one -- 20-40 minutes the first time)"
+demo_banner "4/6  Flink (the long one -- 20-40 minutes the first time)"
 # ---------------------------------------------------------------------------
 if [[ $SKIP_FLINK == 0 ]]; then
     [[ -d "$FLINK_SRC/.git" ]] || git clone --branch "$FLINK_BRANCH" "$FLINK_REPO" "$FLINK_SRC"
@@ -138,7 +144,7 @@ fi
 [[ -d "$FLINK_HOME" ]] || demo_die "no Flink distribution at $FLINK_HOME"
 
 # ---------------------------------------------------------------------------
-demo_banner "5/7  the accelerator provider and the example jars"
+demo_banner "5/6  the accelerator provider and the example jars"
 # ---------------------------------------------------------------------------
 [[ -d "$PROVIDER_SRC/.git" ]] || git clone --branch "$PROVIDER_BRANCH" "$PROVIDER_REPO" "$PROVIDER_SRC"
 (cd "$PROVIDER_SRC" && git fetch --quiet origin "$PROVIDER_BRANCH" && git checkout --quiet "$PROVIDER_BRANCH" && git pull --quiet --ff-only)
@@ -148,7 +154,7 @@ echo "building against TornadoVM $TVM_VERSION"
                           -Dtornado.version="$TVM_VERSION" install)
 
 # ---------------------------------------------------------------------------
-demo_banner "6/7  deploying into the Flink distribution"
+demo_banner "6/6  deploying into the Flink distribution"
 # ---------------------------------------------------------------------------
 TORNADOVM_HOME="$TORNADOVM_HOME" FLINK_SRC="$FLINK_SRC" \
     PROVIDER_JAR="$(ls "$PROVIDER_SRC"/flink-accelerator-tornadovm/target/flink-accelerator-tornadovm-*.jar | grep -v sources | head -1)" \
@@ -170,23 +176,6 @@ print("  config.yaml: 4 task slots, 4g task off-heap")
 PY
 
 # ---------------------------------------------------------------------------
-demo_banner "7/7  datasets"
-# ---------------------------------------------------------------------------
-if [[ $SKIP_DATA == 0 ]]; then
-    export HADOOP_CLASSPATH="$(hadoop_classpath)"
-    EX="$PROVIDER_SRC/flink-accelerator-tornadovm-examples/target"
-    CP="$(ls "$FLINK_HOME"/lib/*.jar | tr '\n' ':')"
-    # Haversine reads CSV it writes itself, so only the log corpus is built here.
-    if [[ ! -d "$DATA_ROOT/logs16/part-00000.parquet" && ! -f "$DATA_ROOT/logs16/part-00000.parquet" ]]; then
-        echo "generating the log corpus (16M and 64M lines, about 2.4 GB of Parquet)"
-        "$JAVA_HOME/bin/java" -Xmx12g -cp "$CP$EX/flink-accelerator-tornadovm-examples-0.1.0-SNAPSHOT-GrokSQLExample.jar:$HADOOP_CLASSPATH" \
-            org.apache.flink.table.examples.java.gpu.LogCorpusGenerator "$DATA_ROOT" 16000000 64000000
-    else
-        echo "log corpus already at $DATA_ROOT"
-    fi
-fi
-
-# ---------------------------------------------------------------------------
 cat > "$DEMO_ROOT/env.sh" <<ENV
 # Written by setup.sh on $(date -Is). Sourced by the demo scripts.
 export DEMO_ROOT="$DEMO_ROOT"
@@ -200,6 +189,6 @@ export RAPIDS_HOME="$RAPIDS_HOME"
 export JAVA_HOME="$JAVA_HOME"
 export CUDA_PATH="$CUDA_PATH"
 ENV
-demo_banner "ready"
+demo_banner "built"
 echo "  env written to $DEMO_ROOT/env.sh"
-echo "  run a demo:  ./demo-haversine.sh | ./demo-regex.sh | ./demo-llm.sh"
+echo "  next:  ./2-generate-data.sh   then   source ./3-env.sh"

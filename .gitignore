@@ -3,3 +3,5 @@ target/
 *.iml
 .idea/
 dependency-reduced-pom.xml
+demos/env.local.sh
+cufile.log

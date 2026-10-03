@@ -10,25 +10,33 @@ author writes that they would not otherwise write is `NOT NULL` in the DDL.
 | `demo-regex.sh` | a whole SQL subtree served by a CUDA library | cuDF: `read_parquet` + `contains_re` |
 | `demo-llm.sh` | GPU-preprocessed SQL feeding a resident language model | cuDF, and cuDNN inside jitllm |
 
-## Getting there from nothing
+## Three scripts
+
+| | | when |
+|---|---|---|
+| `./1-fetch.sh` | clones TornadoVM, Flink and this repository at the right branches, builds all three, deploys the provider into the Flink distribution | once, on a new machine |
+| `./2-generate-data.sh` | generates the log corpus (16M and 64M lines, ~2.4 GB of Parquet) | once, on a new machine |
+| `source ./3-env.sh` | sets every path the demos need, and says what is missing | every shell |
+
+A fresh laptop runs all three; a machine that is already set up runs only the
+third. Both of the first two are idempotent, so a failed step can be fixed and
+the script re-run.
 
 ```bash
 git clone <this repo> && cd flink-accelerator-tornadovm/demos
-./setup.sh
+./1-fetch.sh            # 40-70 minutes cold; Flink's own build is most of it
+./2-generate-data.sh    # a few minutes
+source ./3-env.sh
 ```
 
-`setup.sh` is idempotent — re-run it after fixing anything and it skips what is
-already done. It clones TornadoVM, Flink and this repository, fetches the
-RAPIDS libcudf wheels, builds all three, deploys the provider into the Flink
-distribution, and generates the log corpus. Budget 40–70 minutes on a cold
-machine; Flink's own build is most of it.
+`1-fetch.sh` needs, and checks for: an NVIDIA GPU, a CUDA toolkit whose nvcc
+accepts the host compiler, **JDK 21**, Maven, CMake, Python 3, git and a C++20
+compiler. Override any path by exporting it first — `DEMO_ROOT`,
+`TORNADOVM_SRC`, `FLINK_SRC`, `PROVIDER_SRC`, `DATA_ROOT`, `RAPIDS_HOME`,
+`JAVA_HOME`, `CUDA_PATH` — or, on a machine whose checkouts live elsewhere, put
+them in `demos/env.local.sh`, which `3-env.sh` reads and which is not committed.
 
-It needs, and checks for: an NVIDIA GPU, a CUDA toolkit, **JDK 21**, Maven,
-CMake, Python 3, git and a C++20 compiler. Override any path by exporting it
-first — `DEMO_ROOT`, `TORNADOVM_SRC`, `FLINK_SRC`, `PROVIDER_SRC`, `DATA_ROOT`,
-`RAPIDS_HOME`, `JAVA_HOME`, `CUDA_PATH`.
-
-Then:
+Then, in a shell where `3-env.sh` has been sourced:
 
 ```bash
 ./demo-haversine.sh --print-kernel     # and the CUDA it generated
