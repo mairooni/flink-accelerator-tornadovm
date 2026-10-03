@@ -15,7 +15,7 @@ author writes that they would not otherwise write is `NOT NULL` in the DDL.
 | | | when |
 |---|---|---|
 | `./1-fetch.sh` | clones TornadoVM and Flink at the right branches, builds them and this repository, deploys the provider into the Flink distribution | once, on a new machine |
-| `./2-generate-data.sh` | generates the log corpus (16M and 64M lines, ~2.4 GB of Parquet) | once, on a new machine |
+| `./2-generate-data.sh` | generates the log corpora (1M, 16M and 64M lines, ~2.4 GB of Parquet) | once, on a new machine |
 | `source ./3-env.sh` | sets every path the demos need, and says what is missing | every shell |
 
 A fresh laptop runs all three; a machine that is already set up runs only the
@@ -48,8 +48,9 @@ Then, in a shell where `3-env.sh` has been sourced:
 ./demo-haversine.sh --keep-cluster     # leave the cluster up for the web UI
 ./stop.sh                              # stop a cluster left up that way
 
-./demo-regex.sh --patterns 8 --print-bytecodes   # library tasks and the generated
-                                                 # kernel as nodes of one task graph
+./demo-regex.sh --rows 1 --patterns 8 --print-bytecodes   # library tasks and the
+                      # generated kernel as nodes of one task graph. --rows 1 is the
+                      # 1M corpus: two Parquet files, so ~130 bytecode lines not 2,000
 ./demo-regex.sh --patterns 8
 ./demo-regex.sh --patterns 1           # below the floor: the region declines
 ./demo-llm.sh

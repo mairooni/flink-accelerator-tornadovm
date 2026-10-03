@@ -2,18 +2,22 @@
 #
 # Step 2 of 3 -- generate the corpora the demos read.
 #
-#   ./2-generate-data.sh                 the log corpus (16M and 64M lines)
+#   ./2-generate-data.sh                 the log corpora (1M, 16M and 64M lines)
 #   ./2-generate-data.sh --with-haversine  also materialise the 8M and 32M point CSVs
 #   ./2-generate-data.sh --rows 16000000,64000000   pick the log sizes
+#
+# The 1M corpus is two Parquet files rather than 32, so --print-bytecodes on the
+# regex demo produces about 130 lines instead of 2,000. It costs 31 MB.
 #
 # Idempotent: a corpus that is already there is left alone. The log corpus is
 # about 2.4 GB of Parquet and takes a few minutes; keep DATA_ROOT on a real
 # disk, not on /tmp, which is tmpfs on most distributions and will eat RAM.
+# Total is about 2.4 GB.
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./common.sh
 
-LOGS="16000000,64000000"; WITH_HAVERSINE=0
+LOGS="1000000,16000000,64000000"; WITH_HAVERSINE=0
 while [[ $# -gt 0 ]]; do case "$1" in
     --rows) LOGS="$2"; shift 2 ;;
     --with-haversine) WITH_HAVERSINE=1; shift ;;
