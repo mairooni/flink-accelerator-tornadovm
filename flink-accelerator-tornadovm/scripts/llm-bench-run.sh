@@ -127,7 +127,18 @@ fi
 
 echo
 printf '\033[1m---- %s ----\033[0m\n' "$LABEL"
-echo "$OUT" | grep -oE '@@TRIAGE.*' | tr ' ' '\n' | grep '=' | sed 's/^/  /'
+# Readable rather than raw key=value: this is the slide, not a log line.
+echo "$OUT" | grep -oE '@@TRIAGE.*' | tr ' ' '\n' | grep '=' | awk -F= '
+    $1=="engine"            { printf "  %-26s %s\n", "engine", $2 }
+    $1=="resident"          { printf "  %-26s %s\n", "model already resident", ($2=="true" ? "yes" : "no -- this run loaded it") }
+    $1=="model_load_ms"     { printf "  %-26s %.1f s\n", "model load", $2/1000 }
+    $1=="prompt_tokens"     { printf "  %-26s %s\n", "prompt tokens", $2 }
+    $1=="generated_tokens"  { printf "  %-26s %s\n", "generated tokens", $2 }
+    $1=="prefill_ms"        { printf "  %-26s %s ms\n", "prefill", $2 }
+    $1=="decode_ms"         { printf "  %-26s %s ms\n", "decode", $2 }
+    $1=="decode_tok_s"      { printf "  %-26s %s tokens/s\n", "decode throughput", $2 }
+    $1=="inference_wall_ms" { printf "  %-26s %s ms\n", "inference, end to end", $2 }'
+
 printf '  \033[1mflink run wall time: %s s\033[0m%s\n' "$WALL" \
        "$( ((WARM)) && echo '  (warm: the engine was already resident)' || echo '  (COLD: this run loaded the model)')"
 

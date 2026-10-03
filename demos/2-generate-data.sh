@@ -112,14 +112,18 @@ if [[ $WITH_MODEL == 1 && -f "$MODEL" ]]; then
     if [[ -x "$LLM_SETUP" ]]; then
         demo_banner "demo 3: jitllm, llama.cpp and the triage dataset"
         echo "  building the two engines -- about fifteen minutes the first time"
+        # Keep the triage readings with the other corpora rather than in the
+        # script's own default under $HOME.
+        : "${LLM_BENCH_WORK:=$DATA_ROOT/flink-llm}"
         if JITLLM_SRC="$JITLLM_SRC" LLAMACPP_SRC="$LLAMACPP_SRC" MODEL="$MODEL" \
+           WORK="$LLM_BENCH_WORK" \
            TORNADO_SDK="$TORNADOVM_HOME" FLINK_HOME="$FLINK_HOME" \
            "$LLM_SETUP" --skip-tornadovm --skip-flink; then
             echo "  demo 3 ready"
         else
             echo
             echo "  demo 3 setup did not finish. Demos 1 and 2 are unaffected; retry with:"
-            echo "    JITLLM_SRC=$JITLLM_SRC LLAMACPP_SRC=$LLAMACPP_SRC MODEL=$MODEL \\"
+            echo "    JITLLM_SRC=$JITLLM_SRC LLAMACPP_SRC=$LLAMACPP_SRC MODEL=$MODEL WORK=$LLM_BENCH_WORK \\"
             echo "      $LLM_SETUP --skip-tornadovm --skip-flink"
         fi
     fi

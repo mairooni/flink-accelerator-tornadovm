@@ -31,7 +31,12 @@ esac; done
 
 RUNNER="$PROVIDER_SRC/flink-accelerator-tornadovm/scripts/llm-bench-run.sh"
 [[ -x "$RUNNER" ]] || demo_die "missing $RUNNER"
-ENVFILE="${LLM_BENCH_WORK:-$HOME/gpu-bench-data/flink-llm}/llm-bench.env"
+# The triage readings belong with the other corpora. An install made before
+# that was true keeps working: the old location is still searched.
+: "${LLM_BENCH_WORK:=$DATA_ROOT/flink-llm}"
+ENVFILE="$LLM_BENCH_WORK/llm-bench.env"
+[[ -f "$ENVFILE" ]] || { LLM_BENCH_WORK="$HOME/gpu-bench-data/flink-llm"; ENVFILE="$LLM_BENCH_WORK/llm-bench.env"; }
+export LLM_BENCH_WORK
 if [[ ! -f "$ENVFILE" ]]; then
     cat >&2 <<TXT
 
@@ -50,24 +55,22 @@ TXT
 fi
 
 demo_banner "telemetry triage -- $( [[ $ARM == --gpu ]] && echo 'GPU preprocessing + jitllm' || echo 'CPU preprocessing + llama.cpp' )"
+if [[ $ARM == --gpu ]]; then
 cat <<'TXT'
-  The same SQL text in both arms: screen eight million telemetry readings for
-  anomalies, roll the survivors up per machine, hand the digest to a language
-  model for the maintenance note.
-
-  What differs is where each half runs. The accelerated arm offloads the
-  preprocessing and keeps the model resident in the TaskManager's own JVM; the
-  other preprocesses on the cores and calls llama.cpp over HTTP.
-
-  Watch for `resident=` in the output. Cold, the two arms are close -- the
-  accelerated one spends its preprocessing advantage loading 1.4 GiB of
-  weights. The result this demo is about is the warm one.
+  Eight million telemetry readings screened for anomalies and rolled up per
+  machine on the GPU, then the digest handed to a language model in the same
+  JVM for the maintenance note. One SQL statement; no process boundary between
+  the two halves.
 TXT
-# llm-bench-run.sh owns the cluster for this demo. LLM_BENCH_KEEP_CLUSTER makes
-# it reuse one that is already up and leave it running, so this can follow the
-# haversine demo without the web UI dropping out between them. The llama-server
-# is still killed on exit either way -- it holds GPU memory.
-# Only supply the cap if the caller did not.
+else
+cat <<'TXT'
+  The same SQL, with the preprocessing on the cores and the note from
+  llama.cpp over HTTP -- the arrangement this is measured against.
+TXT
+fi
+
+# Only supply the cap if the caller did not. TelemetryTriage defaults to 256,
+# which stops the note mid-sentence.
 case " ${EXTRA[*]-} " in
     *" --max-new-tokens "*) ;;
     *) EXTRA+=(--max-new-tokens "$MAX_NEW_TOKENS") ;;
