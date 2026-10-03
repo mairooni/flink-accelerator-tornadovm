@@ -44,7 +44,8 @@ them in `demos/env.local.sh`, which `3-env.sh` reads and which is not committed.
 Then, in a shell where `3-env.sh` has been sourced:
 
 ```bash
-./demo-haversine.sh --print-kernel     # 8M rows, and the CUDA it generated
+./demo-haversine.sh --print-kernel     # 8M rows; the CUDA lands in the TaskManager .out
+./demo-haversine.sh --keep-cluster     # leave the cluster up for the web UI
 ./demo-regex.sh --patterns 8
 ./demo-regex.sh --patterns 1           # below the floor: the region declines
 ./demo-llm.sh

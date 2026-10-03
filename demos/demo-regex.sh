@@ -11,13 +11,14 @@ cd "$(dirname "$0")"
 source ./common.sh
 [[ -f "$DEMO_ROOT/env.sh" ]] && source "$DEMO_ROOT/env.sh" && source ./common.sh
 
-ROWS=16; PATTERNS=8; ARM=device; PAR=1
+ROWS=16; PATTERNS=8; ARM=device; PAR=1; KEEP=0
 while [[ $# -gt 0 ]]; do case "$1" in
     --rows) ROWS="$2"; shift 2 ;;
     --patterns) PATTERNS="$2"; shift 2 ;;
     --parallelism) PAR="$2"; shift 2 ;;
     --selective) SELECTIVE=--selective; shift ;;
     --cpu) ARM=cpu; shift ;;
+    --keep-cluster) KEEP=1; shift ;;
     *) demo_die "unknown argument $1" ;;
 esac; done
 
@@ -41,7 +42,7 @@ cat <<'TXT'
   the matching is a rounding error beside the read.
 TXT
 cluster_up
-trap cluster_down EXIT
+trap '[[ ${KEEP:-0} == 1 ]] || cluster_down' EXIT
 JVM_ARGS="$OPTS" "$FLINK_HOME/bin/flink" run -c org.apache.flink.table.examples.java.gpu.GrokSQLExample \
     "$JAR" --data "$DATA" --patterns "$PATTERNS" --parallelism "$PAR" ${SELECTIVE:-} 2>&1 \
     | grep -vE "^SLF4J|^WARNING"
@@ -51,3 +52,8 @@ demo_banner "what the planner and the region decided"
 grep -hE "Accelerator reads the strings|declining the grok|not a grok" "$FLINK_HOME"/log/*client*.log \
     | tail -1 | sed 's/^.*\] - //' || echo "  (the region was not selected -- the CPU plan ran)"
 grep -hE "grok region:" "$FLINK_HOME"/log/*taskexecutor*.log | tail -1 | sed 's/^.*\] - //' || true
+
+if [[ ${KEEP:-0} == 1 ]]; then
+    echo
+    echo "  cluster left running: http://localhost:8081  (stop it with $FLINK_HOME/bin/stop-cluster.sh)"
+fi

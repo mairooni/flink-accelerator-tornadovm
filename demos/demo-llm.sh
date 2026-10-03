@@ -57,3 +57,8 @@ cat <<'TXT'
   weights. The result this demo is about is the warm one.
 TXT
 exec "$RUNNER" "$ARM" "${EXTRA[@]}"
+
+if [[ ${KEEP:-0} == 1 ]]; then
+    echo
+    echo "  cluster left running: http://localhost:8081  (stop it with $FLINK_HOME/bin/stop-cluster.sh)"
+fi

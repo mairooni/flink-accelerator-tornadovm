@@ -6,16 +6,20 @@
 #   ./demo-haversine.sh --rows 8000000
 #   ./demo-haversine.sh --print-kernel  show the CUDA that was generated
 #   ./demo-haversine.sh --cpu           the same query with the accelerator off
+#   ./demo-haversine.sh --keep-cluster  leave the cluster up afterwards, so the
+#                                       web UI at http://localhost:8081 still
+#                                       shows the finished job
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./common.sh
 [[ -f "$DEMO_ROOT/env.sh" ]] && source "$DEMO_ROOT/env.sh" && source ./common.sh
 
-ROWS=8000000; PRINT_KERNEL=0; ARM=device
+ROWS=8000000; PRINT_KERNEL=0; ARM=device; KEEP=0
 while [[ $# -gt 0 ]]; do case "$1" in
     --rows) ROWS="$2"; shift 2 ;;
     --print-kernel) PRINT_KERNEL=1; shift ;;
     --cpu) ARM=cpu; shift ;;
+    --keep-cluster) KEEP=1; shift ;;
     *) demo_die "unknown argument $1" ;;
 esac; done
 
@@ -64,27 +68,30 @@ cat <<'TXT'
   accelerator IR and compiled to a CUDA kernel at job start.
 TXT
 cluster_up
-trap 'cluster_down; restore_config' EXIT
+trap '[[ $KEEP == 1 ]] || cluster_down; restore_config' EXIT
 JVM_ARGS="$OPTS" "$FLINK_HOME/bin/flink" run -c org.apache.flink.table.examples.java.gpu.HaversineSQLExample \
     "$JAR" "$ROWS" "$DATA" 2>&1 | grep -vE "^SLF4J|^WARNING"
 
 if [[ $PRINT_KERNEL == 1 ]]; then
     echo
     demo_banner "the generated CUDA"
-    # TornadoVM writes the kernel to stdout, which for a TaskManager is its .out
-    # file, not the .log everyone looks in first.
-    _out="$(ls -t "$FLINK_HOME"/log/*taskexecutor*.out 2>/dev/null | head -1)"
-    if [[ -n "$_out" ]] && grep -qE "__kernel|__global__|\.visible \.entry" "$_out"; then
-        sed -n '/__kernel\|__global__\|\.visible \.entry/,$p' "$_out" | head -60
-        echo "  ... full text in $_out"
-    else
-        echo "  nothing in ${_out:-the TaskManager .out} -- the kernel may have been served"
-        echo "  from TornadoVM's on-disk code cache. Clear it and re-run:"
-        echo "    rm -rf ~/.tornadovm/  (or \$TORNADO_SDK/var) and ./demo-haversine.sh --print-kernel"
-    fi
+    echo "  TornadoVM wrote it to the TaskManager's stdout:"
+    echo "    $(ls -t "$FLINK_HOME"/log/*taskexecutor*.out 2>/dev/null | head -1)"
+    echo "  Nothing in this repository contains that text -- it is compiled from the SQL"
+    echo "  at job start. The constants are the depot coordinates in radians."
 fi
 
 echo
 demo_banner "where it ran"
+# The log line carries the provider's "claims NNx over CPU" estimate. That is a
+# static model used to decide whether to offload at all -- it is not measured
+# here and it is nothing like the end-to-end speedup, so it is cut rather than
+# shown next to a result it does not describe.
 grep -hE "Accelerated on this TaskManager|Accelerator declined" "$FLINK_HOME"/log/*taskexecutor*.log \
-    | tail -1 | sed 's/^.*\] - //' || echo "  (no accelerator decision logged -- it ran on the CPU)"
+    | tail -1 | sed 's/^.*\] - //; s/: provider \([a-z]*\) claims.*/  (provider: \1)/' \
+    || echo "  (no accelerator decision logged -- it ran on the CPU)"
+
+if [[ $KEEP == 1 ]]; then
+    echo
+    echo "  cluster left running: http://localhost:8081  (stop it with $FLINK_HOME/bin/stop-cluster.sh)"
+fi
