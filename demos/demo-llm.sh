@@ -5,6 +5,8 @@
 #   ./demo-llm.sh            GPU preprocessing + jitllm, resident in the TaskManager
 #   ./demo-llm.sh --cpu      CPU preprocessing + llama.cpp over HTTP
 #   ./demo-llm.sh --warm     make the engine resident first, then run (see below)
+#   ./demo-llm.sh --keep-cluster   reuse a cluster that is already up, and leave
+#                                  it up -- for running straight after demo 1
 #
 # This demo has prerequisites the other two do not -- a jitllm checkout, a
 # llama.cpp build and a GGUF model -- because it compares two inference
@@ -15,10 +17,11 @@ cd "$(dirname "$0")"
 source ./common.sh
 [[ -f "$DEMO_ROOT/env.sh" ]] && source "$DEMO_ROOT/env.sh" && source ./common.sh
 
-ARM=--gpu; EXTRA=()
+ARM=--gpu; EXTRA=(); KEEP=0
 while [[ $# -gt 0 ]]; do case "$1" in
     --cpu)  ARM=--cpu; shift ;;
     --gpu)  ARM=--gpu; shift ;;
+    --keep-cluster|--reuse-cluster) KEEP=1; shift ;;
     *)      EXTRA+=("$1"); shift ;;
 esac; done
 
@@ -56,7 +59,8 @@ cat <<'TXT'
   accelerated one spends its preprocessing advantage loading 1.4 GiB of
   weights. The result this demo is about is the warm one.
 TXT
-# llm-bench-run.sh starts and stops its own cluster and kills the llama-server,
-# so --keep-cluster and --reuse-cluster do not apply here: anything after this
-# line would be unreachable anyway, because exec replaces the process.
-exec "$RUNNER" "$ARM" "${EXTRA[@]}"
+# llm-bench-run.sh owns the cluster for this demo. LLM_BENCH_KEEP_CLUSTER makes
+# it reuse one that is already up and leave it running, so this can follow the
+# haversine demo without the web UI dropping out between them. The llama-server
+# is still killed on exit either way -- it holds GPU memory.
+exec env LLM_BENCH_KEEP_CLUSTER="$KEEP" "$RUNNER" "$ARM" "${EXTRA[@]}"

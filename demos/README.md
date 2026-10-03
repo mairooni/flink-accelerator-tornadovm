@@ -84,12 +84,34 @@ you already have, or `MODEL_URL` at a different one.
 
 ### By talk
 
-The two decks need different subsets, and each is a flag away:
+**Day one — haversine and the LLM, back to back on one cluster:**
 
-| | demos | corpora |
-|---|---|---|
-| lab talk | haversine, LLM | `haversine-8000000`, the triage readings |
-| libraries talk | regex | `logs1` for bytecodes, `logs16` or `logs64` for timing |
+```bash
+source ./3-env.sh
+./demo-haversine.sh --print-kernel --keep-cluster   # kernel in the TaskManager .out
+# show http://localhost:8081
+./demo-llm.sh --keep-cluster                        # reuses that cluster
+# show the UI again: both jobs listed
+./stop.sh
+```
+
+`--warm` on the LLM demo makes the engine resident first; the 1.8x result only
+holds warm, and a cold run says so.
+
+**Day two — the regex demo:**
+
+```bash
+source ./3-env.sh
+./demo-regex.sh --print-bytecodes    # 1M lines, 8 patterns: library tasks and
+                                     # the generated kernel in one task graph
+./demo-regex.sh --patterns 1         # below the floor: the region declines
+./demo-regex.sh --rows 16            # the size the chart is drawn from
+./stop.sh
+```
+
+`--print-kernel` and `--print-bytecodes` need a fresh cluster, since they are
+TaskManager JVM options read only at JVM start — so they refuse to combine with
+`--reuse-cluster`, and a run using them restarts the cluster.
 
 ## Things that will bite on a new machine
 

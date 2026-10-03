@@ -65,8 +65,12 @@ JAR="$LLM_BENCH_JAR_PREFIX-${ARM}TriagePipeline.jar"
 
 # Always torn down, however this exits, so a failed run does not leave a cluster or a model
 # server holding 8 GiB of VRAM behind it.
+#
+# LLM_BENCH_KEEP_CLUSTER=1 keeps the Flink cluster across the run, for a demo that wants the
+# web UI to survive and the earlier jobs to stay listed. The llama-server is killed either
+# way: it holds GPU memory and nothing later needs it.
 cleanup() {
-    "$FLINK_HOME/bin/stop-cluster.sh" >/dev/null 2>&1 || true
+    [[ "${LLM_BENCH_KEEP_CLUSTER:-0}" == 1 ]] || "$FLINK_HOME/bin/stop-cluster.sh" >/dev/null 2>&1 || true
     pkill -x llama-server 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -75,9 +79,14 @@ printf '\n\033[1m%s\033[0m\n' "$LABEL"
 printf '  model %s\n  data  %s\n  modes %s\n\n' \
        "$(basename "$LLM_BENCH_MODEL")" "$LLM_BENCH_DATA" "$MODES"
 
-echo "==> starting the cluster"
-cleanup; sleep 2
-"$FLINK_HOME/bin/start-cluster.sh" >/dev/null
+if [[ "${LLM_BENCH_KEEP_CLUSTER:-0}" == 1 ]] \
+   && curl -s -m 2 localhost:8081/overview 2>/dev/null | grep -qE '"slots-available":[1-9]'; then
+    echo "==> reusing the cluster already running"
+else
+    echo "==> starting the cluster"
+    cleanup; sleep 2
+    "$FLINK_HOME/bin/start-cluster.sh" >/dev/null
+fi
 # Any free slot will do. Matching "slots-available":1 exactly meant a cluster configured with
 # more than one slot never satisfied this and the script waited forever with an idle GPU.
 until curl -s localhost:8081/overview 2>/dev/null | grep -qE '"slots-available":[1-9]'; do sleep 2; done
