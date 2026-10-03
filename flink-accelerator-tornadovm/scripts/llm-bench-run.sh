@@ -129,14 +129,23 @@ printf '  \033[1mflink run wall time: %s s\033[0m%s\n' "$WALL" \
        "$( ((WARM)) && echo '  (warm: the engine was already resident)' || echo '  (COLD: this run loaded the model)')"
 
 # Where the offload decision was actually taken -- the plan only says a subtree is eligible.
+#
+# The provider's "claims NNx over CPU" is an estimate from a static cost model, used only to
+# decide whether offloading is worth the setup. It is not measured, it excludes the read, the
+# JVM and planning, and printed beside a wall-clock figure it invites exactly the wrong
+# comparison -- so the claim and the per-phase breakdown are kept out of the demo output.
+# LLM_BENCH_SHOW_PHASES=1 brings them back for debugging.
 if [[ "$ARM" == Gpu ]]; then
     LOG="$FLINK_HOME/log/flink-$(whoami)-taskexecutor-0-$(hostname).log"
     if [[ -f "$LOG" ]]; then
         echo
-        echo "---- what the TaskManager decided ----"
-        grep -a "Accelerated on this TaskManager\|Accelerator declined" "$LOG" | tail -1 | sed 's/.* - /  /' || true
-        grep -a -A11 "GpuCalcOperator GpuCalcSpec" "$LOG" | tail -11 \
-            | grep -aE "^(batches|gather|copy-in|kernel|drain|attributed|execute|compile)" | sed 's/^/  /' || true
+        echo "---- where the preprocessing ran ----"
+        grep -a "Accelerated on this TaskManager\|Accelerator declined" "$LOG" | tail -1 \
+            | sed 's/.* - /  /; s/: provider \([a-z]*\) claims.*/  (provider: \1)/' || true
+        if [[ "${LLM_BENCH_SHOW_PHASES:-0}" == 1 ]]; then
+            grep -a -A11 "GpuCalcOperator GpuCalcSpec" "$LOG" | tail -11 \
+                | grep -aE "^(batches|gather|copy-in|kernel|drain|attributed|execute|compile)" | sed 's/^/  /' || true
+        fi
     fi
 fi
 echo

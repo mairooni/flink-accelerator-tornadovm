@@ -63,4 +63,5 @@ TXT
 # it reuse one that is already up and leave it running, so this can follow the
 # haversine demo without the web UI dropping out between them. The llama-server
 # is still killed on exit either way -- it holds GPU memory.
+ensure_quiet_classloader
 exec env LLM_BENCH_KEEP_CLUSTER="$KEEP" "$RUNNER" "$ARM" "${EXTRA[@]}"

@@ -84,11 +84,26 @@ demo_die()    { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 cluster_running() { curl -s -m 2 "http://localhost:8081/overview" >/dev/null 2>&1; }
 
+# Hadoop's ShutdownHookManager runs after Flink closes the job classloader and
+# trips the leak check, so every Parquet demo ends in an IllegalStateException
+# stack trace -- after the result, affecting nothing, but it reads as a failure.
+# 1-fetch.sh sets this, but only when it runs: an install made before the
+# setting existed, or one whose config.yaml was regenerated, would not have it.
+# Ensured here instead, where every demo passes.
+ensure_quiet_classloader() {
+    local cfg="$FLINK_HOME/conf/config.yaml"
+    [[ -f "$cfg" ]] || return 0
+    grep -q "^classloader.check-leaked-classloader:" "$cfg" && return 0
+    printf '\nclassloader.check-leaked-classloader: false\n' >> "$cfg"
+    echo "  config.yaml: disabled the leaked-classloader check (Hadoop shutdown-hook noise)"
+}
+
 # REUSE=1 keeps a cluster that is already up, so successive demos land in the
 # same web UI and the earlier jobs stay visible. A restart is still required
 # whenever the TaskManager JVM options change -- the print flags -- because
 # those are only read at JVM start.
 cluster_up() {
+    ensure_quiet_classloader
     if [[ "${REUSE:-0}" == 1 ]] && cluster_running; then
         echo "  reusing the cluster already running at http://localhost:8081"
         return 0
