@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 source ./common.sh
 [[ -f "$DEMO_ROOT/env.sh" ]] && source "$DEMO_ROOT/env.sh" && source ./common.sh
 
-ROWS=2000000; PRINT_KERNEL=0; ARM=device
+ROWS=8000000; PRINT_KERNEL=0; ARM=device
 while [[ $# -gt 0 ]]; do case "$1" in
     --rows) ROWS="$2"; shift 2 ;;
     --print-kernel) PRINT_KERNEL=1; shift ;;
