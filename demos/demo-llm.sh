@@ -18,6 +18,10 @@ source ./common.sh
 [[ -f "$DEMO_ROOT/env.sh" ]] && source "$DEMO_ROOT/env.sh" && source ./common.sh
 
 ARM=--gpu; EXTRA=(); KEEP=0
+# TelemetryTriage defaults to 256, which stops the note mid-sentence -- the run
+# reports generated_tokens=255, the cap, every time. Raised here so the demo
+# needs no flags. Passing --max-new-tokens explicitly still wins.
+MAX_NEW_TOKENS=512
 while [[ $# -gt 0 ]]; do case "$1" in
     --cpu)  ARM=--cpu; shift ;;
     --gpu)  ARM=--gpu; shift ;;
@@ -63,5 +67,11 @@ TXT
 # it reuse one that is already up and leave it running, so this can follow the
 # haversine demo without the web UI dropping out between them. The llama-server
 # is still killed on exit either way -- it holds GPU memory.
+# Only supply the cap if the caller did not.
+case " ${EXTRA[*]-} " in
+    *" --max-new-tokens "*) ;;
+    *) EXTRA+=(--max-new-tokens "$MAX_NEW_TOKENS") ;;
+esac
+
 ensure_quiet_classloader
 exec env LLM_BENCH_KEEP_CLUSTER="$KEEP" "$RUNNER" "$ARM" "${EXTRA[@]}"
