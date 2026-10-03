@@ -111,6 +111,11 @@ under the License.
 				before these moved here. The run scripts under the provider module look the jars up
 				by that bare name, and a benchmark is submitted with `flink run`, so the manifest
 				has to name the class.
+
+				Each execution packs one example and nothing else, so anything shared has to be
+				named in every one of them or it is missing at submit time. BenchData is the only
+				such class; it is a kilobyte, and the examples that do not use it are no worse for
+				carrying it.
 			-->
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
@@ -132,6 +137,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/GpuOffloadExample*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -150,6 +156,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/DeviceConformanceSuite*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -168,6 +175,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/VectorScreenBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -186,6 +194,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/SensorAnomalyBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -204,6 +213,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/NearestNeighbourSQLExample*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -222,6 +232,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/LogCorpusGenerator*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -240,6 +251,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/GrokSQLExample*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -258,6 +270,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/HaversineBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -276,6 +289,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/FleetCentroidBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -294,6 +308,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/BlackScholesBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -312,6 +327,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/GroupedAggregateBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -330,6 +346,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/JoinBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -348,6 +365,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/OverAggregateBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -366,6 +384,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/SortBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -384,6 +403,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/LogisticRegressionBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -402,6 +422,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/MixedTypeVerification*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -420,6 +441,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/ReferenceJoinBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -438,6 +460,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/FeatureGramBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -456,6 +479,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/HaversineSQLExample*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -474,6 +498,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/CudfSortSQLExample*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -492,6 +517,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/CudfGroupBySQLExample*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -510,6 +536,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/KMeansBenchmark*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -528,6 +555,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/KernelAndLibrarySQLExample*</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -546,6 +574,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/llm/**</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
@@ -564,6 +593,7 @@ under the License.
 							</archive>
 							<includes>
 								<include>org/apache/flink/table/examples/java/gpu/llm/**</include>
+								<include>org/apache/flink/table/examples/java/gpu/BenchData*</include>
 							</includes>
 						</configuration>
 					</execution>
