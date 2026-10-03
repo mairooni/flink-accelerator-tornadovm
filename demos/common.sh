@@ -40,6 +40,45 @@ POM
     mkdir -p "$DEMO_ROOT"; cp "$tmp/cp.txt" "$cache"; rm -rf "$tmp"; cat "$cache"
 }
 
+
+# --- TaskManager JVM options ----------------------------------------------
+# tornado.printKernel and tornado.print.bytecodes are read on the TASKMANAGER,
+# into static finals at class init. Setting them in JVM_ARGS reaches only the
+# client, which compiles nothing -- so they have to go into config.yaml before
+# the cluster starts. Added for the life of one run and always restored.
+_TM_CFG_BAK=""
+tm_opts_add() {
+    local flags="$1"
+    local cfg="$FLINK_HOME/conf/config.yaml"
+    [[ -n "$flags" ]] || return 0
+    _TM_CFG_BAK="$(mktemp)"
+    cp "$cfg" "$_TM_CFG_BAK"
+    python3 - "$cfg" "$flags" <<'PYCFG'
+import re, sys
+p, flags = sys.argv[1], sys.argv[2]
+s = open(p).read()
+# config.yaml is nested YAML -- env: / java: / opts: / all: -- so the key is
+# matched by indent, not as a flat env.java.opts.all:.
+m = re.search(r'^(\s+)all:[ \t]*(.*)$', s, re.M)
+if m is None:
+    sys.exit("could not find env.java.opts.all in " + p)
+add = " ".join(f for f in flags.split() if f not in m.group(2))
+if add:
+    s = s[:m.start()] + f"{m.group(1)}all: {m.group(2)} {add}" + s[m.end():]
+    open(p, "w").write(s)
+PYCFG
+}
+tm_opts_restore() {
+    if [[ -n "${_TM_CFG_BAK:-}" && -f "$_TM_CFG_BAK" ]]; then
+        mv -f "$_TM_CFG_BAK" "$FLINK_HOME/conf/config.yaml"
+        _TM_CFG_BAK=""
+    fi
+}
+
+# Where TornadoVM writes kernels and bytecodes: a TaskManager's stdout, which
+# is its .out file, not the .log everyone opens first.
+tm_out() { ls -t "$FLINK_HOME"/log/*taskexecutor*.out 2>/dev/null | head -1; }
+
 demo_banner() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 demo_die()    { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 

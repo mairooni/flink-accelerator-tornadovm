@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 source ./common.sh
 [[ -f "$DEMO_ROOT/env.sh" ]] && source "$DEMO_ROOT/env.sh" && source ./common.sh
 
-ROWS=16; PATTERNS=8; ARM=device; PAR=1; KEEP=0
+ROWS=16; PATTERNS=8; ARM=device; PAR=1; KEEP=0; PRINT_KERNEL=0; PRINT_BYTECODES=0
 while [[ $# -gt 0 ]]; do case "$1" in
     --rows) ROWS="$2"; shift 2 ;;
     --patterns) PATTERNS="$2"; shift 2 ;;
@@ -19,6 +19,8 @@ while [[ $# -gt 0 ]]; do case "$1" in
     --selective) SELECTIVE=--selective; shift ;;
     --cpu) ARM=cpu; shift ;;
     --keep-cluster) KEEP=1; shift ;;
+    --print-kernel) PRINT_KERNEL=1; shift ;;
+    --print-bytecodes) PRINT_BYTECODES=1; shift ;;
     *) demo_die "unknown argument $1" ;;
 esac; done
 
@@ -41,8 +43,13 @@ cat <<'TXT'
   The pattern count is the lever -- at one pattern the region declines, because
   the matching is a rounding error beside the read.
 TXT
+TM_FLAGS=""
+[[ $PRINT_KERNEL == 1 ]]    && TM_FLAGS="$TM_FLAGS -Dtornado.printKernel=true"
+[[ $PRINT_BYTECODES == 1 ]] && TM_FLAGS="$TM_FLAGS -Dtornado.print.bytecodes=true"
+tm_opts_add "$TM_FLAGS"
+
 cluster_up
-trap '[[ ${KEEP:-0} == 1 ]] || cluster_down' EXIT
+trap '[[ ${KEEP:-0} == 1 ]] || cluster_down; tm_opts_restore' EXIT
 JVM_ARGS="$OPTS" "$FLINK_HOME/bin/flink" run -c org.apache.flink.table.examples.java.gpu.GrokSQLExample \
     "$JAR" --data "$DATA" --patterns "$PATTERNS" --parallelism "$PAR" ${SELECTIVE:-} 2>&1 \
     | grep -vE "^SLF4J|^WARNING"
@@ -56,4 +63,17 @@ grep -hE "grok region:" "$FLINK_HOME"/log/*taskexecutor*.log | tail -1 | sed 's/
 if [[ ${KEEP:-0} == 1 ]]; then
     echo
     echo "  cluster left running: http://localhost:8081  (stop it with $FLINK_HOME/bin/stop-cluster.sh)"
+fi
+
+if [[ -n "${TM_FLAGS:-}" ]]; then
+    echo
+    demo_banner "what TornadoVM printed"
+    echo "  TaskManager stdout: $(tm_out)"
+    if [[ $PRINT_BYTECODES == 1 ]]; then
+        echo "    the bytecodes show both kinds of node in one task graph:"
+        echo "      LAUNCH task - grok.read[readParquetStrings]   library task"
+        echo "      LAUNCH task - grok.reN[containsRe]            library task, once per pattern"
+        echo "      LAUNCH task grok.combine - combine            generated kernel"
+        echo "    grep for them with:  grep -E 'LAUNCH|ALLOC|TRANSFER' \"\$(tm_out)\""
+    fi
 fi
