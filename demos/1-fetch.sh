@@ -218,7 +218,7 @@ PY
 
 # ---------------------------------------------------------------------------
 cat > "$DEMO_ROOT/env.sh" <<ENV
-# Written by setup.sh on $(date -Is). Sourced by the demo scripts.
+# Written by 1-fetch.sh on $(date -Is). Read by 3-env.sh.
 export DEMO_ROOT="$DEMO_ROOT"
 export TORNADOVM_SRC="$TORNADOVM_SRC"
 export TORNADOVM_HOME="$TORNADOVM_HOME"

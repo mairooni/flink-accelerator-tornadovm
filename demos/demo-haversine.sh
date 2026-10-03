@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
 esac; done
 
 JAR="$PROVIDER_SRC/flink-accelerator-tornadovm-examples/target/HaversineSQLExample.jar"
-[[ -f "$JAR" ]] || demo_die "no example jar at $JAR -- run ./setup.sh"
+[[ -f "$JAR" ]] || demo_die "no example jar at $JAR -- run ./1-fetch.sh"
 DATA="$DATA_ROOT/haversine-$ROWS"
 
 export HADOOP_CLASSPATH="$(hadoop_classpath)"

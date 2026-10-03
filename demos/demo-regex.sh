@@ -25,9 +25,11 @@ while [[ $# -gt 0 ]]; do case "$1" in
 esac; done
 
 JAR="$PROVIDER_SRC/flink-accelerator-tornadovm-examples/target/flink-accelerator-tornadovm-examples-0.1.0-SNAPSHOT-GrokSQLExample.jar"
-[[ -f "$JAR" ]] || demo_die "no example jar at $JAR -- run ./setup.sh"
+[[ -f "$JAR" ]] || demo_die "no example jar at $JAR -- run ./1-fetch.sh"
 DATA="$DATA_ROOT/logs$ROWS"
-[[ -d "$DATA" ]] || demo_die "no corpus at $DATA -- run ./setup.sh"
+[[ -d "$DATA" ]] || demo_die "no corpus at $DATA
+  Generate it with:  ./2-generate-data.sh --rows ${ROWS}000000
+  (the corpora already generated are: $(ls -d "$DATA_ROOT"/logs* 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' '))"
 
 export HADOOP_CLASSPATH="$(hadoop_classpath)"
 OPTS=""
