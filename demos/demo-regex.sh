@@ -2,6 +2,8 @@
 #
 # Demo 2 -- a CUDA library serving a whole SQL subtree.
 #
+#   ./demo-regex.sh                     1M lines, 8 patterns -- the demo default
+#   ./demo-regex.sh --rows 16           16M lines, the size the charts use
 #   ./demo-regex.sh                    16M lines, 8 patterns
 #   ./demo-regex.sh --rows 64 --patterns 8
 #   ./demo-regex.sh --patterns 1       below the floor: the region declines
@@ -11,7 +13,7 @@ cd "$(dirname "$0")"
 source ./common.sh
 [[ -f "$DEMO_ROOT/env.sh" ]] && source "$DEMO_ROOT/env.sh" && source ./common.sh
 
-ROWS=16; PATTERNS=8; ARM=device; PAR=1; KEEP=0; REUSE=0; PRINT_KERNEL=0; PRINT_BYTECODES=0
+ROWS=1; PATTERNS=8; ARM=device; PAR=1; KEEP=0; REUSE=0; PRINT_KERNEL=0; PRINT_BYTECODES=0
 while [[ $# -gt 0 ]]; do case "$1" in
     --rows) ROWS="$2"; shift 2 ;;
     --patterns) PATTERNS="$2"; shift 2 ;;
