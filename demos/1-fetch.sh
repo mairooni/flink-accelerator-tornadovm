@@ -3,10 +3,12 @@
 # Step 1 of 3 -- fetch the three repositories at the right branches and build
 # them, then deploy the provider into the Flink distribution.
 #
-#   ./1-fetch.sh                    everything
+#   ./1-fetch.sh                    everything, including demo 3's jitllm and
+#                                   llama.cpp (the model comes from script 2)
+#   ./1-fetch.sh --skip-llm         the first two demos only
+#   ./1-fetch.sh --only-llm         just the demo 3 parts, onto an existing setup
 #   ./1-fetch.sh --skip-flink       when Flink is already built
 #   ./1-fetch.sh --skip-tornadovm   when the TornadoVM SDK is already built
-#   ./1-fetch.sh --with-llm         also fetch jitllm and llama.cpp for demo 3
 #
 # Idempotent: re-running skips what is already done, so a failed step can be
 # fixed and the script re-run. Budget 40-70 minutes on a cold machine; Flink's
@@ -20,11 +22,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 source ./common.sh
 
-SKIP_FLINK=0; SKIP_TORNADO=0; WITH_LLM=0
+SKIP_FLINK=0; SKIP_TORNADO=0; SKIP_PROVIDER=0; WITH_LLM=1
 for a in "$@"; do case "$a" in
     --skip-flink) SKIP_FLINK=1 ;;
     --skip-tornadovm) SKIP_TORNADO=1 ;;
-    --with-llm) WITH_LLM=1 ;;
+    --skip-llm) WITH_LLM=0 ;;
+    --with-llm) WITH_LLM=1 ;;   # kept: it was the opt-in before the default changed
+    --only-llm) SKIP_FLINK=1; SKIP_TORNADO=1; SKIP_PROVIDER=1; WITH_LLM=1 ;;
     *) demo_die "unknown argument $a" ;;
 esac; done
 
@@ -65,7 +69,7 @@ ensure_repo() {
 }
 
 # ---------------------------------------------------------------------------
-demo_banner "1/6  preflight"
+demo_banner "1/7  preflight"
 # ---------------------------------------------------------------------------
 command -v nvidia-smi >/dev/null || demo_die "no nvidia-smi: this needs an NVIDIA GPU"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
@@ -106,7 +110,7 @@ rm -rf "$_probe"
 mkdir -p "$DEMO_ROOT" "$DATA_ROOT"
 
 # ---------------------------------------------------------------------------
-demo_banner "2/6  RAPIDS libcudf"
+demo_banner "2/7  RAPIDS libcudf"
 # ---------------------------------------------------------------------------
 # The cuDF shim links against RAPIDS. It is a binary distribution, so it is
 # fetched rather than built; the pip wheels are the only packaging that does
@@ -130,7 +134,7 @@ done
 source ./common.sh   # re-resolve now that RAPIDS exists
 
 # ---------------------------------------------------------------------------
-demo_banner "3/6  TornadoVM"
+demo_banner "3/7  TornadoVM"
 # ---------------------------------------------------------------------------
 if [[ $SKIP_TORNADO == 0 ]]; then
     ensure_repo "$TORNADOVM_SRC" "$TORNADOVM_REPO" "$TORNADOVM_BRANCH" tornadovm
@@ -163,7 +167,7 @@ export TORNADOVM_HOME="${TORNADOVM_HOME:-$(ls -d "$TORNADOVM_SRC"/dist/*/*/ | he
 TORNADOVM_HOME="${TORNADOVM_HOME%/}"
 
 # ---------------------------------------------------------------------------
-demo_banner "4/6  Flink (the long one -- 20-40 minutes the first time)"
+demo_banner "4/7  Flink (the long one -- 20-40 minutes the first time)"
 # ---------------------------------------------------------------------------
 if [[ $SKIP_FLINK == 0 ]]; then
     ensure_repo "$FLINK_SRC" "$FLINK_REPO" "$FLINK_BRANCH" flink
@@ -172,8 +176,9 @@ if [[ $SKIP_FLINK == 0 ]]; then
 fi
 [[ -d "$FLINK_HOME" ]] || demo_die "no Flink distribution at $FLINK_HOME"
 
+if [[ $SKIP_PROVIDER == 0 ]]; then
 # ---------------------------------------------------------------------------
-demo_banner "5/6  the accelerator provider and the example jars"
+demo_banner "5/7  the accelerator provider and the example jars"
 # ---------------------------------------------------------------------------
 # This script ships inside the provider repository, so the provider is already
 # here -- it is the clone the person is standing in. Nothing is fetched or
@@ -186,7 +191,7 @@ echo "building against TornadoVM $TVM_VERSION"
                           -Dtornado.version="$TVM_VERSION" install)
 
 # ---------------------------------------------------------------------------
-demo_banner "6/6  deploying into the Flink distribution"
+demo_banner "6/7  deploying into the Flink distribution"
 # ---------------------------------------------------------------------------
 TORNADOVM_HOME="$TORNADOVM_HOME" FLINK_SRC="$FLINK_SRC" \
     PROVIDER_JAR="$(ls "$PROVIDER_SRC"/flink-accelerator-tornadovm/target/flink-accelerator-tornadovm-*.jar | grep -v sources | head -1)" \
@@ -217,14 +222,14 @@ else:
 open(p, "w").write(s)
 print("  config.yaml: 4 task slots, 4g task off-heap, leaked-classloader check off")
 PY
-
+fi
 
 # ---------------------------------------------------------------------------
-# Demo 3 only. Separate because it is the one demo with prerequisites outside
-# these three repositories, and because the model is a 1.4 GiB download.
+# Demo 3. Skippable with --skip-llm, because it is the one part with
+# prerequisites outside these three repositories and a 1.44 GiB download.
 # ---------------------------------------------------------------------------
 if [[ $WITH_LLM == 1 ]]; then
-    demo_banner "jitllm, llama.cpp and the model"
+    demo_banner "7/7  jitllm and llama.cpp"
     : "${JITLLM_SRC:=$DEMO_ROOT/jitllm}"
     : "${LLAMACPP_SRC:=$DEMO_ROOT/llama.cpp}"
     : "${MODEL:=$JITLLM_SRC/Qwen3-0.6B-f16.gguf}"
@@ -232,27 +237,9 @@ if [[ $WITH_LLM == 1 ]]; then
     ensure_repo "$JITLLM_SRC"   "https://github.com/beehive-lab/jitllm.git"  main   jitllm
     ensure_repo "$LLAMACPP_SRC" "https://github.com/ggml-org/llama.cpp.git"         master llamacpp
 
-    # *.gguf is gitignored in the jitllm repository, so cloning it gets no model.
-    # Qwen3-0.6B in fp16 GGUF, 1.44 GiB. Verified to start with the GGUF magic and
-    # to match the file the reported numbers were taken with to within 192 bytes.
-    : "${MODEL_URL:=https://huggingface.co/gvij/qwen3-0.6b-gguf/resolve/main/qwen3-0.6b-fp16.gguf}"
-    if [[ -f "$MODEL" ]]; then
-        echo "  model: $MODEL"
-    elif [[ -n "${MODEL_URL:-}" ]]; then
-        echo "  downloading $(basename "$MODEL") from $MODEL_URL"
-        mkdir -p "$(dirname "$MODEL")"
-        curl -fL --progress-bar -o "$MODEL" "$MODEL_URL"
-    fi
-    if [[ -f "$MODEL" ]]; then
-        # A truncated download is worse than none: the engine fails deep inside
-        # a loader rather than at startup.
-        head -c 4 "$MODEL" | grep -q GGUF \
-            || demo_die "$MODEL does not start with the GGUF magic -- delete it and re-run"
-    else
-        echo "  no model at $MODEL, and the download did not produce one."
-        echo "  Point MODEL at a Qwen3-0.6B GGUF you already have, or set MODEL_URL."
-        echo "  Demos 1 and 2 are unaffected."
-    fi
+    # The model is a 1.44 GiB download, so it belongs with the other data:
+    # 2-generate-data.sh fetches it. Nothing here needs it.
+    echo "  model: 2-generate-data.sh fetches it (1.44 GiB)"
 
     echo "  then finish the LLM setup with:"
     echo "    JITLLM_SRC=$JITLLM_SRC LLAMACPP_SRC=$LLAMACPP_SRC MODEL=$MODEL \\"

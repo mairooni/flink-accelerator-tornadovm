@@ -14,8 +14,8 @@ author writes that they would not otherwise write is `NOT NULL` in the DDL.
 
 | | | when |
 |---|---|---|
-| `./1-fetch.sh` | clones TornadoVM and Flink at the right branches, builds them and this repository, deploys the provider into the Flink distribution | once, on a new machine |
-| `./2-generate-data.sh` | generates the log corpora (1M, 16M and 64M lines, ~2.4 GB of Parquet) | once, on a new machine |
+| `./1-fetch.sh` | clones TornadoVM, Flink, jitllm and llama.cpp at the right branches, builds them and this repository, deploys the provider into the Flink distribution | once, on a new machine |
+| `./2-generate-data.sh` | generates the log corpora (1M, 16M and 64M lines, ~2.4 GB of Parquet) and downloads demo 3's model (1.44 GiB) | once, on a new machine |
 | `source ./3-env.sh` | sets every path the demos need, and says what is missing | every shell |
 
 A fresh laptop runs all three; a machine that is already set up runs only the
@@ -64,19 +64,22 @@ any order, so `--print-kernel --keep-cluster` does both. With `--keep-cluster`
 the cluster stays up afterwards — the job is then visible at
 <http://localhost:8081> — and `./stop.sh` shuts it down.
 
-### Demo 3 needs three more things
+### Demo 3
 
-`./1-fetch.sh --with-llm` clones jitllm (`beehive-lab/jitllm`) and llama.cpp
-beside the other repositories, and downloads the model. `*.gguf` is gitignored
-in the jitllm repository, so the clone brings no weights; the GGUF comes from
-Hugging Face instead (`gvij/qwen3-0.6b-gguf`, Qwen3-0.6B fp16, 1.44 GiB).
-Set `MODEL` to point at one you already have, or `MODEL_URL` for a different
-one. The file is checked for the GGUF magic afterwards, because a truncated
-download fails deep inside the engine rather than at startup.
+`1-fetch.sh` clones jitllm (`beehive-lab/jitllm`) and llama.cpp along with the
+rest; `2-generate-data.sh` downloads the model, since a 1.44 GiB GGUF is data
+rather than a repository. `*.gguf` is gitignored in the jitllm checkout, so the
+clone brings no weights — the file comes from Hugging Face
+(`gvij/qwen3-0.6b-gguf`, Qwen3-0.6B fp16) and is checked for the GGUF magic
+afterwards, because a truncated download fails deep inside the engine's loader
+rather than at startup.
 
-Then run the repository's own `llm-bench-setup.sh`, which builds both engines
-and the dataset; `1-fetch.sh` prints the exact command with the paths filled in.
-Demos 1 and 2 do not need any of this.
+Skip it with `./1-fetch.sh --skip-llm` and `./2-generate-data.sh --skip-model`;
+add it to an existing setup with `./1-fetch.sh --only-llm`. Point `MODEL` at a
+GGUF you already have, or `MODEL_URL` at a different one.
+
+One step is still manual: `llm-bench-setup.sh` builds both engines and the
+triage dataset. `1-fetch.sh` prints the command with the paths filled in.
 
 ## Things that will bite on a new machine
 

@@ -4,6 +4,7 @@
 #
 #   ./2-generate-data.sh                 the log corpora (1M, 16M and 64M lines)
 #   ./2-generate-data.sh --with-haversine  also materialise the 8M and 32M point CSVs
+#   ./2-generate-data.sh --skip-model      do not fetch demo 3's GGUF
 #   ./2-generate-data.sh --rows 16000000,64000000   pick the log sizes
 #
 # The 1M corpus is two Parquet files rather than 32, so --print-bytecodes on the
@@ -17,10 +18,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 source ./common.sh
 
-LOGS="1000000,16000000,64000000"; WITH_HAVERSINE=0
+LOGS="1000000,16000000,64000000"; WITH_HAVERSINE=0; WITH_MODEL=1
 while [[ $# -gt 0 ]]; do case "$1" in
     --rows) LOGS="$2"; shift 2 ;;
     --with-haversine) WITH_HAVERSINE=1; shift ;;
+    --skip-model) WITH_MODEL=0; shift ;;
     *) demo_die "unknown argument $1" ;;
 esac; done
 
@@ -66,6 +68,33 @@ if [[ $WITH_HAVERSINE == 1 ]]; then
             ./demo-haversine.sh --rows "$n" > /dev/null 2>&1 || demo_die "haversine generation failed for $n rows"
         fi
     done
+fi
+
+# ---------------------------------------------------------------------------
+# Demo 3's weights. Data, not a repository, which is why it is here rather than
+# in 1-fetch.sh. *.gguf is gitignored in the jitllm checkout, so cloning that
+# brings nothing; the file comes from Hugging Face.
+# ---------------------------------------------------------------------------
+if [[ $WITH_MODEL == 1 ]]; then
+    : "${JITLLM_SRC:=$DEMO_ROOT/jitllm}"
+    : "${MODEL:=$JITLLM_SRC/Qwen3-0.6B-f16.gguf}"
+    : "${MODEL_URL:=https://huggingface.co/gvij/qwen3-0.6b-gguf/resolve/main/qwen3-0.6b-fp16.gguf}"
+    demo_banner "model -> $MODEL"
+    if [[ -f "$MODEL" ]]; then
+        echo "  already there ($(du -h "$MODEL" | cut -f1))"
+    elif [[ -d "$(dirname "$MODEL")" ]] || mkdir -p "$(dirname "$MODEL")"; then
+        echo "  downloading Qwen3-0.6B fp16 (1.44 GiB) from $MODEL_URL"
+        curl -fL --progress-bar -o "$MODEL.part" "$MODEL_URL" && mv -f "$MODEL.part" "$MODEL" \
+            || { rm -f "$MODEL.part"; demo_die "download failed -- set MODEL to a GGUF you have, or MODEL_URL to another link"; }
+    fi
+    # A truncated GGUF fails deep inside the engine's loader rather than at
+    # startup, so it is checked here where the message can still be useful.
+    if [[ -f "$MODEL" ]]; then
+        head -c 4 "$MODEL" | grep -q GGUF \
+            || demo_die "$MODEL does not start with the GGUF magic -- delete it and re-run"
+    else
+        echo "  no model at $MODEL -- demo 3 will not run; demos 1 and 2 are unaffected"
+    fi
 fi
 
 demo_banner "data ready"
