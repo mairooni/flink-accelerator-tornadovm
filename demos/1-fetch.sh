@@ -201,8 +201,19 @@ def setkey(s, key, val, indent):
     return pat.sub(f"{indent}{key}: {val}", s) if pat.search(s) else s
 s = setkey(s, "numberOfTaskSlots", 4, "  ")
 s = setkey(s, "size", "4g", "        ")   # taskmanager.memory.task.off-heap.size
+
+# Hadoop's ShutdownHookManager runs after Flink has closed the job classloader
+# and trips the leak check, so every Parquet demo ends in a stack trace that
+# looks like a failure and is not -- the result and the region report are
+# already printed by then. Off, because a demo that prints a scary-looking
+# IllegalStateException on success is worse than the check is worth here.
+if re.search(r"^classloader\.check-leaked-classloader:", s, re.M):
+    s = re.sub(r"^classloader\.check-leaked-classloader:.*$",
+               "classloader.check-leaked-classloader: false", s, flags=re.M)
+else:
+    s = s.rstrip() + "\n\nclassloader.check-leaked-classloader: false\n"
 open(p, "w").write(s)
-print("  config.yaml: 4 task slots, 4g task off-heap")
+print("  config.yaml: 4 task slots, 4g task off-heap, leaked-classloader check off")
 PY
 
 # ---------------------------------------------------------------------------
