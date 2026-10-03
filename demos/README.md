@@ -66,11 +66,13 @@ the cluster stays up afterwards — the job is then visible at
 
 ### Demo 3 needs three more things
 
-`./1-fetch.sh --with-llm` clones jitllm (`beehive-lab/GPULlama3.java`) and
-llama.cpp beside the other repositories. It cannot fetch the model: `*.gguf` is
-gitignored in the jitllm repository, so a clone brings no weights. Put a
-`Qwen3-0.6B` GGUF at `$JITLLM_SRC/Qwen3-0.6B-f16.gguf`, or set `MODEL` to one
-you already have, or pass `MODEL_URL=<direct link>` and it will be downloaded.
+`./1-fetch.sh --with-llm` clones jitllm (`beehive-lab/jitllm`) and llama.cpp
+beside the other repositories, and downloads the model. `*.gguf` is gitignored
+in the jitllm repository, so the clone brings no weights; the GGUF comes from
+Hugging Face instead (`gvij/qwen3-0.6b-gguf`, Qwen3-0.6B fp16, 1.44 GiB).
+Set `MODEL` to point at one you already have, or `MODEL_URL` for a different
+one. The file is checked for the GGUF magic afterwards, because a truncated
+download fails deep inside the engine rather than at startup.
 
 Then run the repository's own `llm-bench-setup.sh`, which builds both engines
 and the dataset; `1-fetch.sh` prints the exact command with the paths filled in.

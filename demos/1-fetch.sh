@@ -225,27 +225,33 @@ PY
 # ---------------------------------------------------------------------------
 if [[ $WITH_LLM == 1 ]]; then
     demo_banner "jitllm, llama.cpp and the model"
-    : "${JITLLM_SRC:=$DEMO_ROOT/GPULlama3.java}"
+    : "${JITLLM_SRC:=$DEMO_ROOT/jitllm}"
     : "${LLAMACPP_SRC:=$DEMO_ROOT/llama.cpp}"
     : "${MODEL:=$JITLLM_SRC/Qwen3-0.6B-f16.gguf}"
 
-    ensure_repo "$JITLLM_SRC"   "https://github.com/beehive-lab/GPULlama3.java.git" main   jitllm
+    ensure_repo "$JITLLM_SRC"   "https://github.com/beehive-lab/jitllm.git"  main   jitllm
     ensure_repo "$LLAMACPP_SRC" "https://github.com/ggml-org/llama.cpp.git"         master llamacpp
 
     # *.gguf is gitignored in the jitllm repository, so cloning it gets no model.
+    # Qwen3-0.6B in fp16 GGUF, 1.44 GiB. Verified to start with the GGUF magic and
+    # to match the file the reported numbers were taken with to within 192 bytes.
+    : "${MODEL_URL:=https://huggingface.co/gvij/qwen3-0.6b-gguf/resolve/main/qwen3-0.6b-fp16.gguf}"
     if [[ -f "$MODEL" ]]; then
         echo "  model: $MODEL"
     elif [[ -n "${MODEL_URL:-}" ]]; then
         echo "  downloading $(basename "$MODEL") from $MODEL_URL"
         mkdir -p "$(dirname "$MODEL")"
         curl -fL --progress-bar -o "$MODEL" "$MODEL_URL"
+    fi
+    if [[ -f "$MODEL" ]]; then
+        # A truncated download is worse than none: the engine fails deep inside
+        # a loader rather than at startup.
+        head -c 4 "$MODEL" | grep -q GGUF \
+            || demo_die "$MODEL does not start with the GGUF magic -- delete it and re-run"
     else
-        echo "  no model at $MODEL"
-        echo "  The GGUF is not in the jitllm checkout -- *.gguf is gitignored there."
-        echo "  Fetch Qwen3-0.6B in GGUF form and put it at that path, or point MODEL"
-        echo "  at one you already have, or re-run with MODEL_URL set to a direct link:"
-        echo "    MODEL_URL=<url> ./1-fetch.sh --with-llm --skip-flink --skip-tornadovm"
-        echo "  Demo 3 will not run until it is there; demos 1 and 2 are unaffected."
+        echo "  no model at $MODEL, and the download did not produce one."
+        echo "  Point MODEL at a Qwen3-0.6B GGUF you already have, or set MODEL_URL."
+        echo "  Demos 1 and 2 are unaffected."
     fi
 
     echo "  then finish the LLM setup with:"
