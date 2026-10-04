@@ -81,6 +81,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ $WITH_MODEL == 1 ]]; then
     : "${JITLLM_SRC:=$DEMO_ROOT/jitllm}"
+    : "${LLAMACPP_SRC:=$DEMO_ROOT/llama.cpp}"
     : "${MODEL:=$JITLLM_SRC/Qwen3-0.6B-f16.gguf}"
     : "${MODEL_URL:=https://huggingface.co/gvij/qwen3-0.6b-gguf/resolve/main/qwen3-0.6b-fp16.gguf}"
     demo_banner "model -> $MODEL"
@@ -115,15 +116,23 @@ if [[ $WITH_MODEL == 1 && -f "$MODEL" ]]; then
         # Keep the triage readings with the other corpora rather than in the
         # script's own default under $HOME.
         : "${LLM_BENCH_WORK:=$DATA_ROOT/flink-llm}"
+        # Every root this install resolved, passed explicitly. llm-bench-setup.sh
+        # is also usable on its own and falls back to its siblings, and those
+        # fallbacks are right for a 1-fetch tree -- but not for a machine where
+        # the checkouts are somewhere else, and silently building jitllm against
+        # a different TornadoVM than the cluster runs is not a failure you see.
         if JITLLM_SRC="$JITLLM_SRC" LLAMACPP_SRC="$LLAMACPP_SRC" MODEL="$MODEL" \
-           WORK="$LLM_BENCH_WORK" \
-           TORNADO_SDK="$TORNADOVM_HOME" FLINK_HOME="$FLINK_HOME" \
+           WORK="$LLM_BENCH_WORK" JDK21="$JAVA_HOME" \
+           TORNADOVM_SRC="$TORNADOVM_SRC" FLINK_SRC="$FLINK_SRC" \
+           FLINK_HOME="$FLINK_HOME" \
            "$LLM_SETUP" --skip-tornadovm --skip-flink; then
             echo "  demo 3 ready"
         else
             echo
             echo "  demo 3 setup did not finish. Demos 1 and 2 are unaffected; retry with:"
-            echo "    JITLLM_SRC=$JITLLM_SRC LLAMACPP_SRC=$LLAMACPP_SRC MODEL=$MODEL WORK=$LLM_BENCH_WORK \\"
+            echo "    JITLLM_SRC=$JITLLM_SRC LLAMACPP_SRC=$LLAMACPP_SRC MODEL=$MODEL \\"
+            echo "      WORK=$LLM_BENCH_WORK JDK21=$JAVA_HOME TORNADOVM_SRC=$TORNADOVM_SRC \\"
+            echo "      FLINK_SRC=$FLINK_SRC FLINK_HOME=$FLINK_HOME \\"
             echo "      $LLM_SETUP --skip-tornadovm --skip-flink"
         fi
     fi

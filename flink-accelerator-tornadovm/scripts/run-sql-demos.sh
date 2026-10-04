@@ -122,13 +122,27 @@ done
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "${HERE}/../.." && pwd)
 
-JAVA_HOME="${JAVA_HOME:-/home/mary/Projects/JDKs/jdk-21.0.3}"
-FLINK_DIST="${FLINK_DIST:-/home/mary/Projects/flink/flink-dist/target/flink-2.3.0-bin/flink-2.3.0}"
+# Derived from where this script is, not from one machine's home directory: the
+# checkouts sit beside this repository, which is how 1-fetch.sh lays them out.
+SIBLINGS=$(dirname "${REPO}")
+FLINK_SRC="${FLINK_SRC:-${SIBLINGS}/flink}"
+FLINK_DIST="${FLINK_DIST:-${FLINK_SRC}/flink-dist/target/flink-2.3.0-bin/flink-2.3.0}"
 RAPIDS_HOME="${RAPIDS_HOME:-$HOME/.local/share/rapids-libcudf}"
+
+# A JDK 21: whatever is already in the environment if it is one, then the usual
+# install locations. TornadoVM's SDK is built with 21 and the cluster must match.
+jdk_is_21() { [[ -x "$1/bin/java" ]] && "$1/bin/java" -version 2>&1 | grep -q '"21\.'; }
+if ! jdk_is_21 "${JAVA_HOME:-}"; then
+    for _c in /usr/lib/jvm/java-21-openjdk /usr/lib/jvm/jdk-21 /usr/lib/jvm/temurin-21-jdk \
+              "$HOME/.sdkman/candidates/java/21"*; do
+        if jdk_is_21 "$_c"; then JAVA_HOME="$_c"; break; fi
+    done
+fi
+[[ -n "${JAVA_HOME:-}" ]] || { echo "no JDK 21 found -- set JAVA_HOME to one" >&2; exit 1; }
 
 # The SDK, resolved rather than assumed. Explicit TORNADO_SDK wins; otherwise the newest
 # CUDA distribution under TORNADO_SRC, which is where `make BACKEND=cuda` leaves it.
-TORNADO_SRC="${TORNADO_SRC:-/home/mary/Projects/TornadoVM}"
+TORNADO_SRC="${TORNADO_SRC:-${SIBLINGS}/TornadoVM}"
 if [[ -z "${TORNADO_SDK:-}" ]]; then
     TORNADO_SDK=$(ls -d "${TORNADO_SRC}"/dist/*cuda*/*cuda* 2>/dev/null | sort | tail -1 || true)
 fi

@@ -72,8 +72,11 @@ unset _v _p
 # cluster must run the JDK the SDK was built against -- not merely "a JDK 21".
 if [[ -z "${JAVA_HOME:-}" || ! -x "${JAVA_HOME}/bin/javac" ]] \
    || ! "${JAVA_HOME}/bin/javac" -version 2>&1 | grep -q " 21"; then
-    for _c in "$HOME/Projects/JDKs/jdk-21.0.3" /usr/lib/jvm/java-21-openjdk /usr/lib/jvm/jdk-21 \
-              "$(dirname "$(dirname "$(readlink -f "$(command -v javac 2>/dev/null)")")")"; do
+    # Generic locations first; the last two are this author's layouts and are
+    # only ever reached on a machine that has them.
+    for _c in /usr/lib/jvm/java-21-openjdk /usr/lib/jvm/jdk-21 /usr/lib/jvm/temurin-21-jdk \
+              "$(dirname "$(dirname "$(readlink -f "$(command -v javac 2>/dev/null)")")")" \
+              "$HOME/.sdkman/candidates/java/21"* "$HOME/Projects/JDKs/jdk-21"*; do
         if [[ -x "$_c/bin/javac" ]] && "$_c/bin/javac" -version 2>&1 | grep -q " 21"; then
             export JAVA_HOME="$_c"; break
         fi

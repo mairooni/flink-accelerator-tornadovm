@@ -27,12 +27,14 @@
 # the artifact the next one compiles against, and out of order the build succeeds against a
 # stale jar and fails at run time instead.
 #
-# Paths are taken from the environment when set, so a checkout somewhere else needs no edit:
+# Paths are taken from the environment when set. Unset, the four checkouts are looked for
+# beside this repository -- which is how 1-fetch.sh lays them out -- so a tree fetched
+# anywhere needs no edit and no variable:
 #
 #   FLINK_SRC       the flink checkout on the gpu-offload branch
 #   FLINK_HOME      the built distribution inside it
 #   TORNADOVM_SRC   the TornadoVM checkout
-#   JITLLM_SRC      the GPULlama3.java / jitllm checkout
+#   JITLLM_SRC      the jitllm checkout (github.com/beehive-lab/jitllm)
 #   LLAMACPP_SRC    the llama.cpp checkout
 #   MODEL           the .gguf both engines load
 #   WORK            scratch space for the dataset, the CUDA shim and the env file
@@ -40,15 +42,34 @@
 
 set -euo pipefail
 
-FLINK_SRC="${FLINK_SRC:-$HOME/Projects/flink}"
-FLINK_HOME="${FLINK_HOME:-$FLINK_SRC/flink-dist/target/flink-2.3.0-bin/flink-2.3.0}"
-TORNADOVM_SRC="${TORNADOVM_SRC:-$HOME/Projects/TornadoVM}"
-JITLLM_SRC="${JITLLM_SRC:-$HOME/Projects/GPULlama3-Beehive/GPULlama3.java}"
-LLAMACPP_SRC="${LLAMACPP_SRC:-$HOME/Projects/llama.cpp}"
-MODEL="${MODEL:-$JITLLM_SRC/Qwen3-0.6B-f16.gguf}"
-WORK="${WORK:-$HOME/gpu-bench-data/flink-llm}"
-JDK21="${JDK21:-$HOME/Projects/JDKs/jdk-21.0.3}"
 PROVIDER_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The sibling checkouts, derived from where this script actually is rather than
+# from one machine's home directory. 1-fetch.sh puts all five side by side under
+# DEMO_ROOT, and a hand-made layout with them beside each other works the same.
+# Every one of these is still overridable, which is what the header documents.
+SIBLINGS="$(dirname "$PROVIDER_SRC")"
+FLINK_SRC="${FLINK_SRC:-$SIBLINGS/flink}"
+FLINK_HOME="${FLINK_HOME:-$FLINK_SRC/flink-dist/target/flink-2.3.0-bin/flink-2.3.0}"
+TORNADOVM_SRC="${TORNADOVM_SRC:-$SIBLINGS/TornadoVM}"
+JITLLM_SRC="${JITLLM_SRC:-$SIBLINGS/jitllm}"
+LLAMACPP_SRC="${LLAMACPP_SRC:-$SIBLINGS/llama.cpp}"
+MODEL="${MODEL:-$JITLLM_SRC/Qwen3-0.6B-f16.gguf}"
+# Same root the examples use for a corpus when they were not told one.
+WORK="${WORK:-${GPU_BENCH_DATA:-$HOME/gpu-bench-data}/flink-llm}"
+
+# A JDK 21, in the order worth trying: one that was named, the one already in
+# the environment if it is a 21, then the usual install locations. Hard-coding
+# one path here meant the script could only ever start on one machine.
+jdk_is_21() { [[ -x "$1/bin/java" ]] && "$1/bin/java" -version 2>&1 | grep -q '"21\.'; }
+if [[ -z "${JDK21:-}" ]]; then
+    for _c in "${JAVA_HOME:-}" /usr/lib/jvm/java-21-openjdk /usr/lib/jvm/jdk-21 \
+              /usr/lib/jvm/temurin-21-jdk "$HOME/.sdkman/candidates/java/21"*; do
+        # An `if`, not an `&&` chain: under `set -e` a chain whose test fails
+        # takes the whole script down on the first candidate that is not a 21.
+        if [[ -n "$_c" ]] && jdk_is_21 "$_c"; then JDK21="$_c"; break; fi
+    done
+fi
+JDK21="${JDK21:-}"
 
 ROWS=8000000
 MACHINES=48
@@ -74,6 +95,7 @@ die() { printf '\033[31merror: %s\033[0m\n' "$*" >&2; exit 1; }
 # 0. Prerequisites, checked before anything is built rather than after
 # ---------------------------------------------------------------------------------------
 say "checking prerequisites"
+[[ -n "$JDK21" ]]            || die "no JDK 21 found -- set JDK21 to one (JAVA_HOME was ${JAVA_HOME:-unset})"
 [[ -x "$JDK21/bin/java" ]]   || die "no JDK 21 at $JDK21 (set JDK21)"
 [[ -d "$FLINK_SRC" ]]        || die "no flink checkout at $FLINK_SRC (set FLINK_SRC)"
 [[ -d "$TORNADOVM_SRC" ]]    || die "no TornadoVM checkout at $TORNADOVM_SRC (set TORNADOVM_SRC)"

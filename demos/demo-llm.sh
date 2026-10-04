@@ -31,24 +31,26 @@ esac; done
 
 RUNNER="$PROVIDER_SRC/flink-accelerator-tornadovm/scripts/llm-bench-run.sh"
 [[ -x "$RUNNER" ]] || demo_die "missing $RUNNER"
-# The triage readings belong with the other corpora. An install made before
-# that was true keeps working: the old location is still searched.
+# The triage readings live with the other corpora, under this install's own
+# DATA_ROOT. There is deliberately no second location to fall back to: a
+# fallback to a fixed path under $HOME finds another install's dataset on the
+# machine these were written on and nothing at all anywhere else, and it is
+# silent either way -- the run prints a data directory nobody recognises and
+# otherwise looks fine.
 : "${LLM_BENCH_WORK:=$DATA_ROOT/flink-llm}"
 ENVFILE="$LLM_BENCH_WORK/llm-bench.env"
-[[ -f "$ENVFILE" ]] || { LLM_BENCH_WORK="$HOME/gpu-bench-data/flink-llm"; ENVFILE="$LLM_BENCH_WORK/llm-bench.env"; }
 export LLM_BENCH_WORK
 if [[ ! -f "$ENVFILE" ]]; then
     cat >&2 <<TXT
 
-This demo is not set up yet. It needs jitllm, llama.cpp and a GGUF model, which
-the repository's own setup script installs:
+This demo is not set up yet: no $ENVFILE
 
-  $PROVIDER_SRC/flink-accelerator-tornadovm/scripts/llm-bench-setup.sh
+Step 2 installs it, together with jitllm, llama.cpp and the GGUF model:
 
-It expects these in the environment (defaults in brackets):
-  JITLLM_SRC    [~/Projects/GPULlama3-Beehive/GPULlama3.java]
-  LLAMACPP_SRC  [~/Projects/llama.cpp]
-  MODEL         [\$JITLLM_SRC/Qwen3-0.6B-f16.gguf]
+  ./2-generate-data.sh
+
+It is idempotent -- a corpus already generated is left alone, so re-running it
+only does the part that is missing.
 
 TXT
     exit 2

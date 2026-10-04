@@ -33,7 +33,10 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENVFILE="${LLM_BENCH_ENV:-$HOME/gpu-bench-data/flink-llm/llm-bench.env}"
+# LLM_BENCH_WORK is what the demo scripts export, and it is what llm-bench-setup.sh
+# was given; the last resort matches that script's own default for WORK rather than
+# naming a directory outright.
+ENVFILE="${LLM_BENCH_ENV:-${LLM_BENCH_WORK:-${GPU_BENCH_DATA:-$HOME/gpu-bench-data}/flink-llm}/llm-bench.env}"
 [[ -f "$ENVFILE" ]] || { echo "no environment file at $ENVFILE -- run llm-bench-setup.sh first" >&2; exit 1; }
 # shellcheck source=/dev/null
 source "$ENVFILE"
